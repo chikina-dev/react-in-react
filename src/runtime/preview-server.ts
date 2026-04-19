@@ -16,11 +16,7 @@ import type {
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type {
-  HostPreviewAssetHint,
-  HostPreviewRequestHint,
-  HostPreviewRootHint,
-} from "./host-adapter";
+import type { HostPreviewRequestHint, HostPreviewRootHint } from "./host-adapter";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewServerState = {
@@ -30,7 +26,6 @@ type PreviewServerState = {
   url: string;
   model: PreviewModel;
   rootHint?: HostPreviewRootHint;
-  assetHint?: HostPreviewAssetHint;
   requestHint?: HostPreviewRequestHint;
   session: SessionSnapshot;
   files: Map<string, WorkspaceFileRecord>;
@@ -93,94 +88,71 @@ export function buildPreviewResponse(
 
   const relativePath = getPreviewRelativePath(request, preview);
   const requestHint = preview.requestHint;
+  const requestKind = requestHint?.kind ?? inferPreviewRequestKind(relativePath);
 
-  if (requestHint?.kind === "root-document" && requestHint.workspacePath) {
-    const file = preview.files.get(requestHint.workspacePath);
+  switch (requestKind) {
+    case "root-document": {
+      const file = requestHint?.workspacePath ? preview.files.get(requestHint.workspacePath) : null;
 
-    if (file) {
-      return buildWorkspaceFileResponse(file, preview, requestHint.documentRoot);
+      if (file && requestHint?.documentRoot) {
+        return buildWorkspaceFileResponse(file, preview, requestHint.documentRoot);
+      }
+
+      return buildPreviewRootResponse(preview, request);
     }
-  }
+    case "root-entry":
+      if (requestHint?.workspacePath) {
+        return htmlResponse(
+          200,
+          renderPreviewAppShell({
+            title: preview.model.title,
+            entryUrl: buildPreviewUrlForWorkspaceFile(
+              requestHint.workspacePath,
+              preview,
+              "/workspace",
+            ),
+          }),
+        );
+      }
+      return buildPreviewRootResponse(preview, request);
+    case "fallback-root":
+      return buildPreviewRootResponse(preview, request);
+    case "runtime-state":
+      return jsonResponse(200, {
+        type: "preview.ready",
+        sessionId: preview.sessionId,
+        pid: preview.pid,
+        port: preview.port,
+        url: preview.url,
+        model: preview.model,
+      } satisfies PreviewReadyEvent);
+    case "workspace-state":
+      return jsonResponse(200, preview.session);
+    case "file-index":
+      return jsonResponse(200, buildPreviewFileIndex(preview));
+    case "runtime-stylesheet":
+      return cssResponse(200, renderRuntimeStylesheet());
+    case "workspace-file":
+      if (requestHint?.workspacePath) {
+        const file = preview.files.get(requestHint.workspacePath);
 
-  if (requestHint?.kind === "root-entry" && requestHint.workspacePath) {
-    return htmlResponse(
-      200,
-      renderPreviewAppShell({
-        title: preview.model.title,
-        entryUrl: buildPreviewUrlForWorkspaceFile(requestHint.workspacePath, preview, "/workspace"),
-      }),
-    );
-  }
-
-  if (requestHint?.kind === "runtime-state" || relativePath === "/__runtime.json") {
-    return jsonResponse(200, {
-      type: "preview.ready",
-      sessionId: preview.sessionId,
-      pid: preview.pid,
-      port: preview.port,
-      url: preview.url,
-      model: preview.model,
-    } satisfies PreviewReadyEvent);
-  }
-
-  if (requestHint?.kind === "workspace-state" || relativePath === "/__workspace.json") {
-    return jsonResponse(200, preview.session);
-  }
-
-  if (requestHint?.kind === "file-index" || relativePath === "/__files.json") {
-    return jsonResponse(200, buildPreviewFileIndex(preview));
-  }
-
-  if (requestHint?.kind === "runtime-stylesheet" || relativePath === "/assets/runtime.css") {
-    return cssResponse(200, renderRuntimeStylesheet());
-  }
-
-  if (relativePath === "/" || relativePath === "/index.html") {
-    const workspaceDocument = resolvePreviewDocument(preview);
-
-    if (workspaceDocument) {
-      return buildWorkspaceFileResponse(workspaceDocument.file, preview, workspaceDocument.root);
+        if (file && requestHint.documentRoot) {
+          return buildWorkspaceFileResponse(file, preview, requestHint.documentRoot);
+        }
+      }
+      return buildPreviewFileResponse(relativePath, preview);
+    case "workspace-asset": {
+      const workspaceAsset = buildWorkspaceAssetResponse(relativePath, preview);
+      if (workspaceAsset) {
+        return workspaceAsset;
+      }
+      break;
     }
-
-    const workspaceEntry = resolvePreviewAppEntry(preview);
-
-    if (workspaceEntry) {
-      return htmlResponse(
-        200,
-        renderPreviewAppShell({
-          title: preview.model.title,
-          entryUrl: buildPreviewUrlForWorkspaceFile(workspaceEntry.path, preview, "/workspace"),
-        }),
-      );
-    }
-
-    const clientScriptUrl = request.headers[PREVIEW_CLIENT_HEADER];
-
-    if (!clientScriptUrl) {
-      return htmlResponse(503, renderPreviewError("Preview client script is not configured."));
-    }
-
-    return htmlResponse(
-      200,
-      renderPreviewHtml({
-        preview,
-        clientScriptUrl,
-        stateUrl: `${preview.url}__runtime.json`,
-        workspaceUrl: `${preview.url}__workspace.json`,
-        filesUrl: `${preview.url}__files.json`,
-        stylesheetUrl: `${preview.url}assets/runtime.css`,
-      }),
-    );
-  }
-
-  if (relativePath.startsWith("/files/")) {
-    return buildPreviewFileResponse(relativePath, preview);
-  }
-
-  const workspaceAsset = buildWorkspaceAssetResponse(relativePath, preview);
-
-  if (workspaceAsset) {
-    return workspaceAsset;
+    case "not-found":
+      return jsonResponse(404, {
+        error: "Unsupported preview path",
+        pathname: request.pathname,
+      });
   }
 
   return jsonResponse(404, {
@@ -224,6 +196,75 @@ function cssResponse(status: number, body: string): VirtualHttpResponse {
     },
     body,
   };
+}
+
+function inferPreviewRequestKind(relativePath: string): HostPreviewRequestHint["kind"] {
+  if (relativePath === "/" || relativePath === "/index.html") {
+    return "fallback-root";
+  }
+
+  if (relativePath === "/__runtime.json") {
+    return "runtime-state";
+  }
+
+  if (relativePath === "/__workspace.json") {
+    return "workspace-state";
+  }
+
+  if (relativePath === "/__files.json") {
+    return "file-index";
+  }
+
+  if (relativePath === "/assets/runtime.css") {
+    return "runtime-stylesheet";
+  }
+
+  if (relativePath.startsWith("/files/")) {
+    return "workspace-file";
+  }
+
+  return "workspace-asset";
+}
+
+function buildPreviewRootResponse(
+  preview: PreviewServerState,
+  request: VirtualHttpRequest,
+): VirtualHttpResponse {
+  const workspaceDocument = resolvePreviewDocument(preview);
+
+  if (workspaceDocument) {
+    return buildWorkspaceFileResponse(workspaceDocument.file, preview, workspaceDocument.root);
+  }
+
+  const workspaceEntry = resolvePreviewAppEntry(preview);
+
+  if (workspaceEntry) {
+    return htmlResponse(
+      200,
+      renderPreviewAppShell({
+        title: preview.model.title,
+        entryUrl: buildPreviewUrlForWorkspaceFile(workspaceEntry.path, preview, "/workspace"),
+      }),
+    );
+  }
+
+  const clientScriptUrl = request.headers[PREVIEW_CLIENT_HEADER];
+
+  if (!clientScriptUrl) {
+    return htmlResponse(503, renderPreviewError("Preview client script is not configured."));
+  }
+
+  return htmlResponse(
+    200,
+    renderPreviewHtml({
+      preview,
+      clientScriptUrl,
+      stateUrl: `${preview.url}__runtime.json`,
+      workspaceUrl: `${preview.url}__workspace.json`,
+      filesUrl: `${preview.url}__files.json`,
+      stylesheetUrl: `${preview.url}assets/runtime.css`,
+    }),
+  );
 }
 
 function renderPreviewHtml(input: {
@@ -473,10 +514,13 @@ function buildWorkspaceAssetResponse(
     return null;
   }
 
-  const documentRoot = preview.assetHint?.documentRoot ?? resolvePreviewDocumentRoot(preview);
+  const documentRoot =
+    preview.requestHint?.kind === "workspace-asset"
+      ? preview.requestHint.documentRoot
+      : resolvePreviewDocumentRoot(preview);
 
-  if (preview.assetHint?.workspacePath) {
-    const hintedFile = preview.files.get(preview.assetHint.workspacePath);
+  if (preview.requestHint?.kind === "workspace-asset") {
+    const hintedFile = preview.files.get(preview.requestHint.workspacePath);
 
     if (hintedFile) {
       return buildWorkspaceFileResponse(hintedFile, preview, documentRoot);

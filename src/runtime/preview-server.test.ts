@@ -152,6 +152,63 @@ test("buildPreviewResponse prefers host-provided request hints", () => {
   expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
 });
 
+test("buildPreviewResponse serves workspace files from host-provided request hints", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/files/src/main.tsx",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/main.tsx",
+            {
+              path: "/workspace/src/main.tsx",
+              size: 18,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("console.log('hint')"),
+              textContent: "console.log('hint')",
+            },
+          ],
+        ]),
+      ),
+      requestHint: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/main.tsx",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/src/main.tsx"],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toContain("text/javascript");
+  expect(response.body).toContain("console.log('hint')");
+});
+
+test("buildPreviewResponse returns 404 from host-provided not-found request hints", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/missing.js",
+    },
+    {
+      ...createPreviewState(),
+      requestHint: {
+        kind: "not-found",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toContain('"error":"Unsupported preview path"');
+});
+
 test("buildPreviewResponse returns runtime CSS for asset route", () => {
   const response = buildPreviewResponse(
     {
@@ -347,9 +404,11 @@ test("buildPreviewResponse prefers host-provided asset hints for document-root a
           ],
         ]),
       ),
-      assetHint: {
+      requestHint: {
+        kind: "workspace-asset",
         workspacePath: "/workspace/dist/assets/app.js",
         documentRoot: "/workspace/dist",
+        hydratePaths: ["/workspace/dist/assets/app.js"],
       },
     },
   );
