@@ -98,6 +98,47 @@ pub struct WorkspaceEntrySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostFsCommand {
+    Exists {
+        path: String,
+    },
+    Stat {
+        path: String,
+    },
+    ReadDir {
+        path: String,
+    },
+    ReadFile {
+        path: String,
+    },
+    CreateDirAll {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        bytes: Vec<u8>,
+        is_text: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostFsResponse {
+    Exists {
+        path: String,
+        exists: bool,
+    },
+    Entry(WorkspaceEntrySummary),
+    DirectoryEntries(Vec<WorkspaceEntrySummary>),
+    File {
+        path: String,
+        size: usize,
+        is_text: bool,
+        text_content: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewRequestKind {
     RootDocument,
     RootEntry,

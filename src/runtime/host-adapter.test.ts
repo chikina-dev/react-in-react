@@ -402,3 +402,70 @@ test("MockRuntimeHostAdapter mutates the workspace tree", async () => {
     "workspace path must stay under /workspace",
   );
 });
+
+test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => {
+  const adapter = new MockRuntimeHostAdapter();
+
+  await adapter.createSession({
+    sessionId: session.sessionId,
+    session,
+    files,
+  });
+
+  await expect(
+    adapter.executeFsCommand(session.sessionId, {
+      kind: "exists",
+      path: "/workspace/src/server.ts",
+    }),
+  ).resolves.toEqual({
+    kind: "exists",
+    path: "/workspace/src/server.ts",
+    exists: true,
+  });
+
+  await expect(
+    adapter.executeFsCommand(session.sessionId, {
+      kind: "read-file",
+      path: "/workspace/package.json",
+    }),
+  ).resolves.toEqual({
+    kind: "file",
+    path: "/workspace/package.json",
+    size: 19,
+    isText: true,
+    textContent: '{"name":"demo-app"}',
+    bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+  });
+
+  await expect(
+    adapter.executeFsCommand(session.sessionId, {
+      kind: "mkdir",
+      path: "/workspace/generated",
+    }),
+  ).resolves.toEqual({
+    kind: "entry",
+    entry: {
+      path: "/workspace/generated",
+      kind: "directory",
+      size: 0,
+      isText: false,
+    },
+  });
+
+  await expect(
+    adapter.executeFsCommand(session.sessionId, {
+      kind: "write-file",
+      path: "/workspace/generated/runtime.txt",
+      bytes: new TextEncoder().encode("runtime host"),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    kind: "entry",
+    entry: {
+      path: "/workspace/generated/runtime.txt",
+      kind: "file",
+      size: 12,
+      isText: true,
+    },
+  });
+});

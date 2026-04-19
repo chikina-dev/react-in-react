@@ -42,6 +42,41 @@ export type HostWorkspaceFileContent = HostWorkspaceFileSummary & {
   bytes: Uint8Array;
 };
 
+export type HostFsCommand =
+  | {
+      kind: "exists" | "stat" | "read-dir" | "read-file" | "mkdir";
+      path: string;
+    }
+  | {
+      kind: "write-file";
+      path: string;
+      bytes: Uint8Array;
+      isText: boolean;
+    };
+
+export type HostFsResponse =
+  | {
+      kind: "exists";
+      path: string;
+      exists: boolean;
+    }
+  | {
+      kind: "entry";
+      entry: HostWorkspaceEntrySummary;
+    }
+  | {
+      kind: "directory-entries";
+      entries: HostWorkspaceEntrySummary[];
+    }
+  | {
+      kind: "file";
+      path: string;
+      size: number;
+      isText: boolean;
+      textContent: string | null;
+      bytes: Uint8Array;
+    };
+
 type MockPreviewRootHint =
   | {
       kind: "workspace-document";
@@ -112,6 +147,7 @@ export interface RuntimeHostAdapter {
       isText: boolean;
     },
   ): Promise<HostWorkspaceEntrySummary>;
+  executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -135,6 +171,7 @@ type WasmRuntimeHostExports = {
   runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
   runtime_host_create_workspace_directory_json(ptr: number, len: number): number;
   runtime_host_write_workspace_file_json(ptr: number, len: number): number;
+  runtime_host_execute_fs_command_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -404,6 +441,62 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       size: bytes.byteLength,
       isText: input.isText,
     };
+  }
+
+  async executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse> {
+    switch (command.kind) {
+      case "exists": {
+        const record = this.sessions.get(sessionId);
+
+        if (!record) {
+          throw new Error(`Rust host session not found: ${sessionId}`);
+        }
+
+        const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, command.path);
+        assertMockWorkspacePathWithinRoot(record.handle.workspaceRoot, resolved);
+
+        return {
+          kind: "exists",
+          path: resolved,
+          exists: record.files.has(resolved) || record.directories.has(resolved),
+        };
+      }
+      case "stat":
+        return {
+          kind: "entry",
+          entry: await this.statWorkspacePath(sessionId, command.path),
+        };
+      case "read-dir":
+        return {
+          kind: "directory-entries",
+          entries: await this.readWorkspaceDirectory(sessionId, command.path),
+        };
+      case "read-file": {
+        const file = await this.readWorkspaceFile(sessionId, command.path);
+        return {
+          kind: "file",
+          path: file.path,
+          size: file.size,
+          isText: file.isText,
+          textContent: file.textContent,
+          bytes: file.bytes,
+        };
+      }
+      case "mkdir":
+        return {
+          kind: "entry",
+          entry: await this.createWorkspaceDirectory(sessionId, command.path),
+        };
+      case "write-file":
+        return {
+          kind: "entry",
+          entry: await this.writeWorkspaceFile(sessionId, {
+            path: command.path,
+            bytes: command.bytes,
+            isText: command.isText,
+          }),
+        };
+    }
   }
 
   private getPreviewRootHint(sessionId: string): MockPreviewRootHint {
@@ -714,6 +807,56 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         `bytes=${encodeHex(input.bytes)}`,
       ],
     );
+  }
+
+  async executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse> {
+    const lines = [`session_id=${sessionId}`, `command=${command.kind}`];
+
+    if ("path" in command) {
+      lines.push(`path=${encodeHex(command.path)}`);
+    }
+
+    if (command.kind === "write-file") {
+      lines.push(`is_text=${String(command.isText)}`);
+      lines.push(`bytes=${encodeHex(command.bytes)}`);
+    }
+
+    const response = await this.invokeWithInput<
+      | {
+          kind: "exists";
+          path: string;
+          exists: boolean;
+        }
+      | {
+          kind: "entry";
+          entry: HostWorkspaceEntrySummary;
+        }
+      | {
+          kind: "directory-entries";
+          entries: HostWorkspaceEntrySummary[];
+        }
+      | {
+          kind: "file";
+          path: string;
+          size: number;
+          isText: boolean;
+          textContent: string | null;
+          bytesHex: string;
+        }
+    >("runtime_host_execute_fs_command_json", lines);
+
+    if (response.kind === "file") {
+      return {
+        kind: "file",
+        path: response.path,
+        size: response.size,
+        isText: response.isText,
+        textContent: response.textContent,
+        bytes: decodeHex(response.bytesHex),
+      };
+    }
+
+    return response;
   }
 
   async resolvePreviewRequestHint(

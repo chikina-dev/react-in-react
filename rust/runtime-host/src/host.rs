@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -305,6 +305,59 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         let resolved = resolve_workspace_path(record, path);
 
         record.vfs.write_file(&resolved, bytes, is_text)
+    }
+
+    pub fn execute_fs_command(
+        &mut self,
+        session_id: &str,
+        command: HostFsCommand,
+    ) -> RuntimeHostResult<HostFsResponse> {
+        match command {
+            HostFsCommand::Exists { path } => {
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_workspace_path(record, &path);
+
+                Ok(HostFsResponse::Exists {
+                    path: resolved.clone(),
+                    exists: record.vfs.exists(&resolved),
+                })
+            }
+            HostFsCommand::Stat { path } => self
+                .stat_workspace_path(session_id, &path)
+                .map(HostFsResponse::Entry),
+            HostFsCommand::ReadDir { path } => self
+                .read_workspace_directory(session_id, &path)
+                .map(HostFsResponse::DirectoryEntries),
+            HostFsCommand::ReadFile { path } => {
+                let file = self.read_workspace_file(session_id, &path)?;
+                let text_content = if file.is_text {
+                    Some(String::from_utf8_lossy(&file.bytes).into_owned())
+                } else {
+                    None
+                };
+
+                Ok(HostFsResponse::File {
+                    path: file.path,
+                    size: file.bytes.len(),
+                    is_text: file.is_text,
+                    text_content,
+                    bytes: file.bytes,
+                })
+            }
+            HostFsCommand::CreateDirAll { path } => self
+                .create_workspace_directory(session_id, &path)
+                .map(HostFsResponse::Entry),
+            HostFsCommand::WriteFile {
+                path,
+                bytes,
+                is_text,
+            } => self
+                .write_workspace_file(session_id, &path, bytes, is_text)
+                .map(HostFsResponse::Entry),
+        }
     }
 
     fn resolve_preview_root_hint(&self, session_id: &str) -> RuntimeHostResult<PreviewRootHint> {

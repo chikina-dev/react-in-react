@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
-use crate::protocol::{ArchiveStats, RunRequest};
+use crate::protocol::{ArchiveStats, HostFsCommand, HostFsResponse, RunRequest};
 use crate::vfs::VirtualFile;
 
 thread_local! {
@@ -375,6 +375,32 @@ pub extern "C" fn runtime_host_write_workspace_file_json(ptr: *const u8, len: us
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_execute_fs_command_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let command = match parse_fs_command(&fields) {
+        Ok(command) => command,
+        Err(error) => return write_error(error),
+    };
+
+    HOST.with(|host| {
+        let result = host.borrow_mut().execute_fs_command(&session_id, command);
+
+        match result {
+            Ok(response) => set_last_result(render_fs_response_json(&response)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn runtime_host_resolve_preview_request_hint_json(
     ptr: *const u8,
     len: usize,
@@ -471,6 +497,37 @@ fn parse_virtual_files(fields: &BTreeMap<String, String>) -> Result<Vec<VirtualF
             })
         })
         .collect()
+}
+
+fn parse_fs_command(fields: &BTreeMap<String, String>) -> Result<HostFsCommand, String> {
+    let kind = required_field(fields, "command").ok_or_else(|| "missing fs command".to_string())?;
+    let path = match required_field(fields, "path") {
+        Some(encoded) => decode_hex(&encoded)?,
+        None => "/workspace".into(),
+    };
+
+    match kind.as_str() {
+        "exists" => Ok(HostFsCommand::Exists { path }),
+        "stat" => Ok(HostFsCommand::Stat { path }),
+        "read-dir" => Ok(HostFsCommand::ReadDir { path }),
+        "read-file" => Ok(HostFsCommand::ReadFile { path }),
+        "mkdir" => Ok(HostFsCommand::CreateDirAll { path }),
+        "write-file" => {
+            let is_text = fields
+                .get("is_text")
+                .map(|value| value == "true" || value == "1")
+                .unwrap_or(false);
+            let encoded_bytes = required_field(fields, "bytes").unwrap_or_default();
+            let bytes = decode_hex_bytes(&encoded_bytes)?;
+
+            Ok(HostFsCommand::WriteFile {
+                path,
+                bytes,
+                is_text,
+            })
+        }
+        _ => Err(format!("unsupported fs command: {kind}")),
+    }
 }
 
 fn decode_hex(input: &str) -> Result<String, String> {
@@ -674,6 +731,45 @@ fn render_workspace_files_json(files: &[VirtualFile]) -> String {
         .join(",");
 
     format!("[{items}]")
+}
+
+fn render_fs_response_json(response: &HostFsResponse) -> String {
+    match response {
+        HostFsResponse::Exists { path, exists } => format!(
+            "{{\"kind\":\"exists\",\"path\":\"{}\",\"exists\":{}}}",
+            escape_json(path),
+            exists,
+        ),
+        HostFsResponse::Entry(entry) => format!(
+            "{{\"kind\":\"entry\",\"entry\":{}}}",
+            render_workspace_entry_json(entry)
+        ),
+        HostFsResponse::DirectoryEntries(entries) => format!(
+            "{{\"kind\":\"directory-entries\",\"entries\":{}}}",
+            render_workspace_entries_json(entries)
+        ),
+        HostFsResponse::File {
+            path,
+            size,
+            is_text,
+            text_content,
+            bytes,
+        } => {
+            let text_content = text_content
+                .as_ref()
+                .map(|value| format!("\"{}\"", escape_json(value)))
+                .unwrap_or_else(|| "null".into());
+
+            format!(
+                "{{\"kind\":\"file\",\"path\":\"{}\",\"size\":{},\"isText\":{},\"textContent\":{},\"bytesHex\":\"{}\"}}",
+                escape_json(path),
+                size,
+                is_text,
+                text_content,
+                encode_hex(bytes),
+            )
+        }
+    }
 }
 
 fn render_string_array_json(values: &[String]) -> String {

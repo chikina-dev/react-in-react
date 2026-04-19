@@ -9,9 +9,9 @@ pub use engine::{EngineAdapter, EngineDescriptor, NullEngineAdapter};
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -145,6 +145,29 @@ mod tests {
                 .bytes,
             b"export const generated = true;"
         );
+        assert_eq!(
+            host.execute_fs_command(
+                &session.session_id,
+                HostFsCommand::Exists {
+                    path: "/workspace/src/generated/app.ts".into(),
+                },
+            )
+            .expect("fs exists should resolve"),
+            HostFsResponse::Exists {
+                path: "/workspace/src/generated/app.ts".into(),
+                exists: true,
+            }
+        );
+        assert!(matches!(
+            host.execute_fs_command(
+                &session.session_id,
+                HostFsCommand::ReadDir {
+                    path: "/workspace/src".into(),
+                },
+            ),
+            Ok(HostFsResponse::DirectoryEntries(entries))
+                if entries.iter().any(|entry| entry.path == "/workspace/src/generated")
+        ));
         assert_eq!(
             host.plan_run(
                 &session.session_id,
