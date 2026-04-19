@@ -182,19 +182,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         }
 
         match relative_path {
-            "/" | "/index.html" => {
-                for candidate in PREVIEW_DOCUMENT_CANDIDATES {
-                    if record.vfs.read(candidate).is_some() {
-                        paths.insert(candidate.into());
-                    }
+            "/" | "/index.html" => match self.resolve_preview_root_hint(session_id)? {
+                PreviewRootHint {
+                    path: Some(path), ..
+                } => {
+                    paths.insert(path);
                 }
-
-                for candidate in PREVIEW_APP_ENTRY_CANDIDATES {
-                    if record.vfs.read(candidate).is_some() {
-                        paths.insert(candidate.into());
-                    }
-                }
-            }
+                PreviewRootHint { path: None, .. } => {}
+            },
             path if path.starts_with("/files/") => {
                 let workspace_path = decode_workspace_path(path);
 
@@ -205,22 +200,11 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             "/assets/runtime.css" => {}
             path if path.starts_with("/__") => {}
             path => {
-                let normalized = normalize_workspace_asset_path(path);
-
-                for root in collect_preview_workspace_roots() {
-                    let candidate = format!("{root}{normalized}");
-
-                    if record.vfs.read(&candidate).is_some() {
-                        paths.insert(candidate);
-                    }
-
-                    if normalized.ends_with('/') {
-                        let index_candidate = format!("{root}{normalized}index.html");
-
-                        if record.vfs.read(&index_candidate).is_some() {
-                            paths.insert(index_candidate);
-                        }
-                    }
+                if let Some(workspace_path) = self
+                    .resolve_preview_asset_hint(session_id, path)?
+                    .workspace_path
+                {
+                    paths.insert(workspace_path);
                 }
             }
         }
@@ -329,13 +313,6 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map(|_| ())
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))
     }
-}
-
-fn collect_preview_workspace_roots() -> BTreeSet<&'static str> {
-    PREVIEW_DOCUMENT_CANDIDATES
-        .iter()
-        .map(|path| dirname(path))
-        .collect()
 }
 
 fn dirname(path: &str) -> &str {

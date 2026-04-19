@@ -1512,6 +1512,10 @@ function resolvePreviewAppEntry(preview: PreviewServerState): WorkspaceFileRecor
 }
 
 function resolvePreviewDocumentRoot(preview: PreviewServerState): string {
+  if (preview.rootHint?.kind === "workspace-document") {
+    return preview.rootHint.root;
+  }
+
   return resolvePreviewDocument(preview)?.root ?? "/workspace";
 }
 

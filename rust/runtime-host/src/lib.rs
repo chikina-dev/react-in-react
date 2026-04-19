@@ -86,5 +86,13 @@ mod tests {
                 .as_deref(),
             Some("/workspace/src/main.tsx")
         );
+        assert_eq!(
+            host.resolve_preview_hydration_paths(&session.session_id, "/src/main.tsx")
+                .expect("preview asset hydration should resolve"),
+            vec![
+                "/workspace/package.json".to_string(),
+                "/workspace/src/main.tsx".to_string(),
+            ]
+        );
     }
 }

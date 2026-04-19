@@ -274,23 +274,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     if (relativePath === "/" || relativePath === "/index.html") {
-      for (const candidate of [
-        "/workspace/index.html",
-        "/workspace/dist/index.html",
-        "/workspace/build/index.html",
-        "/workspace/public/index.html",
-        "/workspace/src/main.tsx",
-        "/workspace/src/main.jsx",
-        "/workspace/src/main.ts",
-        "/workspace/src/main.js",
-        "/workspace/src/index.tsx",
-        "/workspace/src/index.jsx",
-        "/workspace/src/index.ts",
-        "/workspace/src/index.js",
-      ]) {
-        if (record.files.has(candidate)) {
-          paths.add(candidate);
-        }
+      const rootHint = await this.resolvePreviewRootHint(sessionId);
+
+      if (rootHint.path) {
+        paths.add(rootHint.path);
       }
 
       return [...paths];
@@ -310,25 +297,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       return [...paths];
     }
 
-    const normalized = (relativePath.startsWith("/") ? relativePath : `/${relativePath}`).replace(
-      /\/+/g,
-      "/",
-    );
+    const assetHint = await this.resolvePreviewAssetHint(sessionId, relativePath);
 
-    for (const root of ["/workspace", "/workspace/dist", "/workspace/build", "/workspace/public"]) {
-      const candidate = `${root}${normalized}`;
-
-      if (record.files.has(candidate)) {
-        paths.add(candidate);
-      }
-
-      if (normalized.endsWith("/")) {
-        const indexCandidate = `${root}${normalized}index.html`;
-
-        if (record.files.has(indexCandidate)) {
-          paths.add(indexCandidate);
-        }
-      }
+    if (assetHint.workspacePath) {
+      paths.add(assetHint.workspacePath);
     }
 
     return [...paths];
