@@ -287,6 +287,28 @@ pub extern "C" fn runtime_host_resolve_preview_hydration_paths_json(
     1
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_resolve_preview_root_hint_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow().resolve_preview_root_hint(&session_id);
+
+        match result {
+            Ok(hint) => set_last_result(render_preview_root_hint_json(&hint)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
 fn read_input(ptr: *const u8, len: usize) -> Result<String, String> {
     if ptr.is_null() || len == 0 {
         return Ok(String::new());
@@ -496,6 +518,26 @@ fn render_string_array_json(values: &[String]) -> String {
         .join(",");
 
     format!("[{items}]")
+}
+
+fn render_preview_root_hint_json(hint: &crate::protocol::PreviewRootHint) -> String {
+    let kind = match hint.kind {
+        crate::protocol::PreviewRootKind::WorkspaceDocument => "workspace-document",
+        crate::protocol::PreviewRootKind::SourceEntry => "source-entry",
+        crate::protocol::PreviewRootKind::Fallback => "fallback",
+    };
+    let path = hint
+        .path
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+    let root = hint
+        .root
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+
+    format!("{{\"kind\":\"{kind}\",\"path\":{path},\"root\":{root}}}")
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

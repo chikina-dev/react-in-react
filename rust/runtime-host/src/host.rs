@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, RunPlan, RunRequest, SessionSnapshot,
-    SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRootHint, PreviewRootKind,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem};
 
@@ -228,6 +228,44 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         Ok(paths.into_iter().collect())
     }
 
+    pub fn resolve_preview_root_hint(
+        &self,
+        session_id: &str,
+    ) -> RuntimeHostResult<PreviewRootHint> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+
+        for candidate in PREVIEW_DOCUMENT_CANDIDATES {
+            if let Some(file) = record.vfs.read(candidate) {
+                if file.is_text && file.path.ends_with(".html") {
+                    return Ok(PreviewRootHint {
+                        kind: PreviewRootKind::WorkspaceDocument,
+                        path: Some(file.path.clone()),
+                        root: Some(dirname(candidate).to_string()),
+                    });
+                }
+            }
+        }
+
+        for candidate in PREVIEW_APP_ENTRY_CANDIDATES {
+            if record.vfs.read(candidate).is_some() {
+                return Ok(PreviewRootHint {
+                    kind: PreviewRootKind::SourceEntry,
+                    path: Some(candidate.to_string()),
+                    root: None,
+                });
+            }
+        }
+
+        Ok(PreviewRootHint {
+            kind: PreviewRootKind::Fallback,
+            path: None,
+            root: None,
+        })
+    }
+
     pub fn stop_session(&mut self, session_id: &str) -> RuntimeHostResult<()> {
         self.sessions
             .remove(session_id)
@@ -263,7 +301,9 @@ fn normalize_workspace_asset_path(relative_path: &str) -> String {
 }
 
 fn decode_workspace_path(relative_path: &str) -> String {
-    let suffix = relative_path.strip_prefix("/files").unwrap_or(relative_path);
+    let suffix = relative_path
+        .strip_prefix("/files")
+        .unwrap_or(relative_path);
     format!("/workspace{}", decode_percent_path(suffix))
 }
 

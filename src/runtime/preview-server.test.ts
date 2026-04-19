@@ -77,6 +77,43 @@ test("buildPreviewResponse returns HTML for the preview root", () => {
   expect(response.body).toContain("__workspace.json");
 });
 
+test("buildPreviewResponse prefers host-provided preview root hints", () => {
+  const state = createPreviewState(
+    new Map([
+      [
+        "/workspace/src/main.tsx",
+        {
+          path: "/workspace/src/main.tsx",
+          size: 24,
+          contentType: "text/plain; charset=utf-8",
+          isText: true,
+          bytes: new TextEncoder().encode("console.log('from-hint')"),
+          textContent: "console.log('from-hint')",
+        },
+      ],
+    ]),
+  );
+
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/",
+    },
+    {
+      ...state,
+      rootHint: {
+        kind: "source-entry",
+        path: "/workspace/src/main.tsx",
+        root: null,
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toContain("text/html");
+  expect(response.body).toContain('src="/preview/session-1/3000/src/main.tsx"');
+});
+
 test("buildPreviewResponse returns runtime CSS for asset route", () => {
   const response = buildPreviewResponse(
     {

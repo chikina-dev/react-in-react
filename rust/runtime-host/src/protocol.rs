@@ -74,3 +74,17 @@ pub struct WorkspaceFileSummary {
     pub size: usize,
     pub is_text: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewRootKind {
+    WorkspaceDocument,
+    SourceEntry,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRootHint {
+    pub kind: PreviewRootKind,
+    pub path: Option<String>,
+    pub root: Option<String>,
+}

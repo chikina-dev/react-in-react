@@ -114,6 +114,12 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     "/workspace/package.json",
   ]);
 
+  await expect(adapter.resolvePreviewRootHint(session.sessionId)).resolves.toEqual({
+    kind: "fallback",
+    path: null,
+    root: null,
+  });
+
   await expect(
     adapter.readWorkspaceFile(session.sessionId, "/workspace/package.json"),
   ).resolves.toEqual({
