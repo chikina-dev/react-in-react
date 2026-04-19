@@ -94,3 +94,24 @@ pub struct PreviewAssetHint {
     pub workspace_path: Option<String>,
     pub document_root: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewRequestKind {
+    RootDocument,
+    RootEntry,
+    FallbackRoot,
+    RuntimeState,
+    WorkspaceState,
+    FileIndex,
+    RuntimeStylesheet,
+    WorkspaceFile,
+    WorkspaceAsset,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRequestHint {
+    pub kind: PreviewRequestKind,
+    pub workspace_path: Option<String>,
+    pub document_root: Option<String>,
+}

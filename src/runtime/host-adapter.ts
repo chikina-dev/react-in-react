@@ -55,6 +55,34 @@ export type HostPreviewAssetHint = {
   documentRoot: string | null;
 };
 
+export type HostPreviewRequestHint =
+  | {
+      kind: "root-document";
+      workspacePath: string;
+      documentRoot: string;
+    }
+  | {
+      kind: "root-entry";
+      workspacePath: string;
+      documentRoot: null;
+    }
+  | {
+      kind:
+        | "fallback-root"
+        | "runtime-state"
+        | "workspace-state"
+        | "file-index"
+        | "runtime-stylesheet"
+        | "not-found";
+      workspacePath: null;
+      documentRoot: null;
+    }
+  | {
+      kind: "workspace-file" | "workspace-asset";
+      workspacePath: string;
+      documentRoot: string;
+    };
+
 export interface RuntimeHostAdapter {
   bootSummary(): Promise<HostBootstrapSummary>;
   createSession(input: {
@@ -66,6 +94,10 @@ export interface RuntimeHostAdapter {
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   resolvePreviewRootHint(sessionId: string): Promise<HostPreviewRootHint>;
   resolvePreviewAssetHint(sessionId: string, relativePath: string): Promise<HostPreviewAssetHint>;
+  resolvePreviewRequestHint(
+    sessionId: string,
+    relativePath: string,
+  ): Promise<HostPreviewRequestHint>;
   resolvePreviewHydrationPaths(sessionId: string, relativePath: string): Promise<string[]>;
   readWorkspaceFile(sessionId: string, path: string): Promise<HostWorkspaceFileContent>;
   readWorkspaceFiles(sessionId: string, paths: string[]): Promise<HostWorkspaceFileContent[]>;
@@ -84,6 +116,7 @@ type WasmRuntimeHostExports = {
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_root_hint_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_asset_hint_json(ptr: number, len: number): number;
+  runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_hydration_paths_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -306,6 +339,79 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     return [...paths];
   }
 
+  async resolvePreviewRequestHint(
+    sessionId: string,
+    relativePath: string,
+  ): Promise<HostPreviewRequestHint> {
+    if (relativePath === "/" || relativePath === "/index.html") {
+      const rootHint = await this.resolvePreviewRootHint(sessionId);
+
+      if (rootHint.kind === "workspace-document") {
+        return {
+          kind: "root-document",
+          workspacePath: rootHint.path,
+          documentRoot: rootHint.root,
+        };
+      }
+
+      if (rootHint.kind === "source-entry") {
+        return {
+          kind: "root-entry",
+          workspacePath: rootHint.path,
+          documentRoot: null,
+        };
+      }
+
+      return {
+        kind: "fallback-root",
+        workspacePath: null,
+        documentRoot: null,
+      };
+    }
+
+    if (relativePath === "/__runtime.json") {
+      return { kind: "runtime-state", workspacePath: null, documentRoot: null };
+    }
+
+    if (relativePath === "/__workspace.json") {
+      return { kind: "workspace-state", workspacePath: null, documentRoot: null };
+    }
+
+    if (relativePath === "/__files.json") {
+      return { kind: "file-index", workspacePath: null, documentRoot: null };
+    }
+
+    if (relativePath === "/assets/runtime.css") {
+      return { kind: "runtime-stylesheet", workspacePath: null, documentRoot: null };
+    }
+
+    if (relativePath.startsWith("/files/")) {
+      const workspacePath = `/workspace${relativePath.replace(/^\/files/, "")}`;
+
+      if (this.sessions.get(sessionId)?.files.has(workspacePath)) {
+        return {
+          kind: "workspace-file",
+          workspacePath,
+          documentRoot: "/workspace",
+        };
+      }
+
+      return { kind: "not-found", workspacePath: null, documentRoot: null };
+    }
+
+    const assetHint = await this.resolvePreviewAssetHint(sessionId, relativePath);
+
+    if (assetHint.workspacePath && assetHint.documentRoot) {
+      return {
+        kind: "workspace-asset",
+        workspacePath: assetHint.workspacePath,
+        documentRoot: assetHint.documentRoot,
+      };
+    }
+
+    return { kind: "not-found", workspacePath: null, documentRoot: null };
+  }
+
   async readWorkspaceFile(sessionId: string, path: string): Promise<HostWorkspaceFileContent> {
     const record = this.sessions.get(sessionId);
 
@@ -426,6 +532,16 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
   ): Promise<HostPreviewAssetHint> {
     return this.invokeWithInput<HostPreviewAssetHint>(
       "runtime_host_resolve_preview_asset_hint_json",
+      [`session_id=${sessionId}`, `relative_path=${encodeHex(relativePath)}`],
+    );
+  }
+
+  async resolvePreviewRequestHint(
+    sessionId: string,
+    relativePath: string,
+  ): Promise<HostPreviewRequestHint> {
+    return this.invokeWithInput<HostPreviewRequestHint>(
+      "runtime_host_resolve_preview_request_hint_json",
       [`session_id=${sessionId}`, `relative_path=${encodeHex(relativePath)}`],
     );
   }

@@ -125,6 +125,12 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     documentRoot: "/workspace",
   });
 
+  await expect(adapter.resolvePreviewRequestHint(session.sessionId, "/logo.png")).resolves.toEqual({
+    kind: "workspace-asset",
+    workspacePath: "/workspace/logo.png",
+    documentRoot: "/workspace",
+  });
+
   await expect(
     adapter.resolvePreviewHydrationPaths(session.sessionId, "/logo.png"),
   ).resolves.toEqual(["/workspace/package.json", "/workspace/logo.png"]);
@@ -206,6 +212,12 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
 
   await expect(adapter.resolvePreviewAssetHint("session-dist", "/assets/app.js")).resolves.toEqual({
     workspacePath: "/workspace/dist/assets/app.js",
+    documentRoot: "/workspace/dist",
+  });
+
+  await expect(adapter.resolvePreviewRequestHint("session-dist", "/")).resolves.toEqual({
+    kind: "root-document",
+    workspacePath: "/workspace/dist/index.html",
     documentRoot: "/workspace/dist",
   });
 

@@ -16,7 +16,11 @@ import type {
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type { HostPreviewAssetHint, HostPreviewRootHint } from "./host-adapter";
+import type {
+  HostPreviewAssetHint,
+  HostPreviewRequestHint,
+  HostPreviewRootHint,
+} from "./host-adapter";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewServerState = {
@@ -27,6 +31,7 @@ type PreviewServerState = {
   model: PreviewModel;
   rootHint?: HostPreviewRootHint;
   assetHint?: HostPreviewAssetHint;
+  requestHint?: HostPreviewRequestHint;
   session: SessionSnapshot;
   files: Map<string, WorkspaceFileRecord>;
 };
@@ -87,6 +92,48 @@ export function buildPreviewResponse(
   }
 
   const relativePath = getPreviewRelativePath(request, preview);
+  const requestHint = preview.requestHint;
+
+  if (requestHint?.kind === "root-document" && requestHint.workspacePath) {
+    const file = preview.files.get(requestHint.workspacePath);
+
+    if (file) {
+      return buildWorkspaceFileResponse(file, preview, requestHint.documentRoot);
+    }
+  }
+
+  if (requestHint?.kind === "root-entry" && requestHint.workspacePath) {
+    return htmlResponse(
+      200,
+      renderPreviewAppShell({
+        title: preview.model.title,
+        entryUrl: buildPreviewUrlForWorkspaceFile(requestHint.workspacePath, preview, "/workspace"),
+      }),
+    );
+  }
+
+  if (requestHint?.kind === "runtime-state" || relativePath === "/__runtime.json") {
+    return jsonResponse(200, {
+      type: "preview.ready",
+      sessionId: preview.sessionId,
+      pid: preview.pid,
+      port: preview.port,
+      url: preview.url,
+      model: preview.model,
+    } satisfies PreviewReadyEvent);
+  }
+
+  if (requestHint?.kind === "workspace-state" || relativePath === "/__workspace.json") {
+    return jsonResponse(200, preview.session);
+  }
+
+  if (requestHint?.kind === "file-index" || relativePath === "/__files.json") {
+    return jsonResponse(200, buildPreviewFileIndex(preview));
+  }
+
+  if (requestHint?.kind === "runtime-stylesheet" || relativePath === "/assets/runtime.css") {
+    return cssResponse(200, renderRuntimeStylesheet());
+  }
 
   if (relativePath === "/" || relativePath === "/index.html") {
     const workspaceDocument = resolvePreviewDocument(preview);
@@ -124,29 +171,6 @@ export function buildPreviewResponse(
         stylesheetUrl: `${preview.url}assets/runtime.css`,
       }),
     );
-  }
-
-  if (relativePath === "/__runtime.json") {
-    return jsonResponse(200, {
-      type: "preview.ready",
-      sessionId: preview.sessionId,
-      pid: preview.pid,
-      port: preview.port,
-      url: preview.url,
-      model: preview.model,
-    } satisfies PreviewReadyEvent);
-  }
-
-  if (relativePath === "/__workspace.json") {
-    return jsonResponse(200, preview.session);
-  }
-
-  if (relativePath === "/__files.json") {
-    return jsonResponse(200, buildPreviewFileIndex(preview));
-  }
-
-  if (relativePath === "/assets/runtime.css") {
-    return cssResponse(200, renderRuntimeStylesheet());
   }
 
   if (relativePath.startsWith("/files/")) {

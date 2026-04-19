@@ -340,6 +340,40 @@ pub extern "C" fn runtime_host_resolve_preview_asset_hint_json(ptr: *const u8, l
     1
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_resolve_preview_request_hint_json(
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let relative_path = match required_field(&fields, "relative_path") {
+        Some(path) => match decode_hex(&path) {
+            Ok(path) => path,
+            Err(error) => return write_error(error),
+        },
+        None => "/".into(),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow()
+            .resolve_preview_request_hint(&session_id, &relative_path);
+
+        match result {
+            Ok(hint) => set_last_result(render_preview_request_hint_json(&hint)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
 fn read_input(ptr: *const u8, len: usize) -> Result<String, String> {
     if ptr.is_null() || len == 0 {
         return Ok(String::new());
@@ -584,6 +618,35 @@ fn render_preview_asset_hint_json(hint: &crate::protocol::PreviewAssetHint) -> S
         .unwrap_or_else(|| "null".into());
 
     format!("{{\"workspacePath\":{workspace_path},\"documentRoot\":{document_root}}}")
+}
+
+fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) -> String {
+    let kind = match hint.kind {
+        crate::protocol::PreviewRequestKind::RootDocument => "root-document",
+        crate::protocol::PreviewRequestKind::RootEntry => "root-entry",
+        crate::protocol::PreviewRequestKind::FallbackRoot => "fallback-root",
+        crate::protocol::PreviewRequestKind::RuntimeState => "runtime-state",
+        crate::protocol::PreviewRequestKind::WorkspaceState => "workspace-state",
+        crate::protocol::PreviewRequestKind::FileIndex => "file-index",
+        crate::protocol::PreviewRequestKind::RuntimeStylesheet => "runtime-stylesheet",
+        crate::protocol::PreviewRequestKind::WorkspaceFile => "workspace-file",
+        crate::protocol::PreviewRequestKind::WorkspaceAsset => "workspace-asset",
+        crate::protocol::PreviewRequestKind::NotFound => "not-found",
+    };
+    let workspace_path = hint
+        .workspace_path
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+    let document_root = hint
+        .document_root
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+
+    format!(
+        "{{\"kind\":\"{kind}\",\"workspacePath\":{workspace_path},\"documentRoot\":{document_root}}}"
+    )
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

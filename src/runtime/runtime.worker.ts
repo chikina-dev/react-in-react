@@ -391,6 +391,10 @@ async function resolvePreviewHttpResponse(
               record.session.sessionId,
               getPreviewRelativePath(request),
             ),
+            requestHint: await hostAdapter.resolvePreviewRequestHint(
+              record.session.sessionId,
+              getPreviewRelativePath(request),
+            ),
             session: record.session,
             files: files ?? new Map(),
           }

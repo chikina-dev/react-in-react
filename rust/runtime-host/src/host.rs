@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRootHint,
-    PreviewRootKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRequestHint,
+    PreviewRequestKind, PreviewRootHint, PreviewRootKind, RunPlan, RunRequest, SessionSnapshot,
+    SessionState, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem};
 
@@ -305,6 +306,93 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             workspace_path: None,
             document_root: Some(document_root),
         })
+    }
+
+    pub fn resolve_preview_request_hint(
+        &self,
+        session_id: &str,
+        relative_path: &str,
+    ) -> RuntimeHostResult<PreviewRequestHint> {
+        match relative_path {
+            "/" | "/index.html" => match self.resolve_preview_root_hint(session_id)? {
+                PreviewRootHint {
+                    kind: PreviewRootKind::WorkspaceDocument,
+                    path: Some(path),
+                    root,
+                } => Ok(PreviewRequestHint {
+                    kind: PreviewRequestKind::RootDocument,
+                    workspace_path: Some(path),
+                    document_root: root,
+                }),
+                PreviewRootHint {
+                    kind: PreviewRootKind::SourceEntry,
+                    path: Some(path),
+                    ..
+                } => Ok(PreviewRequestHint {
+                    kind: PreviewRequestKind::RootEntry,
+                    workspace_path: Some(path),
+                    document_root: None,
+                }),
+                _ => Ok(PreviewRequestHint {
+                    kind: PreviewRequestKind::FallbackRoot,
+                    workspace_path: None,
+                    document_root: None,
+                }),
+            },
+            "/__runtime.json" => Ok(PreviewRequestHint {
+                kind: PreviewRequestKind::RuntimeState,
+                workspace_path: None,
+                document_root: None,
+            }),
+            "/__workspace.json" => Ok(PreviewRequestHint {
+                kind: PreviewRequestKind::WorkspaceState,
+                workspace_path: None,
+                document_root: None,
+            }),
+            "/__files.json" => Ok(PreviewRequestHint {
+                kind: PreviewRequestKind::FileIndex,
+                workspace_path: None,
+                document_root: None,
+            }),
+            "/assets/runtime.css" => Ok(PreviewRequestHint {
+                kind: PreviewRequestKind::RuntimeStylesheet,
+                workspace_path: None,
+                document_root: None,
+            }),
+            path if path.starts_with("/files/") => {
+                let workspace_path = decode_workspace_path(path);
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+
+                Ok(PreviewRequestHint {
+                    kind: if record.vfs.read(&workspace_path).is_some() {
+                        PreviewRequestKind::WorkspaceFile
+                    } else {
+                        PreviewRequestKind::NotFound
+                    },
+                    workspace_path: record
+                        .vfs
+                        .read(&workspace_path)
+                        .map(|file| file.path.clone()),
+                    document_root: Some("/workspace".into()),
+                })
+            }
+            path => {
+                let asset_hint = self.resolve_preview_asset_hint(session_id, path)?;
+
+                Ok(PreviewRequestHint {
+                    kind: if asset_hint.workspace_path.is_some() {
+                        PreviewRequestKind::WorkspaceAsset
+                    } else {
+                        PreviewRequestKind::NotFound
+                    },
+                    workspace_path: asset_hint.workspace_path,
+                    document_root: asset_hint.document_root,
+                })
+            }
+        }
     }
 
     pub fn stop_session(&mut self, session_id: &str) -> RuntimeHostResult<()> {
