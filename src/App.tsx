@@ -20,6 +20,7 @@ import {
   subscribePreviewWorkerState,
   unregisterPreview,
   unregisterSessionPreviews,
+  withPreviewClientHeader,
 } from "./runtime/preview-service-worker";
 
 type TerminalLine = {
@@ -29,6 +30,25 @@ type TerminalLine = {
 
 type HostPreviewFileSelection = PreviewWorkspaceFile & {
   content: string;
+};
+
+type PreviewRouteProbe = {
+  path: string;
+  status: number;
+  contentType: string;
+  bodyPreview: string;
+};
+
+type PreviewInspection = {
+  diagnostics: PreviewDiagnostics;
+  files: PreviewWorkspaceFile[];
+  selectedFile: HostPreviewFileSelection | null;
+  probes: {
+    root: PreviewRouteProbe;
+    runtime: PreviewRouteProbe;
+    diagnostics: PreviewRouteProbe;
+    files: PreviewRouteProbe;
+  };
 };
 
 const DEFAULT_REQUEST: RunRequest = {
@@ -49,13 +69,8 @@ export function App() {
     },
   ]);
   const [preview, setPreview] = useState<PreviewReadyEvent | null>(null);
-  const [previewDiagnostics, setPreviewDiagnostics] = useState<PreviewDiagnostics | null>(null);
-  const [previewDiagnosticsError, setPreviewDiagnosticsError] = useState<string | null>(null);
-  const [previewFiles, setPreviewFiles] = useState<PreviewWorkspaceFile[] | null>(null);
-  const [previewFileSelection, setPreviewFileSelection] = useState<HostPreviewFileSelection | null>(
-    null,
-  );
-  const [previewFilesError, setPreviewFilesError] = useState<string | null>(null);
+  const [previewInspection, setPreviewInspection] = useState<PreviewInspection | null>(null);
+  const [previewInspectionError, setPreviewInspectionError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [previewRouter, setPreviewRouter] = useState("registering");
   const [previewRouterDetail, setPreviewRouterDetail] = useState<string | null>(null);
@@ -74,11 +89,8 @@ export function App() {
     setSession(event.session);
     setSessionState(event.session.state);
     setPreview(null);
-    setPreviewDiagnostics(null);
-    setPreviewDiagnosticsError(null);
-    setPreviewFiles(null);
-    setPreviewFileSelection(null);
-    setPreviewFilesError(null);
+    setPreviewInspection(null);
+    setPreviewInspectionError(null);
     setTerminal([
       {
         kind: "system",
@@ -112,19 +124,14 @@ export function App() {
           kind: "system",
           text: `Process ${event.pid} exited with code ${event.code}.`,
         });
-        setPreviewDiagnostics(null);
-        setPreviewFiles(null);
-        setPreviewFileSelection(null);
-        setPreviewFilesError(null);
+        setPreviewInspection(null);
+        setPreviewInspectionError(null);
         setSessionState("stopped");
         break;
       case "preview.ready":
         setPreview(event);
-        setPreviewDiagnostics(null);
-        setPreviewDiagnosticsError(null);
-        setPreviewFiles(null);
-        setPreviewFileSelection(null);
-        setPreviewFilesError(null);
+        setPreviewInspection(null);
+        setPreviewInspectionError(null);
         void registerPreview(event);
         appendTerminal({
           kind: "system",
@@ -136,11 +143,8 @@ export function App() {
           kind: "stderr",
           text: `${event.error.code}: ${event.error.message}`,
         });
-        setPreviewDiagnostics(null);
-        setPreviewDiagnosticsError(null);
-        setPreviewFiles(null);
-        setPreviewFileSelection(null);
-        setPreviewFilesError(null);
+        setPreviewInspection(null);
+        setPreviewInspectionError(null);
         setSessionState("errored");
         break;
     }
@@ -170,97 +174,23 @@ export function App() {
 
     let cancelled = false;
 
-    void controller
-      .requestPreviewResponse({
-        sessionId: preview.sessionId,
-        port: preview.port,
-        method: "GET",
-        pathname: `${preview.url}__diagnostics.json`,
-        search: "",
-        headers: {},
-      })
-      .then((response) => {
+    void loadPreviewInspection(controller, preview)
+      .then((inspection) => {
         if (cancelled) {
           return;
         }
 
-        if (response.status >= 400) {
-          setPreviewDiagnostics(null);
-          setPreviewDiagnosticsError(`Failed to load diagnostics: ${response.status}`);
-          return;
-        }
-
-        const payload = decodeVirtualHttpBody(response.body);
-        setPreviewDiagnostics(JSON.parse(payload) as PreviewDiagnostics);
-        setPreviewDiagnosticsError(null);
+        setPreviewInspection(inspection);
+        setPreviewInspectionError(null);
       })
       .catch((error: unknown) => {
         if (cancelled) {
           return;
         }
 
-        setPreviewDiagnostics(null);
-        setPreviewDiagnosticsError(
-          error instanceof Error ? error.message : "Failed to load preview diagnostics.",
-        );
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [controller, preview]);
-
-  useEffect(() => {
-    if (!preview) {
-      return;
-    }
-
-    let cancelled = false;
-
-    void controller
-      .requestPreviewJson<PreviewWorkspaceFile[]>(
-        createPreviewRouteRequest(preview, `${preview.url}__files.json`),
-      )
-      .then(async (files) => {
-        if (cancelled) {
-          return;
-        }
-
-        setPreviewFiles(files);
-        setPreviewFilesError(null);
-
-        const preferredFile =
-          files.find((file) => file.path.endsWith("/package.json")) ??
-          files.find((file) => file.path.includes("/src/")) ??
-          files[0];
-
-        if (!preferredFile) {
-          setPreviewFileSelection(null);
-          return;
-        }
-
-        const content = await controller.requestPreviewText(
-          createPreviewRouteRequest(preview, preferredFile.url),
-        );
-
-        if (cancelled) {
-          return;
-        }
-
-        setPreviewFileSelection({
-          ...preferredFile,
-          content,
-        });
-      })
-      .catch((error: unknown) => {
-        if (cancelled) {
-          return;
-        }
-
-        setPreviewFiles(null);
-        setPreviewFileSelection(null);
-        setPreviewFilesError(
-          error instanceof Error ? error.message : "Failed to load preview file index.",
+        setPreviewInspection(null);
+        setPreviewInspectionError(
+          error instanceof Error ? error.message : "Failed to load preview inspection.",
         );
       });
 
@@ -348,11 +278,8 @@ export function App() {
       }
 
       setPreview(null);
-      setPreviewDiagnostics(null);
-      setPreviewDiagnosticsError(null);
-      setPreviewFiles(null);
-      setPreviewFileSelection(null);
-      setPreviewFilesError(null);
+      setPreviewInspection(null);
+      setPreviewInspectionError(null);
       await controller.run(session.sessionId, request);
     } finally {
       setIsBusy(false);
@@ -373,11 +300,8 @@ export function App() {
 
       await controller.stop(session.sessionId);
       setPreview(null);
-      setPreviewDiagnostics(null);
-      setPreviewDiagnosticsError(null);
-      setPreviewFiles(null);
-      setPreviewFileSelection(null);
-      setPreviewFilesError(null);
+      setPreviewInspection(null);
+      setPreviewInspectionError(null);
     } finally {
       setIsBusy(false);
     }
@@ -601,27 +525,28 @@ export function App() {
             </div>
           </div>
 
-          {previewDiagnostics ? (
+          {previewInspection ? (
             <div className="meta-grid">
               <MetaRow label="Root hint">
-                {previewDiagnostics.rootRequestHint?.kind ?? "none"}
+                {previewInspection.diagnostics.rootRequestHint?.kind ?? "none"}
               </MetaRow>
               <MetaRow label="Request hint">
-                {previewDiagnostics.requestHint?.kind ?? "none"}
+                {previewInspection.diagnostics.requestHint?.kind ?? "none"}
               </MetaRow>
               <MetaRow label="Hydrated files">
-                {previewDiagnostics.hydratedFileCount} / {previewDiagnostics.fileCount}
+                {previewInspection.diagnostics.hydratedFileCount} /{" "}
+                {previewInspection.diagnostics.fileCount}
               </MetaRow>
               <MetaRow label="Hydrated paths">
-                {previewDiagnostics.hydratedPaths.slice(0, 3).join(", ") || "none"}
+                {previewInspection.diagnostics.hydratedPaths.slice(0, 3).join(", ") || "none"}
               </MetaRow>
               <MetaRow label="Diagnostics URL">
-                {`${previewDiagnostics.url}__diagnostics.json`}
+                {`${previewInspection.diagnostics.url}__diagnostics.json`}
               </MetaRow>
             </div>
           ) : (
             <p className="empty-copy">
-              {previewDiagnosticsError ??
+              {previewInspectionError ??
                 "preview 実行後に __diagnostics.json を読み、request hint と hydration 状態をここへ表示します。"}
             </p>
           )}
@@ -635,20 +560,41 @@ export function App() {
             </div>
           </div>
 
-          {previewFiles && previewFileSelection ? (
+          {previewInspection ? (
             <div className="meta-grid">
-              <MetaRow label="Indexed files">{String(previewFiles.length)}</MetaRow>
-              <MetaRow label="Selected file">{previewFileSelection.path}</MetaRow>
-              <MetaRow label="Content type">{previewFileSelection.contentType}</MetaRow>
-              <MetaRow label="Preview route">{previewFileSelection.previewUrl}</MetaRow>
-              <MetaRow label="Raw route">{previewFileSelection.url}</MetaRow>
+              <MetaRow label="Root route">
+                {previewInspection.probes.root.status} / {previewInspection.probes.root.contentType}
+              </MetaRow>
+              <MetaRow label="Runtime route">
+                {previewInspection.probes.runtime.status} /{" "}
+                {previewInspection.probes.runtime.contentType}
+              </MetaRow>
+              <MetaRow label="Files route">
+                {previewInspection.probes.files.status} /{" "}
+                {previewInspection.probes.files.contentType}
+              </MetaRow>
+              <MetaRow label="Indexed files">{String(previewInspection.files.length)}</MetaRow>
+              <MetaRow label="Selected file">
+                {previewInspection.selectedFile?.path ?? "none"}
+              </MetaRow>
+              <MetaRow label="Content type">
+                {previewInspection.selectedFile?.contentType ?? "none"}
+              </MetaRow>
+              <MetaRow label="Preview route">
+                {previewInspection.selectedFile?.previewUrl ?? "none"}
+              </MetaRow>
+              <MetaRow label="Raw route">{previewInspection.selectedFile?.url ?? "none"}</MetaRow>
               <MetaRow label="Body preview">
-                <code>{truncateInspectorSource(previewFileSelection.content)}</code>
+                <code>
+                  {previewInspection.selectedFile
+                    ? truncateInspectorSource(previewInspection.selectedFile.content)
+                    : previewInspection.probes.root.bodyPreview}
+                </code>
               </MetaRow>
             </div>
           ) : (
             <p className="empty-copy">
-              {previewFilesError ??
+              {previewInspectionError ??
                 "preview 実行後に __files.json と実ファイル本文を読み、ホスト側からも preview ルートを検査します。"}
             </p>
           )}
@@ -714,6 +660,7 @@ function decodeVirtualHttpBody(body: string | Uint8Array): string {
 function createPreviewRouteRequest(
   preview: PreviewReadyEvent,
   pathname: string,
+  headers: Record<string, string> = {},
 ): {
   sessionId: string;
   port: number;
@@ -728,12 +675,86 @@ function createPreviewRouteRequest(
     method: "GET",
     pathname,
     search: "",
-    headers: {},
+    headers,
   };
 }
 
 function truncateInspectorSource(source: string): string {
   return source.split("\n").slice(0, 4).join(" ").slice(0, 140);
+}
+
+async function loadPreviewInspection(
+  controller: RuntimeController,
+  preview: PreviewReadyEvent,
+): Promise<PreviewInspection> {
+  const [rootResponse, runtimeResponse, diagnosticsResponse, filesResponse] = await Promise.all([
+    controller.requestPreviewResponse(
+      createPreviewRouteRequest(preview, preview.url, withPreviewClientHeader({})),
+    ),
+    controller.requestPreviewResponse(
+      createPreviewRouteRequest(preview, `${preview.url}__runtime.json`),
+    ),
+    controller.requestPreviewResponse(
+      createPreviewRouteRequest(preview, `${preview.url}__diagnostics.json`),
+    ),
+    controller.requestPreviewResponse(
+      createPreviewRouteRequest(preview, `${preview.url}__files.json`),
+    ),
+  ]);
+
+  if (
+    rootResponse.status >= 400 ||
+    runtimeResponse.status >= 400 ||
+    diagnosticsResponse.status >= 400 ||
+    filesResponse.status >= 400
+  ) {
+    throw new Error(
+      `Preview inspection failed: root=${rootResponse.status} runtime=${runtimeResponse.status} diagnostics=${diagnosticsResponse.status} files=${filesResponse.status}`,
+    );
+  }
+
+  const diagnostics = JSON.parse(
+    decodeVirtualHttpBody(diagnosticsResponse.body),
+  ) as PreviewDiagnostics;
+  const files = JSON.parse(decodeVirtualHttpBody(filesResponse.body)) as PreviewWorkspaceFile[];
+  const preferredFile =
+    files.find((file) => file.path.endsWith("/package.json")) ??
+    files.find((file) => file.path.includes("/src/")) ??
+    files[0] ??
+    null;
+
+  const selectedFile = preferredFile
+    ? {
+        ...preferredFile,
+        content: await controller.requestPreviewText(
+          createPreviewRouteRequest(preview, preferredFile.url),
+        ),
+      }
+    : null;
+
+  return {
+    diagnostics,
+    files,
+    selectedFile,
+    probes: {
+      root: buildPreviewRouteProbe(preview.url, rootResponse),
+      runtime: buildPreviewRouteProbe(`${preview.url}__runtime.json`, runtimeResponse),
+      diagnostics: buildPreviewRouteProbe(`${preview.url}__diagnostics.json`, diagnosticsResponse),
+      files: buildPreviewRouteProbe(`${preview.url}__files.json`, filesResponse),
+    },
+  };
+}
+
+function buildPreviewRouteProbe(
+  path: string,
+  response: { status: number; headers: Record<string, string>; body: string | Uint8Array },
+): PreviewRouteProbe {
+  return {
+    path,
+    status: response.status,
+    contentType: response.headers["content-type"] ?? "unknown",
+    bodyPreview: truncateInspectorSource(decodeVirtualHttpBody(response.body)),
+  };
 }
 
 function StatusPill(props: { label: string; value: string }) {
