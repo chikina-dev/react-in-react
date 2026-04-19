@@ -76,26 +76,6 @@ pub struct WorkspaceFileSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreviewRootKind {
-    WorkspaceDocument,
-    SourceEntry,
-    Fallback,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewRootHint {
-    pub kind: PreviewRootKind,
-    pub path: Option<String>,
-    pub root: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewAssetHint {
-    pub workspace_path: Option<String>,
-    pub document_root: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewRequestKind {
     RootDocument,
     RootEntry,

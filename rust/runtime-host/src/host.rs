@@ -3,9 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRequestHint,
-    PreviewRequestKind, PreviewRootHint, PreviewRootKind, RunPlan, RunRequest, SessionSnapshot,
-    SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem};
 
@@ -26,6 +25,26 @@ const PREVIEW_APP_ENTRY_CANDIDATES: [&str; 8] = [
     "/workspace/src/index.ts",
     "/workspace/src/index.js",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreviewRootKind {
+    WorkspaceDocument,
+    SourceEntry,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewRootHint {
+    kind: PreviewRootKind,
+    path: Option<String>,
+    root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewAssetHint {
+    workspace_path: Option<String>,
+    document_root: Option<String>,
+}
 
 #[derive(Debug)]
 struct SessionRecord {
@@ -165,20 +184,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .ok_or_else(|| RuntimeHostError::FileNotFound(path.into()))
     }
 
-    pub fn resolve_preview_hydration_paths(
-        &self,
-        session_id: &str,
-        relative_path: &str,
-    ) -> RuntimeHostResult<Vec<String>> {
-        Ok(self
-            .resolve_preview_request_hint(session_id, relative_path)?
-            .hydrate_paths)
-    }
-
-    pub fn resolve_preview_root_hint(
-        &self,
-        session_id: &str,
-    ) -> RuntimeHostResult<PreviewRootHint> {
+    fn resolve_preview_root_hint(&self, session_id: &str) -> RuntimeHostResult<PreviewRootHint> {
         let record = self
             .sessions
             .get(session_id)
@@ -213,7 +219,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         })
     }
 
-    pub fn resolve_preview_asset_hint(
+    fn resolve_preview_asset_hint(
         &self,
         session_id: &str,
         relative_path: &str,

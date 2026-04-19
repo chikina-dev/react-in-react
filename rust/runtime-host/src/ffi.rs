@@ -254,93 +254,6 @@ pub extern "C" fn runtime_host_read_workspace_files_json(ptr: *const u8, len: us
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_host_resolve_preview_hydration_paths_json(
-    ptr: *const u8,
-    len: usize,
-) -> u32 {
-    let input = match read_input(ptr, len) {
-        Ok(input) => input,
-        Err(error) => return write_error(error),
-    };
-
-    let fields = parse_fields(&input);
-    let session_id = required_field(&fields, "session_id").unwrap_or_default();
-    let relative_path = match required_field(&fields, "relative_path") {
-        Some(path) => match decode_hex(&path) {
-            Ok(path) => path,
-            Err(error) => return write_error(error),
-        },
-        None => "/".into(),
-    };
-
-    HOST.with(|host| {
-        let result = host
-            .borrow()
-            .resolve_preview_hydration_paths(&session_id, &relative_path);
-
-        match result {
-            Ok(paths) => set_last_result(render_string_array_json(&paths)),
-            Err(error) => set_last_result(render_error_json(&error.to_string())),
-        }
-    });
-
-    1
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_host_resolve_preview_root_hint_json(ptr: *const u8, len: usize) -> u32 {
-    let input = match read_input(ptr, len) {
-        Ok(input) => input,
-        Err(error) => return write_error(error),
-    };
-
-    let fields = parse_fields(&input);
-    let session_id = required_field(&fields, "session_id").unwrap_or_default();
-
-    HOST.with(|host| {
-        let result = host.borrow().resolve_preview_root_hint(&session_id);
-
-        match result {
-            Ok(hint) => set_last_result(render_preview_root_hint_json(&hint)),
-            Err(error) => set_last_result(render_error_json(&error.to_string())),
-        }
-    });
-
-    1
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_host_resolve_preview_asset_hint_json(ptr: *const u8, len: usize) -> u32 {
-    let input = match read_input(ptr, len) {
-        Ok(input) => input,
-        Err(error) => return write_error(error),
-    };
-
-    let fields = parse_fields(&input);
-    let session_id = required_field(&fields, "session_id").unwrap_or_default();
-    let relative_path = match required_field(&fields, "relative_path") {
-        Some(path) => match decode_hex(&path) {
-            Ok(path) => path,
-            Err(error) => return write_error(error),
-        },
-        None => "/".into(),
-    };
-
-    HOST.with(|host| {
-        let result = host
-            .borrow()
-            .resolve_preview_asset_hint(&session_id, &relative_path);
-
-        match result {
-            Ok(hint) => set_last_result(render_preview_asset_hint_json(&hint)),
-            Err(error) => set_last_result(render_error_json(&error.to_string())),
-        }
-    });
-
-    1
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn runtime_host_resolve_preview_request_hint_json(
     ptr: *const u8,
     len: usize,
@@ -583,41 +496,6 @@ fn render_string_array_json(values: &[String]) -> String {
         .join(",");
 
     format!("[{items}]")
-}
-
-fn render_preview_root_hint_json(hint: &crate::protocol::PreviewRootHint) -> String {
-    let kind = match hint.kind {
-        crate::protocol::PreviewRootKind::WorkspaceDocument => "workspace-document",
-        crate::protocol::PreviewRootKind::SourceEntry => "source-entry",
-        crate::protocol::PreviewRootKind::Fallback => "fallback",
-    };
-    let path = hint
-        .path
-        .as_ref()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".into());
-    let root = hint
-        .root
-        .as_ref()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".into());
-
-    format!("{{\"kind\":\"{kind}\",\"path\":{path},\"root\":{root}}}")
-}
-
-fn render_preview_asset_hint_json(hint: &crate::protocol::PreviewAssetHint) -> String {
-    let workspace_path = hint
-        .workspace_path
-        .as_ref()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".into());
-    let document_root = hint
-        .document_root
-        .as_ref()
-        .map(|value| format!("\"{}\"", escape_json(value)))
-        .unwrap_or_else(|| "null".into());
-
-    format!("{{\"workspacePath\":{workspace_path},\"documentRoot\":{document_root}}}")
 }
 
 fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) -> String {

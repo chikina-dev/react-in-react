@@ -9,9 +9,8 @@ pub use engine::{EngineAdapter, EngineDescriptor, NullEngineAdapter};
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRequestHint,
-    PreviewRequestKind, PreviewRootHint, PreviewRootKind, RunPlan, RunRequest, SessionSnapshot,
-    SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -66,30 +65,16 @@ mod tests {
             b"export default null;"
         );
         assert_eq!(
-            host.resolve_preview_hydration_paths(&session.session_id, "/")
-                .expect("preview hydration paths should resolve"),
-            vec![
-                "/workspace/package.json".to_string(),
-                "/workspace/src/main.tsx".to_string(),
-            ]
-        );
-        assert_eq!(
-            host.resolve_preview_root_hint(&session.session_id)
-                .expect("preview root hint should resolve")
-                .path
-                .as_deref(),
-            Some("/workspace/src/main.tsx")
-        );
-        assert_eq!(
-            host.resolve_preview_asset_hint(&session.session_id, "/src/main.tsx")
-                .expect("preview asset hint should resolve")
+            host.resolve_preview_request_hint(&session.session_id, "/")
+                .expect("preview root request hint should resolve")
                 .workspace_path
                 .as_deref(),
             Some("/workspace/src/main.tsx")
         );
         assert_eq!(
-            host.resolve_preview_hydration_paths(&session.session_id, "/src/main.tsx")
-                .expect("preview asset hydration should resolve"),
+            host.resolve_preview_request_hint(&session.session_id, "/")
+                .expect("preview root request hint should resolve")
+                .hydrate_paths,
             vec![
                 "/workspace/package.json".to_string(),
                 "/workspace/src/main.tsx".to_string(),
@@ -100,6 +85,15 @@ mod tests {
                 .expect("preview request hint should resolve")
                 .kind,
             PreviewRequestKind::WorkspaceAsset
+        );
+        assert_eq!(
+            host.resolve_preview_request_hint(&session.session_id, "/src/main.tsx")
+                .expect("preview request hint should resolve")
+                .hydrate_paths,
+            vec![
+                "/workspace/package.json".to_string(),
+                "/workspace/src/main.tsx".to_string(),
+            ]
         );
         assert_eq!(
             host.resolve_preview_request_hint(&session.session_id, "/__diagnostics.json")
