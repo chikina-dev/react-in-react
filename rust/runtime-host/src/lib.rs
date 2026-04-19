@@ -123,6 +123,29 @@ mod tests {
             ]
         );
         assert_eq!(
+            host.create_workspace_directory(&session.session_id, "/workspace/src/generated")
+                .expect("workspace directory should be creatable")
+                .path,
+            "/workspace/src/generated"
+        );
+        assert_eq!(
+            host.write_workspace_file(
+                &session.session_id,
+                "/workspace/src/generated/app.ts",
+                b"export const generated = true;".to_vec(),
+                true,
+            )
+            .expect("workspace file should be writable")
+            .size,
+            30
+        );
+        assert_eq!(
+            host.read_workspace_file(&session.session_id, "/workspace/src/generated/app.ts")
+                .expect("generated file should be readable")
+                .bytes,
+            b"export const generated = true;"
+        );
+        assert_eq!(
             host.plan_run(
                 &session.session_id,
                 &RunRequest::new("src", "node", vec![String::from("main")]),

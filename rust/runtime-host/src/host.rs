@@ -273,6 +273,40 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         record.vfs.read_dir(&resolved)
     }
 
+    pub fn create_workspace_directory(
+        &mut self,
+        session_id: &str,
+        path: &str,
+    ) -> RuntimeHostResult<WorkspaceEntrySummary> {
+        let record = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let resolved = resolve_workspace_path(record, path);
+
+        record.vfs.create_dir_all(&resolved)?;
+        record
+            .vfs
+            .stat(&resolved)
+            .ok_or_else(|| RuntimeHostError::DirectoryNotFound(resolved))
+    }
+
+    pub fn write_workspace_file(
+        &mut self,
+        session_id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        is_text: bool,
+    ) -> RuntimeHostResult<WorkspaceEntrySummary> {
+        let record = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let resolved = resolve_workspace_path(record, path);
+
+        record.vfs.write_file(&resolved, bytes, is_text)
+    }
+
     fn resolve_preview_root_hint(&self, session_id: &str) -> RuntimeHostResult<PreviewRootHint> {
         let record = self
             .sessions

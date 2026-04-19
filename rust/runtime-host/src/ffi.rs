@@ -308,6 +308,73 @@ pub extern "C" fn runtime_host_read_workspace_directory_json(ptr: *const u8, len
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_create_workspace_directory_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let encoded_path = required_field(&fields, "path").unwrap_or_default();
+    let path = match decode_hex(&encoded_path) {
+        Ok(path) => path,
+        Err(error) => return write_error(error),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .create_workspace_directory(&session_id, &path);
+
+        match result {
+            Ok(entry) => set_last_result(render_workspace_entry_json(&entry)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_write_workspace_file_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let encoded_path = required_field(&fields, "path").unwrap_or_default();
+    let path = match decode_hex(&encoded_path) {
+        Ok(path) => path,
+        Err(error) => return write_error(error),
+    };
+    let is_text = fields
+        .get("is_text")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+    let encoded_bytes = required_field(&fields, "bytes").unwrap_or_default();
+    let bytes = match decode_hex_bytes(&encoded_bytes) {
+        Ok(bytes) => bytes,
+        Err(error) => return write_error(error),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .write_workspace_file(&session_id, &path, bytes, is_text);
+
+        match result {
+            Ok(entry) => set_last_result(render_workspace_entry_json(&entry)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn runtime_host_resolve_preview_request_hint_json(
     ptr: *const u8,
     len: usize,

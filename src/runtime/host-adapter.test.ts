@@ -331,3 +331,74 @@ test("MockRuntimeHostAdapter validates cwd and node entrypoints", async () => {
     }),
   ).rejects.toThrow("workspace directory not found");
 });
+
+test("MockRuntimeHostAdapter mutates the workspace tree", async () => {
+  const adapter = new MockRuntimeHostAdapter();
+
+  await adapter.createSession({
+    sessionId: session.sessionId,
+    session,
+    files,
+  });
+
+  await expect(
+    adapter.createWorkspaceDirectory(session.sessionId, "/workspace/src/generated"),
+  ).resolves.toEqual({
+    path: "/workspace/src/generated",
+    kind: "directory",
+    size: 0,
+    isText: false,
+  });
+
+  await expect(
+    adapter.writeWorkspaceFile(session.sessionId, {
+      path: "/workspace/src/generated/app.ts",
+      bytes: new TextEncoder().encode("export const generated = true;"),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    path: "/workspace/src/generated/app.ts",
+    kind: "file",
+    size: 30,
+    isText: true,
+  });
+
+  await expect(
+    adapter.readWorkspaceDirectory(session.sessionId, "/workspace/src"),
+  ).resolves.toEqual([
+    {
+      path: "/workspace/src/generated",
+      kind: "directory",
+      size: 0,
+      isText: false,
+    },
+    {
+      path: "/workspace/src/server.ts",
+      kind: "file",
+      size: 20,
+      isText: true,
+    },
+  ]);
+
+  await expect(
+    adapter.readWorkspaceFile(session.sessionId, "/workspace/src/generated/app.ts"),
+  ).resolves.toEqual({
+    path: "/workspace/src/generated/app.ts",
+    size: 30,
+    isText: true,
+    textContent: "export const generated = true;",
+    bytes: new TextEncoder().encode("export const generated = true;"),
+  });
+
+  await expect(
+    adapter.writeWorkspaceFile(session.sessionId, {
+      path: "/workspace/src",
+      bytes: new TextEncoder().encode("nope"),
+      isText: true,
+    }),
+  ).rejects.toThrow("workspace path is a directory");
+
+  await expect(adapter.createWorkspaceDirectory(session.sessionId, "/tmp/outside")).rejects.toThrow(
+    "workspace path must stay under /workspace",
+  );
+});

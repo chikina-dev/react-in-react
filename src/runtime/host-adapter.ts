@@ -1,4 +1,4 @@
-import type { WorkspaceFileRecord } from "./analyze-archive";
+import { guessContentType, type WorkspaceFileRecord } from "./analyze-archive";
 import type { RunRequest, SessionSnapshot } from "./protocol";
 
 export type HostBootstrapSummary = {
@@ -103,6 +103,15 @@ export interface RuntimeHostAdapter {
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
   readWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary[]>;
+  createWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
+  writeWorkspaceFile(
+    sessionId: string,
+    input: {
+      path: string;
+      bytes: Uint8Array;
+      isText: boolean;
+    },
+  ): Promise<HostWorkspaceEntrySummary>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -124,6 +133,8 @@ type WasmRuntimeHostExports = {
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_stat_workspace_path_json(ptr: number, len: number): number;
   runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
+  runtime_host_create_workspace_directory_json(ptr: number, len: number): number;
+  runtime_host_write_workspace_file_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -308,6 +319,91 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     return [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  async createWorkspaceDirectory(
+    sessionId: string,
+    path: string,
+  ): Promise<HostWorkspaceEntrySummary> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, path);
+    assertMockWorkspacePathWithinRoot(record.handle.workspaceRoot, resolved);
+    if (record.files.has(resolved)) {
+      throw new Error(`workspace path is not a directory: ${resolved}`);
+    }
+
+    let current = resolved;
+    while (current.startsWith(record.handle.workspaceRoot)) {
+      record.directories.add(current);
+
+      if (current === record.handle.workspaceRoot) {
+        break;
+      }
+
+      current = parentMockPosixPath(current);
+    }
+
+    return {
+      path: resolved,
+      kind: "directory",
+      size: 0,
+      isText: false,
+    };
+  }
+
+  async writeWorkspaceFile(
+    sessionId: string,
+    input: {
+      path: string;
+      bytes: Uint8Array;
+      isText: boolean;
+    },
+  ): Promise<HostWorkspaceEntrySummary> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, input.path);
+    assertMockWorkspacePathWithinRoot(record.handle.workspaceRoot, resolved);
+    if (record.directories.has(resolved)) {
+      throw new Error(`workspace path is a directory: ${resolved}`);
+    }
+
+    let current = parentMockPosixPath(resolved);
+    while (current.startsWith(record.handle.workspaceRoot)) {
+      record.directories.add(current);
+
+      if (current === record.handle.workspaceRoot) {
+        break;
+      }
+
+      current = parentMockPosixPath(current);
+    }
+
+    const bytes = new Uint8Array(input.bytes);
+    const textContent = input.isText ? new TextDecoder().decode(bytes) : null;
+    record.files.set(resolved, {
+      path: resolved,
+      size: bytes.byteLength,
+      contentType: guessContentType(resolved),
+      isText: input.isText,
+      bytes,
+      textContent,
+    });
+
+    return {
+      path: resolved,
+      kind: "file",
+      size: bytes.byteLength,
+      isText: input.isText,
+    };
   }
 
   private getPreviewRootHint(sessionId: string): MockPreviewRootHint {
@@ -591,6 +687,35 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     );
   }
 
+  async createWorkspaceDirectory(
+    sessionId: string,
+    path: string,
+  ): Promise<HostWorkspaceEntrySummary> {
+    return this.invokeWithInput<HostWorkspaceEntrySummary>(
+      "runtime_host_create_workspace_directory_json",
+      [`session_id=${sessionId}`, `path=${encodeHex(path)}`],
+    );
+  }
+
+  async writeWorkspaceFile(
+    sessionId: string,
+    input: {
+      path: string;
+      bytes: Uint8Array;
+      isText: boolean;
+    },
+  ): Promise<HostWorkspaceEntrySummary> {
+    return this.invokeWithInput<HostWorkspaceEntrySummary>(
+      "runtime_host_write_workspace_file_json",
+      [
+        `session_id=${sessionId}`,
+        `path=${encodeHex(input.path)}`,
+        `is_text=${String(input.isText)}`,
+        `bytes=${encodeHex(input.bytes)}`,
+      ],
+    );
+  }
+
   async resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -824,6 +949,12 @@ function resolveMockWorkspacePath(workspaceRoot: string, path: string): string {
   }
 
   return normalizeMockPosixPath(path.startsWith("/") ? path : `${workspaceRoot}/${path}`);
+}
+
+function assertMockWorkspacePathWithinRoot(workspaceRoot: string, path: string): void {
+  if (!(path === workspaceRoot || path.startsWith(`${workspaceRoot}/`))) {
+    throw new Error(`workspace path must stay under /workspace: ${path}`);
+  }
 }
 
 function collectMockDirectories(

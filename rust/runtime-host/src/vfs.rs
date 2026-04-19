@@ -87,6 +87,63 @@ impl VirtualFileSystem {
         self.files.get(path)
     }
 
+    pub fn create_dir_all(&mut self, path: &str) -> RuntimeHostResult<()> {
+        let normalized = normalize_posix_path(path);
+
+        if !normalized.starts_with(&self.workspace_root) {
+            return Err(RuntimeHostError::InvalidWorkspacePath(normalized));
+        }
+
+        if self.files.contains_key(&normalized) {
+            return Err(RuntimeHostError::NotADirectory(normalized));
+        }
+
+        for directory in parent_directories(&normalized, &self.workspace_root) {
+            self.directories.insert(directory);
+        }
+
+        self.directories.insert(normalized);
+        Ok(())
+    }
+
+    pub fn write_file(
+        &mut self,
+        path: &str,
+        bytes: Vec<u8>,
+        is_text: bool,
+    ) -> RuntimeHostResult<WorkspaceEntrySummary> {
+        let normalized = normalize_posix_path(path);
+
+        if !normalized.starts_with(&self.workspace_root) {
+            return Err(RuntimeHostError::InvalidWorkspacePath(normalized));
+        }
+
+        if self.directories.contains(&normalized) {
+            return Err(RuntimeHostError::IsADirectory(normalized));
+        }
+
+        for directory in parent_directories(&normalized, &self.workspace_root) {
+            self.directories.insert(directory);
+        }
+
+        let size = bytes.len();
+        self.files.insert(
+            normalized.clone(),
+            VirtualFile {
+                path: normalized.clone(),
+                bytes,
+                is_text,
+            },
+        );
+
+        Ok(WorkspaceEntrySummary {
+            path: normalized,
+            kind: WorkspaceEntryKind::File,
+            size,
+            is_text,
+        })
+    }
+
     pub fn exists(&self, path: &str) -> bool {
         self.files.contains_key(path) || self.directories.contains(path)
     }
@@ -289,6 +346,34 @@ mod tests {
                 "/workspace/public".to_string(),
                 "/workspace/src".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn create_dir_all_and_write_file_mutate_workspace_tree() {
+        let mut vfs = VirtualFileSystem::new("/workspace");
+        vfs.mount_files([VirtualFile::text("/workspace/package.json", "{}")])
+            .expect("mount should succeed");
+
+        vfs.create_dir_all("/workspace/src/generated")
+            .expect("directory creation should succeed");
+        let written = vfs
+            .write_file(
+                "/workspace/src/generated/app.js",
+                b"console.log('generated');".to_vec(),
+                true,
+            )
+            .expect("file write should succeed");
+
+        assert!(vfs.is_dir("/workspace/src"));
+        assert!(vfs.is_dir("/workspace/src/generated"));
+        assert_eq!(written.path, "/workspace/src/generated/app.js");
+        assert_eq!(written.size, 25);
+        assert_eq!(
+            vfs.read("/workspace/src/generated/app.js")
+                .expect("generated file should exist")
+                .bytes,
+            b"console.log('generated');"
         );
     }
 }
