@@ -1,7 +1,12 @@
 import ReactDOM from "react-dom/client";
 
 import { PreviewApp } from "./preview/PreviewApp";
-import type { PreviewReadyEvent, PreviewWorkspaceFile, SessionSnapshot } from "./runtime/protocol";
+import type {
+  PreviewDiagnostics,
+  PreviewReadyEvent,
+  PreviewWorkspaceFile,
+  SessionSnapshot,
+} from "./runtime/protocol";
 import "./style.css";
 
 type PreviewBootstrap = {
@@ -10,6 +15,7 @@ type PreviewBootstrap = {
   stateUrl: string;
   workspaceUrl: string;
   filesUrl: string;
+  diagnosticsUrl: string;
 };
 
 declare global {
@@ -31,11 +37,13 @@ async function main(): Promise<void> {
     throw new Error("Missing preview bootstrap payload");
   }
 
-  const [previewResponse, workspaceResponse, filesResponse] = await Promise.all([
-    fetch(bootstrap.stateUrl, { cache: "no-store" }),
-    fetch(bootstrap.workspaceUrl, { cache: "no-store" }),
-    fetch(bootstrap.filesUrl, { cache: "no-store" }),
-  ]);
+  const [previewResponse, workspaceResponse, filesResponse, diagnosticsResponse] =
+    await Promise.all([
+      fetch(bootstrap.stateUrl, { cache: "no-store" }),
+      fetch(bootstrap.workspaceUrl, { cache: "no-store" }),
+      fetch(bootstrap.filesUrl, { cache: "no-store" }),
+      fetch(bootstrap.diagnosticsUrl, { cache: "no-store" }),
+    ]);
 
   if (!previewResponse.ok) {
     throw new Error(`Failed to load preview data: ${previewResponse.status}`);
@@ -49,11 +57,16 @@ async function main(): Promise<void> {
     throw new Error(`Failed to load file index: ${filesResponse.status}`);
   }
 
-  const [preview, workspace, files] = (await Promise.all([
+  if (!diagnosticsResponse.ok) {
+    throw new Error(`Failed to load diagnostics: ${diagnosticsResponse.status}`);
+  }
+
+  const [preview, workspace, files, diagnostics] = (await Promise.all([
     previewResponse.json(),
     workspaceResponse.json(),
     filesResponse.json(),
-  ])) as [PreviewReadyEvent, SessionSnapshot, PreviewWorkspaceFile[]];
+    diagnosticsResponse.json(),
+  ])) as [PreviewReadyEvent, SessionSnapshot, PreviewWorkspaceFile[], PreviewDiagnostics];
 
   const preferredFile =
     files.find((file) => file.path.endsWith("/package.json")) ??
@@ -77,6 +90,7 @@ async function main(): Promise<void> {
     <PreviewApp
       files={files}
       preview={preview}
+      diagnostics={diagnostics}
       selectedFile={selectedFile}
       workspace={workspace}
     />,

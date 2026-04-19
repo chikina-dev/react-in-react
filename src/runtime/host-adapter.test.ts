@@ -52,6 +52,17 @@ const files = new Map<string, WorkspaceFileRecord>([
       textContent: null,
     },
   ],
+  [
+    "/workspace/src/server.ts",
+    {
+      path: "/workspace/src/server.ts",
+      size: 20,
+      contentType: "text/plain; charset=utf-8",
+      isText: true,
+      bytes: new TextEncoder().encode("console.log('server')"),
+      textContent: "console.log('server')",
+    },
+  ],
 ]);
 
 test("MockRuntimeHostAdapter reports the null engine boot summary", async () => {
@@ -78,7 +89,7 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     sessionId: "session-1",
     workspaceRoot: "/workspace",
     packageName: "demo-app",
-    fileCount: 2,
+    fileCount: 3,
   });
 
   await expect(
@@ -109,6 +120,11 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
       path: "/workspace/logo.png",
       size: 4,
       isText: false,
+    },
+    {
+      path: "/workspace/src/server.ts",
+      size: 20,
+      isText: true,
     },
   ]);
 
@@ -177,6 +193,17 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
         textContent: "console.log('dist');",
       },
     ],
+    [
+      "/workspace/server.js",
+      {
+        path: "/workspace/server.js",
+        size: 21,
+        contentType: "text/javascript; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("console.log('server');"),
+        textContent: "console.log('server');",
+      },
+    ],
   ]);
 
   await adapter.createSession({
@@ -212,10 +239,51 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
     }),
   ).resolves.toEqual({
     cwd: "/workspace",
-    entrypoint: "server.js",
+    entrypoint: "/workspace/server.js",
     commandLine: "node server.js",
     envCount: 0,
     commandKind: "node-entrypoint",
     resolvedScript: null,
   });
+});
+
+test("MockRuntimeHostAdapter validates cwd and node entrypoints", async () => {
+  const adapter = new MockRuntimeHostAdapter();
+
+  await adapter.createSession({
+    sessionId: session.sessionId,
+    session,
+    files,
+  });
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "src",
+      command: "node",
+      args: ["server"],
+    }),
+  ).resolves.toEqual({
+    cwd: "/workspace/src",
+    entrypoint: "/workspace/src/server.ts",
+    commandLine: "node server",
+    envCount: 0,
+    commandKind: "node-entrypoint",
+    resolvedScript: null,
+  });
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "/tmp",
+      command: "node",
+      args: ["server"],
+    }),
+  ).rejects.toThrow("working directory must stay under /workspace");
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "/workspace",
+      command: "node",
+      args: ["missing-entry"],
+    }),
+  ).rejects.toThrow("entrypoint not found");
 });

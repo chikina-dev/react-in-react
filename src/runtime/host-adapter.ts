@@ -168,7 +168,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     const commandLine = [request.command, ...request.args].join(" ").trim();
-    const cwd = request.cwd || record.handle.workspaceRoot;
+    const cwd = resolveMockRunCwd(record.handle.workspaceRoot, request.cwd);
 
     if (request.command === "npm" && request.args[0] === "run") {
       const scriptName = request.args[1];
@@ -188,11 +188,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     if (request.command === "node") {
-      const entrypoint = request.args[0];
-
-      if (!entrypoint) {
-        throw new Error("node entrypoint is required");
-      }
+      const entrypoint = resolveMockNodeEntrypoint(record.files, cwd, request.args[0]);
 
       return {
         cwd,
@@ -628,6 +624,77 @@ function resolveMockPreviewAssetWorkspacePath(
   }
 
   return candidates.find((candidate) => files.has(candidate)) ?? null;
+}
+
+function resolveMockRunCwd(workspaceRoot: string, cwd: string): string {
+  const normalized = !cwd
+    ? workspaceRoot
+    : normalizeMockPosixPath(cwd.startsWith("/") ? cwd : `${workspaceRoot}/${cwd}`);
+
+  if (normalized === workspaceRoot || normalized.startsWith(`${workspaceRoot}/`)) {
+    return normalized;
+  }
+
+  throw new Error(`working directory must stay under /workspace: ${normalized}`);
+}
+
+function resolveMockNodeEntrypoint(
+  files: Map<string, WorkspaceFileRecord>,
+  cwd: string,
+  entrypoint: string | undefined,
+): string {
+  if (!entrypoint) {
+    throw new Error("node entrypoint is required");
+  }
+
+  const requested = normalizeMockPosixPath(
+    entrypoint.startsWith("/") ? entrypoint : `${cwd}/${entrypoint}`,
+  );
+  const candidates = [
+    requested,
+    `${requested}.js`,
+    `${requested}.mjs`,
+    `${requested}.cjs`,
+    `${requested}.ts`,
+    `${requested}.tsx`,
+    `${requested}.jsx`,
+    `${requested}/index.js`,
+    `${requested}/index.ts`,
+    `${requested}/index.tsx`,
+  ];
+
+  for (const candidate of candidates) {
+    if (files.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(`entrypoint not found: ${requested}`);
+}
+
+function normalizeMockPosixPath(input: string): string {
+  const isAbsolute = input.startsWith("/");
+  const segments = input.split("/").filter(Boolean);
+  const normalized: string[] = [];
+
+  for (const segment of segments) {
+    if (segment === ".") {
+      continue;
+    }
+
+    if (segment === "..") {
+      normalized.pop();
+      continue;
+    }
+
+    normalized.push(segment);
+  }
+
+  if (normalized.length === 0) {
+    return isAbsolute ? "/" : ".";
+  }
+
+  return `${isAbsolute ? "/" : ""}${normalized.join("/")}`;
 }
 
 export async function createRuntimeHostAdapter(): Promise<RuntimeHostAdapter> {

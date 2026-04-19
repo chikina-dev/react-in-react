@@ -6,7 +6,10 @@ import {
 } from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
+  PreviewHostFileSummary,
+  PreviewHostSummary,
   PreviewModel,
+  PreviewRunPlan,
   ProcessId,
   RuntimeError,
   SessionId,
@@ -41,6 +44,9 @@ type SessionRecord = {
     url: string;
     model: PreviewModel;
     rootRequestHint: HostPreviewRequestHint;
+    host: PreviewHostSummary;
+    run: PreviewRunPlan;
+    hostFiles: PreviewHostFileSummary;
   } | null;
   hostFileCache: Map<string, WorkspaceFileRecord>;
 };
@@ -150,7 +156,7 @@ async function runSession(
 
   const hostAdapter = await hostAdapterPromise;
   const bootSummary = await hostAdapter.bootSummary();
-  let runPlan;
+  let runPlan: HostRunPlan;
 
   try {
     runPlan = await hostAdapter.planRun(sessionId, {
@@ -215,6 +221,20 @@ async function runSession(
     url,
     model,
     rootRequestHint: await hostAdapter.resolvePreviewRequestHint(sessionId, "/"),
+    host: bootSummary,
+    run: {
+      cwd: runPlan.cwd,
+      entrypoint: runPlan.entrypoint,
+      commandLine: runPlan.commandLine,
+      envCount: runPlan.envCount,
+      commandKind: runPlan.commandKind,
+      resolvedScript: runPlan.resolvedScript,
+    },
+    hostFiles: {
+      count: record.hostFiles.count,
+      samplePath: record.hostFiles.samplePath,
+      sampleSize: record.hostFiles.sampleSize,
+    },
   };
 
   postMessage({
@@ -355,6 +375,22 @@ function mapRunPlanError(error: unknown): RuntimeError {
     };
   }
 
+  if (message.startsWith("working directory must stay under /workspace: ")) {
+    return {
+      code: "INVALID_CWD",
+      message: "Working directory must stay under /workspace.",
+      detail: message.slice("working directory must stay under /workspace: ".length),
+    };
+  }
+
+  if (message.startsWith("entrypoint not found: ")) {
+    return {
+      code: "ENTRYPOINT_NOT_FOUND",
+      message: "The requested node entrypoint could not be found in the mounted workspace.",
+      detail: message.slice("entrypoint not found: ".length),
+    };
+  }
+
   return {
     code: "RUN_PLAN_FAILED",
     message,
@@ -387,6 +423,9 @@ async function resolvePreviewHttpResponse(
             model: record.preview.model,
             rootRequestHint: record.preview.rootRequestHint,
             requestHint: requestHint ?? undefined,
+            host: record.preview.host,
+            run: record.preview.run,
+            hostFiles: record.preview.hostFiles,
             session: record.session,
             files: files ?? new Map(),
           }

@@ -29,6 +29,25 @@ function createPreviewState(files: PreviewState["files"] = new Map()): PreviewSt
       command: "npm run dev",
       highlights: ["react=true"],
     },
+    host: {
+      engineName: "null-engine",
+      supportsInterrupts: true,
+      supportsModuleLoader: true,
+      workspaceRoot: "/workspace",
+    },
+    run: {
+      cwd: "/workspace",
+      entrypoint: "dev",
+      commandLine: "npm run dev",
+      envCount: 0,
+      commandKind: "npm-script",
+      resolvedScript: "vite",
+    },
+    hostFiles: {
+      count: 2,
+      samplePath: "/workspace/package.json",
+      sampleSize: 12,
+    },
     session: {
       sessionId: "session-1",
       state: "running",
@@ -75,6 +94,7 @@ test("buildPreviewResponse returns HTML for the preview root", () => {
   expect(response.body).toContain("/assets/preview-client.js");
   expect(response.body).toContain("__runtime.json");
   expect(response.body).toContain("__workspace.json");
+  expect(response.body).toContain("__diagnostics.json");
 });
 
 test("buildPreviewResponse prefers host-provided preview root hints", () => {
@@ -295,6 +315,10 @@ test("buildPreviewResponse returns preview diagnostics", () => {
   expect(response.body).toContain('"requestHint":{"kind":"diagnostics-state"');
   expect(response.body).toContain('"rootRequestHint":{"kind":"fallback-root"');
   expect(response.body).toContain('"hydratedPaths":["/workspace/package.json"]');
+  expect(response.body).toContain('"engineName":"null-engine"');
+  expect(response.body).toContain('"commandKind":"npm-script"');
+  expect(response.body).toContain('"resolvedScript":"vite"');
+  expect(response.body).toContain('"samplePath":"/workspace/package.json"');
 });
 
 test("buildPreviewResponse returns workspace file contents", () => {

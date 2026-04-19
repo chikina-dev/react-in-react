@@ -1,10 +1,16 @@
-import type { PreviewReadyEvent, PreviewWorkspaceFile, SessionSnapshot } from "../runtime/protocol";
+import type {
+  PreviewDiagnostics,
+  PreviewReadyEvent,
+  PreviewWorkspaceFile,
+  SessionSnapshot,
+} from "../runtime/protocol";
 
 type SelectedPreviewFile = PreviewWorkspaceFile & {
   content: string;
 };
 
 export function PreviewApp(props: {
+  diagnostics: PreviewDiagnostics;
   files: PreviewWorkspaceFile[];
   preview: PreviewReadyEvent;
   selectedFile: SelectedPreviewFile | null;
@@ -25,7 +31,8 @@ export function PreviewApp(props: {
         <GuestMetric label="Command" value={model.command} />
         <GuestMetric label="Port" value={String(props.preview.port)} />
         <GuestMetric label="Workspace" value={model.cwd} />
-        <GuestMetric label="Renderer" value="Service Worker preview route" />
+        <GuestMetric label="Entrypoint" value={props.diagnostics.run.entrypoint} />
+        <GuestMetric label="Engine" value={props.diagnostics.host.engineName} />
         <GuestMetric label="Text files" value={String(textFileCount)} />
       </div>
 
@@ -39,6 +46,31 @@ export function PreviewApp(props: {
       </div>
 
       <div className="guest-columns">
+        <section className="guest-card">
+          <h4>Execution plan</h4>
+          <ul className="guest-list">
+            <li>
+              <code>{props.diagnostics.run.commandKind}</code>
+              <span>{props.diagnostics.run.commandLine}</span>
+            </li>
+            <li>
+              <code>cwd</code>
+              <span>{props.diagnostics.run.cwd}</span>
+            </li>
+            <li>
+              <code>resolved</code>
+              <span>{props.diagnostics.run.resolvedScript ?? "<direct-entry>"}</span>
+            </li>
+            <li>
+              <code>host-vfs</code>
+              <span>
+                {props.diagnostics.hostFiles.count} files / sample{" "}
+                {props.diagnostics.hostFiles.samplePath ?? "<none>"}
+              </span>
+            </li>
+          </ul>
+        </section>
+
         <section className="guest-card">
           <h4>Workspace snapshot</h4>
           <ul className="guest-list">
@@ -91,6 +123,20 @@ export function PreviewApp(props: {
         ) : (
           <p>No text file was available for preview.</p>
         )}
+      </section>
+
+      <section className="guest-card">
+        <h4>Diagnostics route</h4>
+        <p>
+          Hydrated files: <strong>{props.diagnostics.hydratedFileCount}</strong> /{" "}
+          <strong>{props.diagnostics.fileCount}</strong>
+        </p>
+        <p>
+          Root hint: <code>{props.diagnostics.rootRequestHint?.kind ?? "none"}</code>
+        </p>
+        <p>
+          Request hint: <code>{props.diagnostics.requestHint?.kind ?? "none"}</code>
+        </p>
       </section>
     </div>
   );

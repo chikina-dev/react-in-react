@@ -7,8 +7,12 @@ import previewReactDomClientUrl from "../preview/shims/react-dom-client.js?url";
 import previewReactUrl from "../preview/shims/react.js?url";
 import previewStylesheetShimUrl from "../preview/shims/stylesheet.js?url";
 import type {
+  PreviewDiagnostics,
+  PreviewHostFileSummary,
+  PreviewHostSummary,
   PreviewModel,
   PreviewReadyEvent,
+  PreviewRunPlan,
   PreviewWorkspaceFile,
   SessionId,
   SessionSnapshot,
@@ -27,6 +31,9 @@ type PreviewServerState = {
   model: PreviewModel;
   rootRequestHint?: HostPreviewRequestHint;
   requestHint?: HostPreviewRequestHint;
+  host: PreviewHostSummary;
+  run: PreviewRunPlan;
+  hostFiles: PreviewHostFileSummary;
   session: SessionSnapshot;
   files: Map<string, WorkspaceFileRecord>;
 };
@@ -326,6 +333,7 @@ function buildPreviewRootResponse(
       stateUrl: `${preview.url}__runtime.json`,
       workspaceUrl: `${preview.url}__workspace.json`,
       filesUrl: `${preview.url}__files.json`,
+      diagnosticsUrl: `${preview.url}__diagnostics.json`,
       stylesheetUrl: `${preview.url}assets/runtime.css`,
     }),
   );
@@ -337,6 +345,7 @@ function renderPreviewHtml(input: {
   stateUrl: string;
   workspaceUrl: string;
   filesUrl: string;
+  diagnosticsUrl: string;
   stylesheetUrl: string;
 }): string {
   return `<!doctype html>
@@ -379,7 +388,8 @@ function renderPreviewHtml(input: {
           port: ${JSON.stringify(input.preview.port)},
           stateUrl: ${JSON.stringify(input.stateUrl)},
           workspaceUrl: ${JSON.stringify(input.workspaceUrl)},
-          filesUrl: ${JSON.stringify(input.filesUrl)}
+          filesUrl: ${JSON.stringify(input.filesUrl)},
+          diagnosticsUrl: ${JSON.stringify(input.diagnosticsUrl)}
         };
       </script>
       <script type="module" src="${input.clientScriptUrl}"></script>
@@ -553,19 +563,7 @@ function buildPreviewFileIndex(preview: PreviewServerState): PreviewWorkspaceFil
     }));
 }
 
-function buildPreviewDiagnostics(preview: PreviewServerState): {
-  sessionId: SessionId;
-  pid: number;
-  port: number;
-  url: string;
-  model: PreviewModel;
-  session: SessionSnapshot;
-  rootRequestHint: HostPreviewRequestHint | null;
-  requestHint: HostPreviewRequestHint | null;
-  fileCount: number;
-  hydratedFileCount: number;
-  hydratedPaths: string[];
-} {
+function buildPreviewDiagnostics(preview: PreviewServerState): PreviewDiagnostics {
   const hydratedPaths = [...preview.files.values()]
     .filter((file) => file.textContent !== null || file.bytes.length > 0 || file.size === 0)
     .map((file) => file.path)
@@ -583,6 +581,9 @@ function buildPreviewDiagnostics(preview: PreviewServerState): {
     fileCount: preview.files.size,
     hydratedFileCount: hydratedPaths.length,
     hydratedPaths,
+    host: preview.host,
+    run: preview.run,
+    hostFiles: preview.hostFiles,
   };
 }
 

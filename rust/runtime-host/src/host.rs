@@ -6,7 +6,7 @@ use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
     RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
-use crate::vfs::{VirtualFile, VirtualFileSystem};
+use crate::vfs::{normalize_posix_path, VirtualFile, VirtualFileSystem};
 
 const PREVIEW_DOCUMENT_CANDIDATES: [&str; 4] = [
     "/workspace/index.html",
@@ -141,11 +141,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .get(session_id)
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
 
-        let cwd = if request.cwd.is_empty() {
-            record.snapshot.workspace_root.clone()
-        } else {
-            request.cwd.clone()
-        };
+        let cwd = resolve_run_cwd(record, &request.cwd)?;
         let command_line = std::iter::once(request.command.as_str())
             .chain(request.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
@@ -173,11 +169,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         }
 
         if request.command == "node" {
-            let entrypoint = request
-                .args
-                .first()
-                .cloned()
-                .ok_or(RuntimeHostError::NodeEntrypointRequired)?;
+            let entrypoint = resolve_node_entrypoint(record, &cwd, request.args.first())?;
 
             return Ok(RunPlan {
                 cwd,
@@ -469,6 +461,58 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map(|_| ())
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))
     }
+}
+
+fn resolve_run_cwd(record: &SessionRecord, cwd: &str) -> RuntimeHostResult<String> {
+    let normalized = if cwd.is_empty() {
+        record.snapshot.workspace_root.clone()
+    } else if cwd.starts_with('/') {
+        normalize_posix_path(cwd)
+    } else {
+        normalize_posix_path(&format!("{}/{}", record.snapshot.workspace_root, cwd))
+    };
+
+    if normalized == record.snapshot.workspace_root
+        || normalized.starts_with(&format!("{}/", record.snapshot.workspace_root))
+    {
+        return Ok(normalized);
+    }
+
+    Err(RuntimeHostError::InvalidWorkingDirectory(normalized))
+}
+
+fn resolve_node_entrypoint(
+    record: &SessionRecord,
+    cwd: &str,
+    entrypoint: Option<&String>,
+) -> RuntimeHostResult<String> {
+    let entrypoint = entrypoint.ok_or(RuntimeHostError::NodeEntrypointRequired)?;
+    let requested = if entrypoint.starts_with('/') {
+        normalize_posix_path(entrypoint)
+    } else {
+        normalize_posix_path(&format!("{cwd}/{entrypoint}"))
+    };
+
+    let candidates = [
+        requested.clone(),
+        format!("{requested}.js"),
+        format!("{requested}.mjs"),
+        format!("{requested}.cjs"),
+        format!("{requested}.ts"),
+        format!("{requested}.tsx"),
+        format!("{requested}.jsx"),
+        format!("{requested}/index.js"),
+        format!("{requested}/index.ts"),
+        format!("{requested}/index.tsx"),
+    ];
+
+    for candidate in candidates {
+        if record.vfs.read(&candidate).is_some() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(RuntimeHostError::EntrypointNotFound(requested))
 }
 
 fn dirname(path: &str) -> &str {

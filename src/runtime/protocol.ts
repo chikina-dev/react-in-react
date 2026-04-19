@@ -50,6 +50,28 @@ export type PreviewModel = {
   highlights: string[];
 };
 
+export type PreviewRunPlan = {
+  cwd: string;
+  entrypoint: string;
+  commandLine: string;
+  envCount: number;
+  commandKind: "npm-script" | "node-entrypoint";
+  resolvedScript: string | null;
+};
+
+export type PreviewHostSummary = {
+  engineName: string;
+  supportsInterrupts: boolean;
+  supportsModuleLoader: boolean;
+  workspaceRoot: string;
+};
+
+export type PreviewHostFileSummary = {
+  count: number;
+  samplePath: string | null;
+  sampleSize: number | null;
+};
+
 export type PreviewWorkspaceFile = {
   path: string;
   size: number;
@@ -80,6 +102,33 @@ export type RuntimeError = {
   detail?: string;
   path?: string;
   pid?: number;
+};
+
+export type PreviewDiagnostics = {
+  sessionId: SessionId;
+  pid: number;
+  port: number;
+  url: string;
+  model: PreviewModel;
+  session: SessionSnapshot;
+  rootRequestHint: {
+    kind: string;
+    workspacePath: string | null;
+    documentRoot: string | null;
+    hydratePaths: string[];
+  } | null;
+  requestHint: {
+    kind: string;
+    workspacePath: string | null;
+    documentRoot: string | null;
+    hydratePaths: string[];
+  } | null;
+  fileCount: number;
+  hydratedFileCount: number;
+  hydratedPaths: string[];
+  host: PreviewHostSummary;
+  run: PreviewRunPlan;
+  hostFiles: PreviewHostFileSummary;
 };
 
 export type UiToWorkerMessage =

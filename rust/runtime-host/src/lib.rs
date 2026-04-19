@@ -104,5 +104,28 @@ mod tests {
                 .kind,
             PreviewRequestKind::DiagnosticsState
         );
+        assert_eq!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new("src", "node", vec![String::from("main")]),
+            )
+            .expect("node run plan should resolve")
+            .entrypoint,
+            "/workspace/src/main.tsx"
+        );
+        assert!(matches!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new("/tmp", "node", vec![String::from("main")]),
+            ),
+            Err(RuntimeHostError::InvalidWorkingDirectory(path)) if path == "/tmp"
+        ));
+        assert!(matches!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new("/workspace", "node", vec![String::from("missing")]),
+            ),
+            Err(RuntimeHostError::EntrypointNotFound(path)) if path == "/workspace/missing"
+        ));
     }
 }
