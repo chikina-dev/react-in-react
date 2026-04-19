@@ -287,6 +287,9 @@ function previewReadyResponse(preview: PreviewServerState): VirtualHttpResponse 
     port: preview.port,
     url: preview.url,
     model: preview.model,
+    host: preview.host,
+    run: preview.run,
+    hostFiles: preview.hostFiles,
   } satisfies PreviewReadyEvent);
 }
 

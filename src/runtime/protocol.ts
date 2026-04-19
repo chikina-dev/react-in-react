@@ -195,6 +195,9 @@ export type PreviewReadyEvent = {
   port: number;
   url: string;
   model: PreviewModel;
+  host: PreviewHostSummary;
+  run: PreviewRunPlan;
+  hostFiles: PreviewHostFileSummary;
 };
 
 export type RuntimeErrorEvent = {

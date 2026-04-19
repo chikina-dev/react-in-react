@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from "rea
 import { PreviewFrame } from "./components/PreviewFrame";
 import { RuntimeController } from "./runtime/controller";
 import type {
+  PreviewDiagnostics,
   PreviewReadyEvent,
   RunRequest,
   RuntimeEvent,
@@ -43,6 +44,8 @@ export function App() {
     },
   ]);
   const [preview, setPreview] = useState<PreviewReadyEvent | null>(null);
+  const [previewDiagnostics, setPreviewDiagnostics] = useState<PreviewDiagnostics | null>(null);
+  const [previewDiagnosticsError, setPreviewDiagnosticsError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [previewRouter, setPreviewRouter] = useState("registering");
   const [previewRouterDetail, setPreviewRouterDetail] = useState<string | null>(null);
@@ -61,6 +64,8 @@ export function App() {
     setSession(event.session);
     setSessionState(event.session.state);
     setPreview(null);
+    setPreviewDiagnostics(null);
+    setPreviewDiagnosticsError(null);
     setTerminal([
       {
         kind: "system",
@@ -94,10 +99,13 @@ export function App() {
           kind: "system",
           text: `Process ${event.pid} exited with code ${event.code}.`,
         });
+        setPreviewDiagnostics(null);
         setSessionState("stopped");
         break;
       case "preview.ready":
         setPreview(event);
+        setPreviewDiagnostics(null);
+        setPreviewDiagnosticsError(null);
         void registerPreview(event);
         appendTerminal({
           kind: "system",
@@ -109,6 +117,8 @@ export function App() {
           kind: "stderr",
           text: `${event.error.code}: ${event.error.message}`,
         });
+        setPreviewDiagnostics(null);
+        setPreviewDiagnosticsError(null);
         setSessionState("errored");
         break;
     }
@@ -130,6 +140,53 @@ export function App() {
       setPreviewRouterDetail(state.detail ?? null);
     });
   }, []);
+
+  useEffect(() => {
+    if (!preview) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void controller
+      .requestPreviewResponse({
+        sessionId: preview.sessionId,
+        port: preview.port,
+        method: "GET",
+        pathname: `${preview.url}__diagnostics.json`,
+        search: "",
+        headers: {},
+      })
+      .then((response) => {
+        if (cancelled) {
+          return;
+        }
+
+        if (response.status >= 400) {
+          setPreviewDiagnostics(null);
+          setPreviewDiagnosticsError(`Failed to load diagnostics: ${response.status}`);
+          return;
+        }
+
+        const payload = decodeVirtualHttpBody(response.body);
+        setPreviewDiagnostics(JSON.parse(payload) as PreviewDiagnostics);
+        setPreviewDiagnosticsError(null);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewDiagnostics(null);
+        setPreviewDiagnosticsError(
+          error instanceof Error ? error.message : "Failed to load preview diagnostics.",
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [controller, preview]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator)) {
@@ -210,6 +267,8 @@ export function App() {
       }
 
       setPreview(null);
+      setPreviewDiagnostics(null);
+      setPreviewDiagnosticsError(null);
       await controller.run(session.sessionId, request);
     } finally {
       setIsBusy(false);
@@ -229,6 +288,9 @@ export function App() {
       }
 
       await controller.stop(session.sessionId);
+      setPreview(null);
+      setPreviewDiagnostics(null);
+      setPreviewDiagnosticsError(null);
     } finally {
       setIsBusy(false);
     }
@@ -251,6 +313,7 @@ export function App() {
           <StatusPill label="State" value={sessionState} />
           <StatusPill label="Session" value={session?.sessionId.slice(0, 8) ?? "none"} />
           <StatusPill label="Files" value={String(session?.archive.fileCount ?? 0)} />
+          <StatusPill label="Engine" value={preview?.host.engineName ?? "pending"} />
           <StatusPill label="Preview router" value={previewRouter} />
         </div>
       </section>
@@ -413,6 +476,70 @@ export function App() {
           <PreviewFrame preview={preview} serviceWorkerReady={previewRouter === "ready"} />
         </div>
 
+        <div className="panel runtime-panel">
+          <div className="panel-header">
+            <div>
+              <p className="panel-kicker">5. Run plan</p>
+              <h2>Rust host が返した実行計画</h2>
+            </div>
+          </div>
+
+          {preview ? (
+            <div className="meta-grid">
+              <MetaRow label="Command kind">{preview.run.commandKind}</MetaRow>
+              <MetaRow label="Command line">{preview.run.commandLine}</MetaRow>
+              <MetaRow label="Resolved cwd">{preview.run.cwd}</MetaRow>
+              <MetaRow label="Entrypoint">{preview.run.entrypoint}</MetaRow>
+              <MetaRow label="Resolved script">
+                {preview.run.resolvedScript ?? "<direct-entry>"}
+              </MetaRow>
+              <MetaRow label="Host engine">{preview.host.engineName}</MetaRow>
+              <MetaRow label="Host VFS">
+                {preview.hostFiles.count} files / {preview.hostFiles.samplePath ?? "none"}
+              </MetaRow>
+            </div>
+          ) : (
+            <p className="empty-copy">
+              preview.ready が返ると、ここに Rust/WASM host 側で正規化された run plan と host
+              概要を表示します。
+            </p>
+          )}
+        </div>
+
+        <div className="panel diagnostics-panel">
+          <div className="panel-header">
+            <div>
+              <p className="panel-kicker">6. Diagnostics</p>
+              <h2>preview 内部状態をホスト側で観測</h2>
+            </div>
+          </div>
+
+          {previewDiagnostics ? (
+            <div className="meta-grid">
+              <MetaRow label="Root hint">
+                {previewDiagnostics.rootRequestHint?.kind ?? "none"}
+              </MetaRow>
+              <MetaRow label="Request hint">
+                {previewDiagnostics.requestHint?.kind ?? "none"}
+              </MetaRow>
+              <MetaRow label="Hydrated files">
+                {previewDiagnostics.hydratedFileCount} / {previewDiagnostics.fileCount}
+              </MetaRow>
+              <MetaRow label="Hydrated paths">
+                {previewDiagnostics.hydratedPaths.slice(0, 3).join(", ") || "none"}
+              </MetaRow>
+              <MetaRow label="Diagnostics URL">
+                {`${previewDiagnostics.url}__diagnostics.json`}
+              </MetaRow>
+            </div>
+          ) : (
+            <p className="empty-copy">
+              {previewDiagnosticsError ??
+                "preview 実行後に __diagnostics.json を読み、request hint と hydration 状態をここへ表示します。"}
+            </p>
+          )}
+        </div>
+
         <div className="panel architecture-panel">
           <div className="panel-header">
             <div>
@@ -460,6 +587,14 @@ function splitArgs(raw: string): string[] {
     .split(" ")
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function decodeVirtualHttpBody(body: string | Uint8Array): string {
+  if (typeof body === "string") {
+    return body;
+  }
+
+  return new TextDecoder().decode(body);
 }
 
 function StatusPill(props: { label: string; value: string }) {

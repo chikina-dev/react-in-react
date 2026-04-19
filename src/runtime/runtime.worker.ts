@@ -244,6 +244,9 @@ async function runSession(
     port,
     url,
     model,
+    host: record.preview.host,
+    run: record.preview.run,
+    hostFiles: record.preview.hostFiles,
   } satisfies WorkerToUiMessage);
 
   await emitStdout(sessionId, pid, `[preview] server-ready ${url}`);

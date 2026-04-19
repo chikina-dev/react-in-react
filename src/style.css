@@ -157,6 +157,8 @@ h2 {
   grid-column: span 6;
 }
 
+.runtime-panel,
+.diagnostics-panel,
 .architecture-panel,
 .file-panel {
   grid-column: span 6;

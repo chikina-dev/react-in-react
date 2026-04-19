@@ -75,6 +75,9 @@ test("buildPreviewResponse returns preview metadata when state endpoint is reque
   expect(response.status).toBe(200);
   expect(response.headers["content-type"]).toContain("application/json");
   expect(response.body).toContain('"type":"preview.ready"');
+  expect(response.body).toContain('"engineName":"null-engine"');
+  expect(response.body).toContain('"commandKind":"npm-script"');
+  expect(response.body).toContain('"samplePath":"/workspace/package.json"');
 });
 
 test("buildPreviewResponse returns HTML for the preview root", () => {
