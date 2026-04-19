@@ -501,17 +501,21 @@ fn parse_virtual_files(fields: &BTreeMap<String, String>) -> Result<Vec<VirtualF
 
 fn parse_fs_command(fields: &BTreeMap<String, String>) -> Result<HostFsCommand, String> {
     let kind = required_field(fields, "command").ok_or_else(|| "missing fs command".to_string())?;
+    let cwd = match required_field(fields, "cwd") {
+        Some(encoded) => decode_hex(&encoded)?,
+        None => "/workspace".into(),
+    };
     let path = match required_field(fields, "path") {
         Some(encoded) => decode_hex(&encoded)?,
         None => "/workspace".into(),
     };
 
     match kind.as_str() {
-        "exists" => Ok(HostFsCommand::Exists { path }),
-        "stat" => Ok(HostFsCommand::Stat { path }),
-        "read-dir" => Ok(HostFsCommand::ReadDir { path }),
-        "read-file" => Ok(HostFsCommand::ReadFile { path }),
-        "mkdir" => Ok(HostFsCommand::CreateDirAll { path }),
+        "exists" => Ok(HostFsCommand::Exists { cwd, path }),
+        "stat" => Ok(HostFsCommand::Stat { cwd, path }),
+        "read-dir" => Ok(HostFsCommand::ReadDir { cwd, path }),
+        "read-file" => Ok(HostFsCommand::ReadFile { cwd, path }),
+        "mkdir" => Ok(HostFsCommand::CreateDirAll { cwd, path }),
         "write-file" => {
             let is_text = fields
                 .get("is_text")
@@ -521,6 +525,7 @@ fn parse_fs_command(fields: &BTreeMap<String, String>) -> Result<HostFsCommand, 
             let bytes = decode_hex_bytes(&encoded_bytes)?;
 
             Ok(HostFsCommand::WriteFile {
+                cwd,
                 path,
                 bytes,
                 is_text,

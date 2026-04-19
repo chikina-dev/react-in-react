@@ -149,6 +149,7 @@ mod tests {
             host.execute_fs_command(
                 &session.session_id,
                 HostFsCommand::Exists {
+                    cwd: "/workspace".into(),
                     path: "/workspace/src/generated/app.ts".into(),
                 },
             )
@@ -162,7 +163,8 @@ mod tests {
             host.execute_fs_command(
                 &session.session_id,
                 HostFsCommand::ReadDir {
-                    path: "/workspace/src".into(),
+                    cwd: "/workspace".into(),
+                    path: "src".into(),
                 },
             ),
             Ok(HostFsResponse::DirectoryEntries(entries))

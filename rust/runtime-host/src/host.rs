@@ -313,26 +313,54 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         command: HostFsCommand,
     ) -> RuntimeHostResult<HostFsResponse> {
         match command {
-            HostFsCommand::Exists { path } => {
+            HostFsCommand::Exists { cwd, path } => {
                 let record = self
                     .sessions
                     .get(session_id)
                     .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
-                let resolved = resolve_workspace_path(record, &path);
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
 
                 Ok(HostFsResponse::Exists {
                     path: resolved.clone(),
                     exists: record.vfs.exists(&resolved),
                 })
             }
-            HostFsCommand::Stat { path } => self
-                .stat_workspace_path(session_id, &path)
-                .map(HostFsResponse::Entry),
-            HostFsCommand::ReadDir { path } => self
-                .read_workspace_directory(session_id, &path)
-                .map(HostFsResponse::DirectoryEntries),
-            HostFsCommand::ReadFile { path } => {
-                let file = self.read_workspace_file(session_id, &path)?;
+            HostFsCommand::Stat { cwd, path } => {
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+
+                record
+                    .vfs
+                    .stat(&resolved)
+                    .map(HostFsResponse::Entry)
+                    .ok_or(RuntimeHostError::FileNotFound(resolved))
+            }
+            HostFsCommand::ReadDir { cwd, path } => {
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+
+                record
+                    .vfs
+                    .read_dir(&resolved)
+                    .map(HostFsResponse::DirectoryEntries)
+            }
+            HostFsCommand::ReadFile { cwd, path } => {
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+                let file = record
+                    .vfs
+                    .read(&resolved)
+                    .cloned()
+                    .ok_or_else(|| RuntimeHostError::FileNotFound(resolved.clone()))?;
                 let text_content = if file.is_text {
                     Some(String::from_utf8_lossy(&file.bytes).into_owned())
                 } else {
@@ -347,16 +375,37 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     bytes: file.bytes,
                 })
             }
-            HostFsCommand::CreateDirAll { path } => self
-                .create_workspace_directory(session_id, &path)
-                .map(HostFsResponse::Entry),
+            HostFsCommand::CreateDirAll { cwd, path } => {
+                let record = self
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+
+                record.vfs.create_dir_all(&resolved)?;
+                record
+                    .vfs
+                    .stat(&resolved)
+                    .map(HostFsResponse::Entry)
+                    .ok_or(RuntimeHostError::DirectoryNotFound(resolved))
+            }
             HostFsCommand::WriteFile {
+                cwd,
                 path,
                 bytes,
                 is_text,
-            } => self
-                .write_workspace_file(session_id, &path, bytes, is_text)
-                .map(HostFsResponse::Entry),
+            } => {
+                let record = self
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+
+                record
+                    .vfs
+                    .write_file(&resolved, bytes, is_text)
+                    .map(HostFsResponse::Entry)
+            }
         }
     }
 
@@ -609,6 +658,36 @@ fn resolve_workspace_path(record: &SessionRecord, path: &str) -> String {
         normalize_posix_path(path)
     } else {
         normalize_posix_path(&format!("{}/{}", record.snapshot.workspace_root, path))
+    }
+}
+
+fn resolve_fs_command_path(
+    record: &SessionRecord,
+    cwd: &str,
+    path: &str,
+) -> RuntimeHostResult<String> {
+    let resolved_cwd = resolve_run_cwd(
+        record,
+        if cwd.is_empty() {
+            &record.snapshot.workspace_root
+        } else {
+            cwd
+        },
+    )?;
+    let resolved = if path.is_empty() {
+        resolved_cwd
+    } else if path.starts_with('/') {
+        normalize_posix_path(path)
+    } else {
+        normalize_posix_path(&format!("{resolved_cwd}/{path}"))
+    };
+
+    if resolved == record.snapshot.workspace_root
+        || resolved.starts_with(&format!("{}/", record.snapshot.workspace_root))
+    {
+        Ok(resolved)
+    } else {
+        Err(RuntimeHostError::InvalidWorkspacePath(resolved))
     }
 }
 

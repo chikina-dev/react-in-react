@@ -45,10 +45,12 @@ export type HostWorkspaceFileContent = HostWorkspaceFileSummary & {
 export type HostFsCommand =
   | {
       kind: "exists" | "stat" | "read-dir" | "read-file" | "mkdir";
+      cwd?: string;
       path: string;
     }
   | {
       kind: "write-file";
+      cwd?: string;
       path: string;
       bytes: Uint8Array;
       isText: boolean;
@@ -444,15 +446,22 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const resolvedCwd = resolveMockRunCwd(
+      record.handle.workspaceRoot,
+      record.directories,
+      record.files,
+      command.cwd ?? record.handle.workspaceRoot,
+    );
+
     switch (command.kind) {
       case "exists": {
-        const record = this.sessions.get(sessionId);
-
-        if (!record) {
-          throw new Error(`Rust host session not found: ${sessionId}`);
-        }
-
-        const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, command.path);
+        const resolved = resolveMockFsCommandPath(resolvedCwd, command.path);
         assertMockWorkspacePathWithinRoot(record.handle.workspaceRoot, resolved);
 
         return {
@@ -464,15 +473,24 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       case "stat":
         return {
           kind: "entry",
-          entry: await this.statWorkspacePath(sessionId, command.path),
+          entry: await this.statWorkspacePath(
+            sessionId,
+            resolveMockFsCommandPath(resolvedCwd, command.path),
+          ),
         };
       case "read-dir":
         return {
           kind: "directory-entries",
-          entries: await this.readWorkspaceDirectory(sessionId, command.path),
+          entries: await this.readWorkspaceDirectory(
+            sessionId,
+            resolveMockFsCommandPath(resolvedCwd, command.path),
+          ),
         };
       case "read-file": {
-        const file = await this.readWorkspaceFile(sessionId, command.path);
+        const file = await this.readWorkspaceFile(
+          sessionId,
+          resolveMockFsCommandPath(resolvedCwd, command.path),
+        );
         return {
           kind: "file",
           path: file.path,
@@ -485,13 +503,16 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       case "mkdir":
         return {
           kind: "entry",
-          entry: await this.createWorkspaceDirectory(sessionId, command.path),
+          entry: await this.createWorkspaceDirectory(
+            sessionId,
+            resolveMockFsCommandPath(resolvedCwd, command.path),
+          ),
         };
       case "write-file":
         return {
           kind: "entry",
           entry: await this.writeWorkspaceFile(sessionId, {
-            path: command.path,
+            path: resolveMockFsCommandPath(resolvedCwd, command.path),
             bytes: command.bytes,
             isText: command.isText,
           }),
@@ -810,7 +831,11 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse> {
-    const lines = [`session_id=${sessionId}`, `command=${command.kind}`];
+    const lines = [
+      `session_id=${sessionId}`,
+      `command=${command.kind}`,
+      `cwd=${encodeHex(command.cwd ?? "/workspace")}`,
+    ];
 
     if ("path" in command) {
       lines.push(`path=${encodeHex(command.path)}`);
@@ -1092,6 +1117,14 @@ function resolveMockWorkspacePath(workspaceRoot: string, path: string): string {
   }
 
   return normalizeMockPosixPath(path.startsWith("/") ? path : `${workspaceRoot}/${path}`);
+}
+
+function resolveMockFsCommandPath(cwd: string, path: string): string {
+  if (!path) {
+    return cwd;
+  }
+
+  return normalizeMockPosixPath(path.startsWith("/") ? path : `${cwd}/${path}`);
 }
 
 function assertMockWorkspacePathWithinRoot(workspaceRoot: string, path: string): void {

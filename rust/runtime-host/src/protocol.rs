@@ -100,21 +100,27 @@ pub struct WorkspaceEntrySummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostFsCommand {
     Exists {
+        cwd: String,
         path: String,
     },
     Stat {
+        cwd: String,
         path: String,
     },
     ReadDir {
+        cwd: String,
         path: String,
     },
     ReadFile {
+        cwd: String,
         path: String,
     },
     CreateDirAll {
+        cwd: String,
         path: String,
     },
     WriteFile {
+        cwd: String,
         path: String,
         bytes: Vec<u8>,
         is_text: bool,

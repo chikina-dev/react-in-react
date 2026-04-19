@@ -415,7 +415,8 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   await expect(
     adapter.executeFsCommand(session.sessionId, {
       kind: "exists",
-      path: "/workspace/src/server.ts",
+      cwd: "/workspace/src",
+      path: "server.ts",
     }),
   ).resolves.toEqual({
     kind: "exists",
@@ -426,7 +427,8 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   await expect(
     adapter.executeFsCommand(session.sessionId, {
       kind: "read-file",
-      path: "/workspace/package.json",
+      cwd: "/workspace",
+      path: "package.json",
     }),
   ).resolves.toEqual({
     kind: "file",
@@ -440,12 +442,13 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   await expect(
     adapter.executeFsCommand(session.sessionId, {
       kind: "mkdir",
-      path: "/workspace/generated",
+      cwd: "/workspace/src",
+      path: "generated/nested",
     }),
   ).resolves.toEqual({
     kind: "entry",
     entry: {
-      path: "/workspace/generated",
+      path: "/workspace/src/generated/nested",
       kind: "directory",
       size: 0,
       isText: false,
@@ -455,14 +458,15 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   await expect(
     adapter.executeFsCommand(session.sessionId, {
       kind: "write-file",
-      path: "/workspace/generated/runtime.txt",
+      cwd: "/workspace/src",
+      path: "generated/nested/runtime.txt",
       bytes: new TextEncoder().encode("runtime host"),
       isText: true,
     }),
   ).resolves.toEqual({
     kind: "entry",
     entry: {
-      path: "/workspace/generated/runtime.txt",
+      path: "/workspace/src/generated/nested/runtime.txt",
       kind: "file",
       size: 12,
       isText: true,
