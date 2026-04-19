@@ -33,7 +33,7 @@ export type HostWorkspaceFileContent = HostWorkspaceFileSummary & {
   bytes: Uint8Array;
 };
 
-export type HostPreviewRootHint =
+type MockPreviewRootHint =
   | {
       kind: "workspace-document";
       path: string;
@@ -92,7 +92,6 @@ export interface RuntimeHostAdapter {
   }): Promise<HostSessionHandle>;
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
-  resolvePreviewRootHint(sessionId: string): Promise<HostPreviewRootHint>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -112,7 +111,6 @@ type WasmRuntimeHostExports = {
   runtime_host_create_session_json(ptr: number, len: number): number;
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
-  runtime_host_resolve_preview_root_hint_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -189,7 +187,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }));
   }
 
-  async resolvePreviewRootHint(sessionId: string): Promise<HostPreviewRootHint> {
+  private getPreviewRootHint(sessionId: string): MockPreviewRootHint {
     const record = this.sessions.get(sessionId);
 
     if (!record) {
@@ -252,7 +250,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     const hydrationPaths = collectMockPreviewHydrationPaths(record.files);
 
     if (relativePath === "/" || relativePath === "/index.html") {
-      const rootHint = await this.resolvePreviewRootHint(sessionId);
+      const rootHint = this.getPreviewRootHint(sessionId);
 
       if (rootHint.kind === "workspace-document") {
         return {
@@ -325,7 +323,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       return { kind: "not-found", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
-    const rootHint = await this.resolvePreviewRootHint(sessionId);
+    const rootHint = this.getPreviewRootHint(sessionId);
     const documentRoot = rootHint.kind === "workspace-document" ? rootHint.root : "/workspace";
     const workspacePath = resolveMockPreviewAssetWorkspacePath(
       record.files,
@@ -448,13 +446,6 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
   async listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]> {
     return this.invokeWithInput<HostWorkspaceFileSummary[]>(
       "runtime_host_list_workspace_files_json",
-      [`session_id=${sessionId}`],
-    );
-  }
-
-  async resolvePreviewRootHint(sessionId: string): Promise<HostPreviewRootHint> {
-    return this.invokeWithInput<HostPreviewRootHint>(
-      "runtime_host_resolve_preview_root_hint_json",
       [`session_id=${sessionId}`],
     );
   }

@@ -1,5 +1,5 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
-import { createRuntimeHostAdapter, type HostPreviewRootHint } from "./host-adapter";
+import { createRuntimeHostAdapter, type HostPreviewRequestHint } from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
   PreviewModel,
@@ -36,7 +36,7 @@ type SessionRecord = {
     port: number;
     url: string;
     model: PreviewModel;
-    rootHint: HostPreviewRootHint;
+    rootRequestHint: HostPreviewRequestHint;
   } | null;
   hostFileCache: Map<string, WorkspaceFileRecord>;
 };
@@ -210,7 +210,7 @@ async function runSession(
     port,
     url,
     model,
-    rootHint: await hostAdapter.resolvePreviewRootHint(sessionId),
+    rootRequestHint: await hostAdapter.resolvePreviewRequestHint(sessionId, "/"),
   };
 
   postMessage({
@@ -393,7 +393,7 @@ async function resolvePreviewHttpResponse(
             port: record.preview.port,
             url: record.preview.url,
             model: record.preview.model,
-            rootHint: record.preview.rootHint,
+            rootRequestHint: record.preview.rootRequestHint,
             requestHint: requestHint ?? undefined,
             session: record.session,
             files: files ?? new Map(),

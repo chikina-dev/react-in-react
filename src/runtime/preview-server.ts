@@ -16,7 +16,7 @@ import type {
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type { HostPreviewRequestHint, HostPreviewRootHint } from "./host-adapter";
+import type { HostPreviewRequestHint } from "./host-adapter";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewServerState = {
@@ -25,7 +25,7 @@ type PreviewServerState = {
   port: number;
   url: string;
   model: PreviewModel;
-  rootHint?: HostPreviewRootHint;
+  rootRequestHint?: HostPreviewRequestHint;
   requestHint?: HostPreviewRequestHint;
   session: SessionSnapshot;
   files: Map<string, WorkspaceFileRecord>;
@@ -560,7 +560,7 @@ function buildPreviewDiagnostics(preview: PreviewServerState): {
   url: string;
   model: PreviewModel;
   session: SessionSnapshot;
-  rootHint: HostPreviewRootHint | null;
+  rootRequestHint: HostPreviewRequestHint | null;
   requestHint: HostPreviewRequestHint | null;
   fileCount: number;
   hydratedFileCount: number;
@@ -578,7 +578,7 @@ function buildPreviewDiagnostics(preview: PreviewServerState): {
     url: preview.url,
     model: preview.model,
     session: preview.session,
-    rootHint: preview.rootHint ?? null,
+    rootRequestHint: preview.rootRequestHint ?? null,
     requestHint: preview.requestHint ?? null,
     fileCount: preview.files.size,
     hydratedFileCount: hydratedPaths.length,
@@ -1631,13 +1631,13 @@ function resolvePreviewDocument(preview: PreviewServerState): {
   file: WorkspaceFileRecord;
   root: string;
 } | null {
-  if (preview.rootHint?.kind === "workspace-document") {
-    const file = preview.files.get(preview.rootHint.path);
+  if (preview.rootRequestHint?.kind === "root-document") {
+    const file = preview.files.get(preview.rootRequestHint.workspacePath);
 
     if (file && file.isText && file.contentType.startsWith("text/html")) {
       return {
         file,
-        root: preview.rootHint.root,
+        root: preview.rootRequestHint.documentRoot,
       };
     }
   }
@@ -1657,8 +1657,8 @@ function resolvePreviewDocument(preview: PreviewServerState): {
 }
 
 function resolvePreviewAppEntry(preview: PreviewServerState): WorkspaceFileRecord | null {
-  if (preview.rootHint?.kind === "source-entry") {
-    const file = preview.files.get(preview.rootHint.path);
+  if (preview.rootRequestHint?.kind === "root-entry") {
+    const file = preview.files.get(preview.rootRequestHint.workspacePath);
 
     if (file && shouldTransformWorkspaceModule(file)) {
       return file;
@@ -1677,8 +1677,8 @@ function resolvePreviewAppEntry(preview: PreviewServerState): WorkspaceFileRecor
 }
 
 function resolvePreviewDocumentRoot(preview: PreviewServerState): string {
-  if (preview.rootHint?.kind === "workspace-document") {
-    return preview.rootHint.root;
+  if (preview.rootRequestHint?.kind === "root-document") {
+    return preview.rootRequestHint.documentRoot;
   }
 
   return resolvePreviewDocument(preview)?.root ?? "/workspace";

@@ -101,10 +101,11 @@ test("buildPreviewResponse prefers host-provided preview root hints", () => {
     },
     {
       ...state,
-      rootHint: {
-        kind: "source-entry",
-        path: "/workspace/src/main.tsx",
-        root: null,
+      rootRequestHint: {
+        kind: "root-entry",
+        workspacePath: "/workspace/src/main.tsx",
+        documentRoot: null,
+        hydratePaths: ["/workspace/src/main.tsx"],
       },
     },
   );
@@ -274,10 +275,11 @@ test("buildPreviewResponse returns preview diagnostics", () => {
           ],
         ]),
       ),
-      rootHint: {
-        kind: "fallback",
-        path: null,
-        root: null,
+      rootRequestHint: {
+        kind: "fallback-root",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
       },
       requestHint: {
         kind: "diagnostics-state",
@@ -291,6 +293,7 @@ test("buildPreviewResponse returns preview diagnostics", () => {
   expect(response.status).toBe(200);
   expect(response.body).toContain('"sessionId":"session-1"');
   expect(response.body).toContain('"requestHint":{"kind":"diagnostics-state"');
+  expect(response.body).toContain('"rootRequestHint":{"kind":"fallback-root"');
   expect(response.body).toContain('"hydratedPaths":["/workspace/package.json"]');
 });
 
