@@ -101,5 +101,11 @@ mod tests {
                 .kind,
             PreviewRequestKind::WorkspaceAsset
         );
+        assert_eq!(
+            host.resolve_preview_request_hint(&session.session_id, "/__diagnostics.json")
+                .expect("preview diagnostics hint should resolve")
+                .kind,
+            PreviewRequestKind::DiagnosticsState
+        );
     }
 }

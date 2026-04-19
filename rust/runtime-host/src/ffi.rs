@@ -628,6 +628,7 @@ fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) 
         crate::protocol::PreviewRequestKind::RuntimeState => "runtime-state",
         crate::protocol::PreviewRequestKind::WorkspaceState => "workspace-state",
         crate::protocol::PreviewRequestKind::FileIndex => "file-index",
+        crate::protocol::PreviewRequestKind::DiagnosticsState => "diagnostics-state",
         crate::protocol::PreviewRequestKind::RuntimeStylesheet => "runtime-stylesheet",
         crate::protocol::PreviewRequestKind::WorkspaceFile => "workspace-file",
         crate::protocol::PreviewRequestKind::WorkspaceAsset => "workspace-asset",

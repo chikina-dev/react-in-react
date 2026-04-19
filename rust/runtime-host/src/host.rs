@@ -331,6 +331,12 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 document_root: None,
                 hydrate_paths: Vec::new(),
             }),
+            "/__diagnostics.json" => Ok(PreviewRequestHint {
+                kind: PreviewRequestKind::DiagnosticsState,
+                workspace_path: None,
+                document_root: None,
+                hydrate_paths: Vec::new(),
+            }),
             "/assets/runtime.css" => Ok(PreviewRequestHint {
                 kind: PreviewRequestKind::RuntimeStylesheet,
                 workspace_path: None,

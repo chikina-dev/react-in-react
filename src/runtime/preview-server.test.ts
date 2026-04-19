@@ -252,6 +252,48 @@ test("buildPreviewResponse returns preview file index", () => {
   expect(response.body).toContain('"previewUrl":"/preview/session-1/3000/package.json"');
 });
 
+test("buildPreviewResponse returns preview diagnostics", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/__diagnostics.json",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/package.json",
+            {
+              path: "/workspace/package.json",
+              size: 12,
+              contentType: "application/json; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('{"name":"x"}'),
+              textContent: '{"name":"x"}',
+            },
+          ],
+        ]),
+      ),
+      rootHint: {
+        kind: "fallback",
+        path: null,
+        root: null,
+      },
+      requestHint: {
+        kind: "diagnostics-state",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.body).toContain('"sessionId":"session-1"');
+  expect(response.body).toContain('"requestHint":{"kind":"diagnostics-state"');
+  expect(response.body).toContain('"hydratedPaths":["/workspace/package.json"]');
+});
+
 test("buildPreviewResponse returns workspace file contents", () => {
   const response = buildPreviewResponse(
     {

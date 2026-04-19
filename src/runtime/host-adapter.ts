@@ -69,6 +69,7 @@ export type HostPreviewRequestHint =
         | "runtime-state"
         | "workspace-state"
         | "file-index"
+        | "diagnostics-state"
         | "runtime-stylesheet"
         | "not-found";
       workspacePath: null;
@@ -289,6 +290,15 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
     if (relativePath === "/__files.json") {
       return { kind: "file-index", workspacePath: null, documentRoot: null, hydratePaths: [] };
+    }
+
+    if (relativePath === "/__diagnostics.json") {
+      return {
+        kind: "diagnostics-state",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      };
     }
 
     if (relativePath === "/assets/runtime.css") {

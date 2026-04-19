@@ -103,6 +103,7 @@ pub enum PreviewRequestKind {
     RuntimeState,
     WorkspaceState,
     FileIndex,
+    DiagnosticsState,
     RuntimeStylesheet,
     WorkspaceFile,
     WorkspaceAsset,

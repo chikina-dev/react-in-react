@@ -148,6 +148,10 @@ function inferPreviewRequestKind(relativePath: string): HostPreviewRequestHint["
     return "file-index";
   }
 
+  if (relativePath === "/__diagnostics.json") {
+    return "diagnostics-state";
+  }
+
   if (relativePath === "/assets/runtime.css") {
     return "runtime-stylesheet";
   }
@@ -194,6 +198,8 @@ function buildPreviewResponseFromHint(
       return jsonResponse(200, preview.session);
     case "file-index":
       return jsonResponse(200, buildPreviewFileIndex(preview));
+    case "diagnostics-state":
+      return jsonResponse(200, buildPreviewDiagnostics(preview));
     case "runtime-stylesheet":
       return cssResponse(200, renderRuntimeStylesheet());
     case "workspace-file": {
@@ -235,6 +241,8 @@ function buildPreviewResponseFromFallback(
       return jsonResponse(200, preview.session);
     case "file-index":
       return jsonResponse(200, buildPreviewFileIndex(preview));
+    case "diagnostics-state":
+      return jsonResponse(200, buildPreviewDiagnostics(preview));
     case "runtime-stylesheet":
       return cssResponse(200, renderRuntimeStylesheet());
     case "workspace-file":
@@ -543,6 +551,39 @@ function buildPreviewFileIndex(preview: PreviewServerState): PreviewWorkspaceFil
       url: `${preview.url}files${file.path.replace("/workspace", "")}`,
       previewUrl: buildPreviewUrlForWorkspaceFile(file.path, preview, documentRoot),
     }));
+}
+
+function buildPreviewDiagnostics(preview: PreviewServerState): {
+  sessionId: SessionId;
+  pid: number;
+  port: number;
+  url: string;
+  model: PreviewModel;
+  session: SessionSnapshot;
+  rootHint: HostPreviewRootHint | null;
+  requestHint: HostPreviewRequestHint | null;
+  fileCount: number;
+  hydratedFileCount: number;
+  hydratedPaths: string[];
+} {
+  const hydratedPaths = [...preview.files.values()]
+    .filter((file) => file.textContent !== null || file.bytes.length > 0 || file.size === 0)
+    .map((file) => file.path)
+    .sort((left, right) => left.localeCompare(right));
+
+  return {
+    sessionId: preview.sessionId,
+    pid: preview.pid,
+    port: preview.port,
+    url: preview.url,
+    model: preview.model,
+    session: preview.session,
+    rootHint: preview.rootHint ?? null,
+    requestHint: preview.requestHint ?? null,
+    fileCount: preview.files.size,
+    hydratedFileCount: hydratedPaths.length,
+    hydratedPaths,
+  };
 }
 
 function buildPreviewFileResponse(
