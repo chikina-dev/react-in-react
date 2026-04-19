@@ -60,11 +60,13 @@ export type HostPreviewRequestHint =
       kind: "root-document";
       workspacePath: string;
       documentRoot: string;
+      hydratePaths: string[];
     }
   | {
       kind: "root-entry";
       workspacePath: string;
       documentRoot: null;
+      hydratePaths: string[];
     }
   | {
       kind:
@@ -76,11 +78,13 @@ export type HostPreviewRequestHint =
         | "not-found";
       workspacePath: null;
       documentRoot: null;
+      hydratePaths: string[];
     }
   | {
       kind: "workspace-file" | "workspace-asset";
       workspacePath: string;
       documentRoot: string;
+      hydratePaths: string[];
     };
 
 export interface RuntimeHostAdapter {
@@ -351,6 +355,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "root-document",
           workspacePath: rootHint.path,
           documentRoot: rootHint.root,
+          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
         };
       }
 
@@ -359,6 +364,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "root-entry",
           workspacePath: rootHint.path,
           documentRoot: null,
+          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
         };
       }
 
@@ -366,23 +372,29 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         kind: "fallback-root",
         workspacePath: null,
         documentRoot: null,
+        hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
       };
     }
 
     if (relativePath === "/__runtime.json") {
-      return { kind: "runtime-state", workspacePath: null, documentRoot: null };
+      return { kind: "runtime-state", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
     if (relativePath === "/__workspace.json") {
-      return { kind: "workspace-state", workspacePath: null, documentRoot: null };
+      return { kind: "workspace-state", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
     if (relativePath === "/__files.json") {
-      return { kind: "file-index", workspacePath: null, documentRoot: null };
+      return { kind: "file-index", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
     if (relativePath === "/assets/runtime.css") {
-      return { kind: "runtime-stylesheet", workspacePath: null, documentRoot: null };
+      return {
+        kind: "runtime-stylesheet",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      };
     }
 
     if (relativePath.startsWith("/files/")) {
@@ -393,10 +405,11 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "workspace-file",
           workspacePath,
           documentRoot: "/workspace",
+          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
         };
       }
 
-      return { kind: "not-found", workspacePath: null, documentRoot: null };
+      return { kind: "not-found", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
     const assetHint = await this.resolvePreviewAssetHint(sessionId, relativePath);
@@ -406,10 +419,11 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         kind: "workspace-asset",
         workspacePath: assetHint.workspacePath,
         documentRoot: assetHint.documentRoot,
+        hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
       };
     }
 
-    return { kind: "not-found", workspacePath: null, documentRoot: null };
+    return { kind: "not-found", workspacePath: null, documentRoot: null, hydratePaths: [] };
   }
 
   async readWorkspaceFile(sessionId: string, path: string): Promise<HostWorkspaceFileContent> {

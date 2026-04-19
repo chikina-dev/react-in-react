@@ -170,47 +170,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         session_id: &str,
         relative_path: &str,
     ) -> RuntimeHostResult<Vec<String>> {
-        let record = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
-        let mut paths = BTreeSet::new();
-
-        for file in record.vfs.files() {
-            if file.path.ends_with("/package.json") {
-                paths.insert(file.path.clone());
-            }
-        }
-
-        match relative_path {
-            "/" | "/index.html" => match self.resolve_preview_root_hint(session_id)? {
-                PreviewRootHint {
-                    path: Some(path), ..
-                } => {
-                    paths.insert(path);
-                }
-                PreviewRootHint { path: None, .. } => {}
-            },
-            path if path.starts_with("/files/") => {
-                let workspace_path = decode_workspace_path(path);
-
-                if record.vfs.read(&workspace_path).is_some() {
-                    paths.insert(workspace_path);
-                }
-            }
-            "/assets/runtime.css" => {}
-            path if path.starts_with("/__") => {}
-            path => {
-                if let Some(workspace_path) = self
-                    .resolve_preview_asset_hint(session_id, path)?
-                    .workspace_path
-                {
-                    paths.insert(workspace_path);
-                }
-            }
-        }
-
-        Ok(paths.into_iter().collect())
+        Ok(self
+            .resolve_preview_request_hint(session_id, relative_path)?
+            .hydrate_paths)
     }
 
     pub fn resolve_preview_root_hint(
@@ -321,8 +283,12 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     root,
                 } => Ok(PreviewRequestHint {
                     kind: PreviewRequestKind::RootDocument,
-                    workspace_path: Some(path),
+                    workspace_path: Some(path.clone()),
                     document_root: root,
+                    hydrate_paths: collect_preview_hydrate_paths(
+                        self.sessions.get(session_id).expect("session exists"),
+                        Some(path.as_str()),
+                    ),
                 }),
                 PreviewRootHint {
                     kind: PreviewRootKind::SourceEntry,
@@ -330,34 +296,46 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     ..
                 } => Ok(PreviewRequestHint {
                     kind: PreviewRequestKind::RootEntry,
-                    workspace_path: Some(path),
+                    workspace_path: Some(path.clone()),
                     document_root: None,
+                    hydrate_paths: collect_preview_hydrate_paths(
+                        self.sessions.get(session_id).expect("session exists"),
+                        Some(path.as_str()),
+                    ),
                 }),
                 _ => Ok(PreviewRequestHint {
                     kind: PreviewRequestKind::FallbackRoot,
                     workspace_path: None,
                     document_root: None,
+                    hydrate_paths: collect_preview_hydrate_paths(
+                        self.sessions.get(session_id).expect("session exists"),
+                        None,
+                    ),
                 }),
             },
             "/__runtime.json" => Ok(PreviewRequestHint {
                 kind: PreviewRequestKind::RuntimeState,
                 workspace_path: None,
                 document_root: None,
+                hydrate_paths: Vec::new(),
             }),
             "/__workspace.json" => Ok(PreviewRequestHint {
                 kind: PreviewRequestKind::WorkspaceState,
                 workspace_path: None,
                 document_root: None,
+                hydrate_paths: Vec::new(),
             }),
             "/__files.json" => Ok(PreviewRequestHint {
                 kind: PreviewRequestKind::FileIndex,
                 workspace_path: None,
                 document_root: None,
+                hydrate_paths: Vec::new(),
             }),
             "/assets/runtime.css" => Ok(PreviewRequestHint {
                 kind: PreviewRequestKind::RuntimeStylesheet,
                 workspace_path: None,
                 document_root: None,
+                hydrate_paths: Vec::new(),
             }),
             path if path.starts_with("/files/") => {
                 let workspace_path = decode_workspace_path(path);
@@ -377,19 +355,32 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                         .read(&workspace_path)
                         .map(|file| file.path.clone()),
                     document_root: Some("/workspace".into()),
+                    hydrate_paths: collect_preview_hydrate_paths(
+                        record,
+                        Some(workspace_path.as_str()),
+                    ),
                 })
             }
             path => {
                 let asset_hint = self.resolve_preview_asset_hint(session_id, path)?;
+                let record = self
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+                let workspace_path = asset_hint.workspace_path.clone();
 
                 Ok(PreviewRequestHint {
-                    kind: if asset_hint.workspace_path.is_some() {
+                    kind: if workspace_path.is_some() {
                         PreviewRequestKind::WorkspaceAsset
                     } else {
                         PreviewRequestKind::NotFound
                     },
-                    workspace_path: asset_hint.workspace_path,
+                    workspace_path,
                     document_root: asset_hint.document_root,
+                    hydrate_paths: collect_preview_hydrate_paths(
+                        record,
+                        asset_hint.workspace_path.as_deref(),
+                    ),
                 })
             }
         }
@@ -410,6 +401,25 @@ fn dirname(path: &str) -> &str {
         Some(index) if index > 0 => &normalized[..index],
         _ => "/workspace",
     }
+}
+
+fn collect_preview_hydrate_paths(
+    record: &SessionRecord,
+    workspace_path: Option<&str>,
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+
+    for file in record.vfs.files() {
+        if file.path.ends_with("/package.json") {
+            paths.insert(file.path.clone());
+        }
+    }
+
+    if let Some(path) = workspace_path {
+        paths.insert(path.to_string());
+    }
+
+    paths.into_iter().collect()
 }
 
 fn normalize_workspace_asset_path(relative_path: &str) -> String {

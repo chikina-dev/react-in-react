@@ -643,9 +643,10 @@ fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) 
         .as_ref()
         .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".into());
+    let hydrate_paths = render_string_array_json(&hint.hydrate_paths);
 
     format!(
-        "{{\"kind\":\"{kind}\",\"workspacePath\":{workspace_path},\"documentRoot\":{document_root}}}"
+        "{{\"kind\":\"{kind}\",\"workspacePath\":{workspace_path},\"documentRoot\":{document_root},\"hydratePaths\":{hydrate_paths}}}"
     )
 }
 

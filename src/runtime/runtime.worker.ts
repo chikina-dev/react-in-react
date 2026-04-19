@@ -374,8 +374,15 @@ async function resolvePreviewHttpResponse(
   record: SessionRecord | null,
 ): Promise<VirtualHttpResponse> {
   if (isPreviewPath(request.pathname)) {
-    const files = record ? await ensurePreviewFiles(request, record) : null;
     const hostAdapter = await hostAdapterPromise;
+    const requestHint = record
+      ? await hostAdapter.resolvePreviewRequestHint(
+          record.session.sessionId,
+          getPreviewRelativePath(request),
+        )
+      : null;
+    const files =
+      record && requestHint ? await ensurePreviewFiles(record, requestHint.hydratePaths) : null;
 
     return buildPreviewResponse(
       request,
@@ -387,14 +394,7 @@ async function resolvePreviewHttpResponse(
             url: record.preview.url,
             model: record.preview.model,
             rootHint: record.preview.rootHint,
-            assetHint: await hostAdapter.resolvePreviewAssetHint(
-              record.session.sessionId,
-              getPreviewRelativePath(request),
-            ),
-            requestHint: await hostAdapter.resolvePreviewRequestHint(
-              record.session.sessionId,
-              getPreviewRelativePath(request),
-            ),
+            requestHint: requestHint ?? undefined,
             session: record.session,
             files: files ?? new Map(),
           }
@@ -416,8 +416,8 @@ async function resolvePreviewHttpResponse(
 }
 
 async function ensurePreviewFiles(
-  request: Extract<UiToWorkerMessage, { type: "preview.http" }>["request"],
   record: SessionRecord,
+  hydrationPaths: string[],
 ): Promise<Map<string, WorkspaceFileRecord>> {
   const files = new Map(
     record.hostFiles.index.map((summary) => [summary.path, createPreviewFileStub(summary)]),
@@ -428,10 +428,6 @@ async function ensurePreviewFiles(
   }
 
   const hostAdapter = await hostAdapterPromise;
-  const hydrationPaths = await hostAdapter.resolvePreviewHydrationPaths(
-    record.session.sessionId,
-    getPreviewRelativePath(request),
-  );
   const nextPaths = hydrationPaths.filter(
     (path) => !record.hostFileCache.has(path) && files.has(path),
   );

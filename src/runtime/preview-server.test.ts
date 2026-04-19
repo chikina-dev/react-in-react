@@ -142,6 +142,7 @@ test("buildPreviewResponse prefers host-provided request hints", () => {
         kind: "root-document",
         workspacePath: "/workspace/dist/index.html",
         documentRoot: "/workspace/dist",
+        hydratePaths: ["/workspace/dist/index.html"],
       },
     },
   );

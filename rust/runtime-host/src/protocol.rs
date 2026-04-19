@@ -114,4 +114,5 @@ pub struct PreviewRequestHint {
     pub kind: PreviewRequestKind,
     pub workspace_path: Option<String>,
     pub document_root: Option<String>,
+    pub hydrate_paths: Vec<String>,
 }
