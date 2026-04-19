@@ -30,6 +30,13 @@ export type HostWorkspaceFileSummary = {
   isText: boolean;
 };
 
+export type HostWorkspaceEntrySummary = {
+  path: string;
+  kind: "file" | "directory";
+  size: number;
+  isText: boolean;
+};
+
 export type HostWorkspaceFileContent = HostWorkspaceFileSummary & {
   textContent: string | null;
   bytes: Uint8Array;
@@ -94,6 +101,8 @@ export interface RuntimeHostAdapter {
   }): Promise<HostSessionHandle>;
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
+  statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
+  readWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary[]>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -113,6 +122,8 @@ type WasmRuntimeHostExports = {
   runtime_host_create_session_json(ptr: number, len: number): number;
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
+  runtime_host_stat_workspace_path_json(ptr: number, len: number): number;
+  runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -125,6 +136,7 @@ type HostSessionRecord = {
   handle: HostSessionHandle;
   packageScripts: Record<string, string>;
   files: Map<string, WorkspaceFileRecord>;
+  directories: Set<string>;
 };
 
 export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
@@ -155,6 +167,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       handle,
       packageScripts: input.session.packageJson?.scripts ?? {},
       files: input.files,
+      directories: collectMockDirectories(input.files, input.session.workspaceRoot),
     });
 
     return handle;
@@ -168,7 +181,12 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     const commandLine = [request.command, ...request.args].join(" ").trim();
-    const cwd = resolveMockRunCwd(record.handle.workspaceRoot, request.cwd);
+    const cwd = resolveMockRunCwd(
+      record.handle.workspaceRoot,
+      record.directories,
+      record.files,
+      request.cwd,
+    );
 
     if (request.command === "npm" && request.args[0] === "run") {
       const scriptName = request.args[1];
@@ -215,6 +233,81 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       size: file.size,
       isText: file.isText,
     }));
+  }
+
+  async statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, path);
+    const file = record.files.get(resolved);
+    if (file) {
+      return {
+        path: file.path,
+        kind: "file",
+        size: file.size,
+        isText: file.isText,
+      };
+    }
+
+    if (record.directories.has(resolved)) {
+      return {
+        path: resolved,
+        kind: "directory",
+        size: 0,
+        isText: false,
+      };
+    }
+
+    throw new Error(`workspace file not found: ${resolved}`);
+  }
+
+  async readWorkspaceDirectory(
+    sessionId: string,
+    path: string,
+  ): Promise<HostWorkspaceEntrySummary[]> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const resolved = resolveMockWorkspacePath(record.handle.workspaceRoot, path);
+    if (!record.directories.has(resolved)) {
+      if (record.files.has(resolved)) {
+        throw new Error(`workspace path is not a directory: ${resolved}`);
+      }
+
+      throw new Error(`workspace directory not found: ${resolved}`);
+    }
+
+    const entries = new Map<string, HostWorkspaceEntrySummary>();
+    for (const directory of record.directories) {
+      if (directory !== resolved && parentMockPosixPath(directory) === resolved) {
+        entries.set(directory, {
+          path: directory,
+          kind: "directory",
+          size: 0,
+          isText: false,
+        });
+      }
+    }
+
+    for (const file of record.files.values()) {
+      if (parentMockPosixPath(file.path) === resolved) {
+        entries.set(file.path, {
+          path: file.path,
+          kind: "file",
+          size: file.size,
+          isText: file.isText,
+        });
+      }
+    }
+
+    return [...entries.values()].sort((left, right) => left.path.localeCompare(right.path));
   }
 
   private getPreviewRootHint(sessionId: string): MockPreviewRootHint {
@@ -481,6 +574,23 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     );
   }
 
+  async statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary> {
+    return this.invokeWithInput<HostWorkspaceEntrySummary>(
+      "runtime_host_stat_workspace_path_json",
+      [`session_id=${sessionId}`, `path=${path}`],
+    );
+  }
+
+  async readWorkspaceDirectory(
+    sessionId: string,
+    path: string,
+  ): Promise<HostWorkspaceEntrySummary[]> {
+    return this.invokeWithInput<HostWorkspaceEntrySummary[]>(
+      "runtime_host_read_workspace_directory_json",
+      [`session_id=${sessionId}`, `path=${path}`],
+    );
+  }
+
   async resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -626,16 +736,27 @@ function resolveMockPreviewAssetWorkspacePath(
   return candidates.find((candidate) => files.has(candidate)) ?? null;
 }
 
-function resolveMockRunCwd(workspaceRoot: string, cwd: string): string {
-  const normalized = !cwd
-    ? workspaceRoot
-    : normalizeMockPosixPath(cwd.startsWith("/") ? cwd : `${workspaceRoot}/${cwd}`);
+function resolveMockRunCwd(
+  workspaceRoot: string,
+  directories: Set<string>,
+  files: Map<string, WorkspaceFileRecord>,
+  cwd: string,
+): string {
+  const normalized = resolveMockWorkspacePath(workspaceRoot, cwd);
 
-  if (normalized === workspaceRoot || normalized.startsWith(`${workspaceRoot}/`)) {
-    return normalized;
+  if (!(normalized === workspaceRoot || normalized.startsWith(`${workspaceRoot}/`))) {
+    throw new Error(`working directory must stay under /workspace: ${normalized}`);
   }
 
-  throw new Error(`working directory must stay under /workspace: ${normalized}`);
+  if (!directories.has(normalized)) {
+    if (files.has(normalized)) {
+      throw new Error(`workspace path is not a directory: ${normalized}`);
+    }
+
+    throw new Error(`workspace directory not found: ${normalized}`);
+  }
+
+  return normalized;
 }
 
 function resolveMockNodeEntrypoint(
@@ -695,6 +816,52 @@ function normalizeMockPosixPath(input: string): string {
   }
 
   return `${isAbsolute ? "/" : ""}${normalized.join("/")}`;
+}
+
+function resolveMockWorkspacePath(workspaceRoot: string, path: string): string {
+  if (!path) {
+    return workspaceRoot;
+  }
+
+  return normalizeMockPosixPath(path.startsWith("/") ? path : `${workspaceRoot}/${path}`);
+}
+
+function collectMockDirectories(
+  files: Map<string, WorkspaceFileRecord>,
+  workspaceRoot: string,
+): Set<string> {
+  const directories = new Set<string>([workspaceRoot]);
+
+  for (const path of files.keys()) {
+    let current = parentMockPosixPath(path);
+
+    while (current.startsWith(workspaceRoot)) {
+      directories.add(current);
+
+      if (current === workspaceRoot) {
+        break;
+      }
+
+      current = parentMockPosixPath(current);
+    }
+  }
+
+  return directories;
+}
+
+function parentMockPosixPath(path: string): string {
+  const normalized = path.replace(/\/+$/, "");
+
+  if (!normalized || normalized === "/") {
+    return "/";
+  }
+
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) {
+    return "/";
+  }
+
+  return normalized.slice(0, index);
 }
 
 export async function createRuntimeHostAdapter(): Promise<RuntimeHostAdapter> {

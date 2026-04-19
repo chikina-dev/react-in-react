@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 pub enum RuntimeHostError {
     InvalidWorkspacePath(String),
     InvalidWorkingDirectory(String),
+    DirectoryNotFound(String),
+    NotADirectory(String),
     DuplicateFilePath(String),
     SessionNotFound(String),
     FileNotFound(String),
@@ -22,6 +24,8 @@ impl Display for RuntimeHostError {
             Self::InvalidWorkingDirectory(path) => {
                 write!(f, "working directory must stay under /workspace: {path}")
             }
+            Self::DirectoryNotFound(path) => write!(f, "workspace directory not found: {path}"),
+            Self::NotADirectory(path) => write!(f, "workspace path is not a directory: {path}"),
             Self::DuplicateFilePath(path) => write!(f, "duplicate workspace file path: {path}"),
             Self::SessionNotFound(session_id) => write!(f, "session not found: {session_id}"),
             Self::FileNotFound(path) => write!(f, "workspace file not found: {path}"),

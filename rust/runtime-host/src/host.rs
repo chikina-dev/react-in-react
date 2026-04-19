@@ -4,9 +4,10 @@ use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
-use crate::vfs::{normalize_posix_path, VirtualFile, VirtualFileSystem};
+use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
 const PREVIEW_DOCUMENT_CANDIDATES: [&str; 4] = [
     "/workspace/index.html",
@@ -241,6 +242,37 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .ok_or_else(|| RuntimeHostError::FileNotFound(path.into()))
     }
 
+    pub fn stat_workspace_path(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> RuntimeHostResult<WorkspaceEntrySummary> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let resolved = resolve_workspace_path(record, path);
+
+        record
+            .vfs
+            .stat(&resolved)
+            .ok_or_else(|| RuntimeHostError::FileNotFound(resolved))
+    }
+
+    pub fn read_workspace_directory(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> RuntimeHostResult<Vec<WorkspaceEntrySummary>> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let resolved = resolve_workspace_path(record, path);
+
+        record.vfs.read_dir(&resolved)
+    }
+
     fn resolve_preview_root_hint(&self, session_id: &str) -> RuntimeHostResult<PreviewRootHint> {
         let record = self
             .sessions
@@ -464,21 +496,33 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 }
 
 fn resolve_run_cwd(record: &SessionRecord, cwd: &str) -> RuntimeHostResult<String> {
-    let normalized = if cwd.is_empty() {
-        record.snapshot.workspace_root.clone()
-    } else if cwd.starts_with('/') {
-        normalize_posix_path(cwd)
-    } else {
-        normalize_posix_path(&format!("{}/{}", record.snapshot.workspace_root, cwd))
-    };
+    let normalized = resolve_workspace_path(record, cwd);
 
     if normalized == record.snapshot.workspace_root
         || normalized.starts_with(&format!("{}/", record.snapshot.workspace_root))
     {
+        if !record.vfs.exists(&normalized) {
+            return Err(RuntimeHostError::DirectoryNotFound(normalized));
+        }
+
+        if !record.vfs.is_dir(&normalized) {
+            return Err(RuntimeHostError::NotADirectory(normalized));
+        }
+
         return Ok(normalized);
     }
 
     Err(RuntimeHostError::InvalidWorkingDirectory(normalized))
+}
+
+fn resolve_workspace_path(record: &SessionRecord, path: &str) -> String {
+    if path.is_empty() {
+        record.snapshot.workspace_root.clone()
+    } else if path.starts_with('/') {
+        normalize_posix_path(path)
+    } else {
+        normalize_posix_path(&format!("{}/{}", record.snapshot.workspace_root, path))
+    }
 }
 
 fn resolve_node_entrypoint(

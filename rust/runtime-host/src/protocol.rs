@@ -84,6 +84,20 @@ pub struct WorkspaceFileSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEntrySummary {
+    pub path: String,
+    pub kind: WorkspaceEntryKind,
+    pub size: usize,
+    pub is_text: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreviewRequestKind {
     RootDocument,
     RootEntry,

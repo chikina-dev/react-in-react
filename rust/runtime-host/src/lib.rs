@@ -10,7 +10,8 @@ pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRequestHint, PreviewRequestKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -105,6 +106,23 @@ mod tests {
             PreviewRequestKind::DiagnosticsState
         );
         assert_eq!(
+            host.stat_workspace_path(&session.session_id, "/workspace/src")
+                .expect("workspace directory should be stat-able")
+                .kind,
+            WorkspaceEntryKind::Directory
+        );
+        assert_eq!(
+            host.read_workspace_directory(&session.session_id, "/workspace")
+                .expect("workspace directory entries should resolve")
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>(),
+            vec![
+                "/workspace/package.json".to_string(),
+                "/workspace/src".to_string(),
+            ]
+        );
+        assert_eq!(
             host.plan_run(
                 &session.session_id,
                 &RunRequest::new("src", "node", vec![String::from("main")]),
@@ -113,6 +131,20 @@ mod tests {
             .entrypoint,
             "/workspace/src/main.tsx"
         );
+        assert!(matches!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new("/workspace/missing", "node", vec![String::from("main")]),
+            ),
+            Err(RuntimeHostError::DirectoryNotFound(path)) if path == "/workspace/missing"
+        ));
+        assert!(matches!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new("/workspace/package.json", "node", vec![String::from("main")]),
+            ),
+            Err(RuntimeHostError::NotADirectory(path)) if path == "/workspace/package.json"
+        ));
         assert!(matches!(
             host.plan_run(
                 &session.session_id,

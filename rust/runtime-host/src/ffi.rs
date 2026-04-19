@@ -83,14 +83,13 @@ pub extern "C" fn runtime_host_create_session_json(ptr: *const u8, len: usize) -
     };
 
     HOST.with(|host| {
-        let result =
-            host.borrow_mut().create_session_with_id(
-                session_id,
-                archive,
-                package_name,
-                package_scripts,
-                files,
-            );
+        let result = host.borrow_mut().create_session_with_id(
+            session_id,
+            archive,
+            package_name,
+            package_scripts,
+            files,
+        );
 
         match result {
             Ok(snapshot) => set_last_result(render_session_handle_json(&snapshot)),
@@ -257,6 +256,52 @@ pub extern "C" fn runtime_host_read_workspace_files_json(ptr: *const u8, len: us
         }
 
         set_last_result(render_workspace_files_json(&files));
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_stat_workspace_path_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let path = required_field(&fields, "path").unwrap_or_else(|| "/workspace".into());
+
+    HOST.with(|host| {
+        let result = host.borrow().stat_workspace_path(&session_id, &path);
+
+        match result {
+            Ok(entry) => set_last_result(render_workspace_entry_json(&entry)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_read_workspace_directory_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let path = required_field(&fields, "path").unwrap_or_else(|| "/workspace".into());
+
+    HOST.with(|host| {
+        let result = host.borrow().read_workspace_directory(&session_id, &path);
+
+        match result {
+            Ok(entries) => set_last_result(render_workspace_entries_json(&entries)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
     });
 
     1
@@ -506,6 +551,31 @@ fn render_workspace_file_summaries_json(files: &[crate::protocol::WorkspaceFileS
                 file.is_text,
             )
         })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
+}
+
+fn render_workspace_entry_json(entry: &crate::protocol::WorkspaceEntrySummary) -> String {
+    let kind = match entry.kind {
+        crate::protocol::WorkspaceEntryKind::File => "file",
+        crate::protocol::WorkspaceEntryKind::Directory => "directory",
+    };
+
+    format!(
+        "{{\"path\":\"{}\",\"kind\":\"{}\",\"size\":{},\"isText\":{}}}",
+        escape_json(&entry.path),
+        kind,
+        entry.size,
+        entry.is_text,
+    )
+}
+
+fn render_workspace_entries_json(entries: &[crate::protocol::WorkspaceEntrySummary]) -> String {
+    let items = entries
+        .iter()
+        .map(render_workspace_entry_json)
         .collect::<Vec<_>>()
         .join(",");
 

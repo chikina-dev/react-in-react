@@ -128,6 +128,34 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     },
   ]);
 
+  await expect(adapter.statWorkspacePath(session.sessionId, "/workspace/src")).resolves.toEqual({
+    path: "/workspace/src",
+    kind: "directory",
+    size: 0,
+    isText: false,
+  });
+
+  await expect(adapter.readWorkspaceDirectory(session.sessionId, "/workspace")).resolves.toEqual([
+    {
+      path: "/workspace/logo.png",
+      kind: "file",
+      size: 4,
+      isText: false,
+    },
+    {
+      path: "/workspace/package.json",
+      kind: "file",
+      size: 19,
+      isText: true,
+    },
+    {
+      path: "/workspace/src",
+      kind: "directory",
+      size: 0,
+      isText: false,
+    },
+  ]);
+
   await expect(adapter.resolvePreviewRequestHint(session.sessionId, "/logo.png")).resolves.toEqual({
     kind: "workspace-asset",
     workspacePath: "/workspace/logo.png",
@@ -286,4 +314,20 @@ test("MockRuntimeHostAdapter validates cwd and node entrypoints", async () => {
       args: ["missing-entry"],
     }),
   ).rejects.toThrow("entrypoint not found");
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "/workspace/package.json",
+      command: "node",
+      args: ["server"],
+    }),
+  ).rejects.toThrow("workspace path is not a directory");
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "/workspace/missing",
+      command: "node",
+      args: ["server"],
+    }),
+  ).rejects.toThrow("workspace directory not found");
 });
