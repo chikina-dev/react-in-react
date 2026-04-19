@@ -71,6 +71,10 @@ export function App() {
   const [preview, setPreview] = useState<PreviewReadyEvent | null>(null);
   const [previewInspection, setPreviewInspection] = useState<PreviewInspection | null>(null);
   const [previewInspectionError, setPreviewInspectionError] = useState<string | null>(null);
+  const [previewSelectedPath, setPreviewSelectedPath] = useState<string | null>(null);
+  const [previewProbePath, setPreviewProbePath] = useState("/");
+  const [previewManualProbe, setPreviewManualProbe] = useState<PreviewRouteProbe | null>(null);
+  const [previewManualProbeError, setPreviewManualProbeError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [previewRouter, setPreviewRouter] = useState("registering");
   const [previewRouterDetail, setPreviewRouterDetail] = useState<string | null>(null);
@@ -91,6 +95,10 @@ export function App() {
     setPreview(null);
     setPreviewInspection(null);
     setPreviewInspectionError(null);
+    setPreviewSelectedPath(null);
+    setPreviewProbePath("/");
+    setPreviewManualProbe(null);
+    setPreviewManualProbeError(null);
     setTerminal([
       {
         kind: "system",
@@ -126,12 +134,19 @@ export function App() {
         });
         setPreviewInspection(null);
         setPreviewInspectionError(null);
+        setPreviewSelectedPath(null);
+        setPreviewManualProbe(null);
+        setPreviewManualProbeError(null);
         setSessionState("stopped");
         break;
       case "preview.ready":
         setPreview(event);
         setPreviewInspection(null);
         setPreviewInspectionError(null);
+        setPreviewSelectedPath(null);
+        setPreviewProbePath("/");
+        setPreviewManualProbe(null);
+        setPreviewManualProbeError(null);
         void registerPreview(event);
         appendTerminal({
           kind: "system",
@@ -145,6 +160,9 @@ export function App() {
         });
         setPreviewInspection(null);
         setPreviewInspectionError(null);
+        setPreviewSelectedPath(null);
+        setPreviewManualProbe(null);
+        setPreviewManualProbeError(null);
         setSessionState("errored");
         break;
     }
@@ -182,6 +200,7 @@ export function App() {
 
         setPreviewInspection(inspection);
         setPreviewInspectionError(null);
+        setPreviewSelectedPath(inspection.selectedFile?.path ?? null);
       })
       .catch((error: unknown) => {
         if (cancelled) {
@@ -192,12 +211,65 @@ export function App() {
         setPreviewInspectionError(
           error instanceof Error ? error.message : "Failed to load preview inspection.",
         );
+        setPreviewSelectedPath(null);
       });
 
     return () => {
       cancelled = true;
     };
   }, [controller, preview]);
+
+  useEffect(() => {
+    if (!preview || !previewInspection || !previewSelectedPath) {
+      return;
+    }
+
+    if (previewInspection.selectedFile?.path === previewSelectedPath) {
+      return;
+    }
+
+    const nextFile = previewInspection.files.find((file) => file.path === previewSelectedPath);
+    if (!nextFile) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void controller
+      .requestPreviewText(createPreviewRouteRequest(preview, nextFile.url))
+      .then((content) => {
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewInspection((current) => {
+          if (!current) {
+            return current;
+          }
+
+          return {
+            ...current,
+            selectedFile: {
+              ...nextFile,
+              content,
+            },
+          };
+        });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewInspectionError(
+          error instanceof Error ? error.message : "Failed to load selected preview file.",
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [controller, preview, previewInspection, previewSelectedPath]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator)) {
@@ -280,6 +352,10 @@ export function App() {
       setPreview(null);
       setPreviewInspection(null);
       setPreviewInspectionError(null);
+      setPreviewSelectedPath(null);
+      setPreviewProbePath("/");
+      setPreviewManualProbe(null);
+      setPreviewManualProbeError(null);
       await controller.run(session.sessionId, request);
     } finally {
       setIsBusy(false);
@@ -302,8 +378,31 @@ export function App() {
       setPreview(null);
       setPreviewInspection(null);
       setPreviewInspectionError(null);
+      setPreviewSelectedPath(null);
+      setPreviewProbePath("/");
+      setPreviewManualProbe(null);
+      setPreviewManualProbeError(null);
     } finally {
       setIsBusy(false);
+    }
+  }
+
+  async function probePreviewPath(): Promise<void> {
+    if (!preview) {
+      return;
+    }
+
+    setPreviewManualProbeError(null);
+
+    try {
+      const request = createCustomPreviewRouteRequest(preview, previewProbePath);
+      const response = await controller.requestPreviewResponse(request);
+      setPreviewManualProbe(buildPreviewRouteProbe(request.pathname, response));
+    } catch (error) {
+      setPreviewManualProbe(null);
+      setPreviewManualProbeError(
+        error instanceof Error ? error.message : "Failed to probe preview route.",
+      );
     }
   }
 
@@ -561,37 +660,86 @@ export function App() {
           </div>
 
           {previewInspection ? (
-            <div className="meta-grid">
-              <MetaRow label="Root route">
-                {previewInspection.probes.root.status} / {previewInspection.probes.root.contentType}
-              </MetaRow>
-              <MetaRow label="Runtime route">
-                {previewInspection.probes.runtime.status} /{" "}
-                {previewInspection.probes.runtime.contentType}
-              </MetaRow>
-              <MetaRow label="Files route">
-                {previewInspection.probes.files.status} /{" "}
-                {previewInspection.probes.files.contentType}
-              </MetaRow>
-              <MetaRow label="Indexed files">{String(previewInspection.files.length)}</MetaRow>
-              <MetaRow label="Selected file">
-                {previewInspection.selectedFile?.path ?? "none"}
-              </MetaRow>
-              <MetaRow label="Content type">
-                {previewInspection.selectedFile?.contentType ?? "none"}
-              </MetaRow>
-              <MetaRow label="Preview route">
-                {previewInspection.selectedFile?.previewUrl ?? "none"}
-              </MetaRow>
-              <MetaRow label="Raw route">{previewInspection.selectedFile?.url ?? "none"}</MetaRow>
-              <MetaRow label="Body preview">
-                <code>
-                  {previewInspection.selectedFile
-                    ? truncateInspectorSource(previewInspection.selectedFile.content)
-                    : previewInspection.probes.root.bodyPreview}
-                </code>
-              </MetaRow>
-            </div>
+            <>
+              <div className="meta-grid">
+                <MetaRow label="Root route">
+                  {previewInspection.probes.root.status} /{" "}
+                  {previewInspection.probes.root.contentType}
+                </MetaRow>
+                <MetaRow label="Runtime route">
+                  {previewInspection.probes.runtime.status} /{" "}
+                  {previewInspection.probes.runtime.contentType}
+                </MetaRow>
+                <MetaRow label="Files route">
+                  {previewInspection.probes.files.status} /{" "}
+                  {previewInspection.probes.files.contentType}
+                </MetaRow>
+                <MetaRow label="Indexed files">{String(previewInspection.files.length)}</MetaRow>
+                <MetaRow label="Selected file">
+                  {previewInspection.selectedFile?.path ?? "none"}
+                </MetaRow>
+                <MetaRow label="Content type">
+                  {previewInspection.selectedFile?.contentType ?? "none"}
+                </MetaRow>
+                <MetaRow label="Preview route">
+                  {previewInspection.selectedFile?.previewUrl ?? "none"}
+                </MetaRow>
+                <MetaRow label="Raw route">{previewInspection.selectedFile?.url ?? "none"}</MetaRow>
+                <MetaRow label="Body preview">
+                  <code>
+                    {previewInspection.selectedFile
+                      ? truncateInspectorSource(previewInspection.selectedFile.content)
+                      : previewInspection.probes.root.bodyPreview}
+                  </code>
+                </MetaRow>
+              </div>
+
+              <div className="inspector-file-picker">
+                <span>Preview files</span>
+                <div className="inspector-chip-list">
+                  {previewInspection.files.slice(0, 10).map((file) => (
+                    <button
+                      key={file.path}
+                      className={
+                        file.path === previewSelectedPath
+                          ? "inspector-chip active"
+                          : "inspector-chip"
+                      }
+                      onClick={() => setPreviewSelectedPath(file.path)}
+                      type="button"
+                    >
+                      {file.path.replace("/workspace/", "")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="inspector-probe-form">
+                <label>
+                  <span>Custom preview path</span>
+                  <input
+                    value={previewProbePath}
+                    onChange={(event) => setPreviewProbePath(event.currentTarget.value)}
+                  />
+                </label>
+                <button className="ghost" onClick={() => void probePreviewPath()} type="button">
+                  Probe route
+                </button>
+              </div>
+
+              {previewManualProbe ? (
+                <div className="meta-grid">
+                  <MetaRow label="Probed path">{previewManualProbe.path}</MetaRow>
+                  <MetaRow label="Probe status">{String(previewManualProbe.status)}</MetaRow>
+                  <MetaRow label="Probe content-type">{previewManualProbe.contentType}</MetaRow>
+                  <MetaRow label="Probe body">
+                    <code>{previewManualProbe.bodyPreview}</code>
+                  </MetaRow>
+                </div>
+              ) : previewManualProbeError ? (
+                <p className="empty-copy">{previewManualProbeError}</p>
+              ) : null}
+            </>
           ) : (
             <p className="empty-copy">
               {previewInspectionError ??
@@ -679,8 +827,38 @@ function createPreviewRouteRequest(
   };
 }
 
+function createCustomPreviewRouteRequest(
+  preview: PreviewReadyEvent,
+  rawPath: string,
+): {
+  sessionId: string;
+  port: number;
+  method: string;
+  pathname: string;
+  search: string;
+  headers: Record<string, string>;
+} {
+  const normalized = normalizePreviewProbePath(rawPath);
+  const suffix = normalized === "/" ? "" : normalized.replace(/^\//, "");
+  const pathname = suffix ? `${preview.url}${suffix}` : preview.url;
+  const headers =
+    normalized === "/" || normalized === "/index.html" ? withPreviewClientHeader({}) : {};
+
+  return createPreviewRouteRequest(preview, pathname, headers);
+}
+
 function truncateInspectorSource(source: string): string {
   return source.split("\n").slice(0, 4).join(" ").slice(0, 140);
+}
+
+function normalizePreviewProbePath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+
+  if (!trimmed) {
+    return "/";
+  }
+
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
 }
 
 async function loadPreviewInspection(
