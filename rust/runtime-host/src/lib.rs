@@ -10,8 +10,8 @@ pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostProcessInfo, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot,
+    SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -170,6 +170,23 @@ mod tests {
             Ok(HostFsResponse::DirectoryEntries(entries))
                 if entries.iter().any(|entry| entry.path == "/workspace/src/generated")
         ));
+        assert_eq!(
+            host.build_process_info(
+                &session.session_id,
+                &RunRequest::new(
+                    "src",
+                    "node",
+                    vec![String::from("main"), String::from("--watch")]
+                ),
+            )
+            .expect("process info should resolve")
+            .argv,
+            vec![
+                "/virtual/node".to_string(),
+                "/workspace/src/main.tsx".to_string(),
+                "--watch".to_string(),
+            ]
+        );
         assert_eq!(
             host.plan_run(
                 &session.session_id,

@@ -77,6 +77,18 @@ pub struct HostBootstrapSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostProcessInfo {
+    pub cwd: String,
+    pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub exec_path: String,
+    pub platform: String,
+    pub entrypoint: String,
+    pub command_line: String,
+    pub command_kind: RunCommandKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileSummary {
     pub path: String,
     pub size: usize,

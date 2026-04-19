@@ -1,6 +1,7 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
 import {
   createRuntimeHostAdapter,
+  type HostProcessInfo,
   type HostPreviewRequestHint,
   type HostRunPlan,
 } from "./host-adapter";
@@ -157,9 +158,15 @@ async function runSession(
   const hostAdapter = await hostAdapterPromise;
   const bootSummary = await hostAdapter.bootSummary();
   let runPlan: HostRunPlan;
+  let processInfo: HostProcessInfo;
 
   try {
     runPlan = await hostAdapter.planRun(sessionId, {
+      cwd: request.cwd,
+      command: request.command,
+      args: request.args,
+    });
+    processInfo = await hostAdapter.buildProcessInfo(sessionId, {
       cwd: request.cwd,
       command: request.command,
       args: request.args,
@@ -199,6 +206,11 @@ async function runSession(
     sessionId,
     pid,
     `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
+  );
+  await emitStdout(
+    sessionId,
+    pid,
+    `[process] exec=${processInfo.execPath} cwd=${processInfo.cwd} argv=${processInfo.argv.join(" ")}`,
   );
 
   await emitStdout(

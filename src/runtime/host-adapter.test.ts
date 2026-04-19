@@ -110,6 +110,28 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     resolvedScript: "vite",
   });
 
+  await expect(
+    adapter.buildProcessInfo(session.sessionId, {
+      cwd: "/workspace",
+      command: "npm",
+      args: ["run", "dev", "--host"],
+      env: {
+        NODE_ENV: "development",
+      },
+    }),
+  ).resolves.toEqual({
+    cwd: "/workspace",
+    argv: ["/virtual/node", "npm", "run", "dev", "--host"],
+    env: {
+      NODE_ENV: "development",
+    },
+    execPath: "/virtual/node",
+    platform: "browser",
+    entrypoint: "dev",
+    commandLine: "npm run dev --host",
+    commandKind: "npm-script",
+  });
+
   await expect(adapter.listWorkspaceFiles(session.sessionId)).resolves.toEqual([
     {
       path: "/workspace/package.json",

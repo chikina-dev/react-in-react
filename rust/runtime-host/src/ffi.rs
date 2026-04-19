@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
-use crate::protocol::{ArchiveStats, HostFsCommand, HostFsResponse, RunRequest};
+use crate::protocol::{ArchiveStats, HostFsCommand, HostFsResponse, HostProcessInfo, RunRequest};
 use crate::vfs::VirtualFile;
 
 thread_local! {
@@ -145,6 +145,58 @@ pub extern "C" fn runtime_host_plan_run_json(ptr: *const u8, len: usize) -> u32 
 
         match result {
             Ok(plan) => set_last_result(render_run_plan_json(&plan)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_build_process_info_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let cwd = required_field(&fields, "cwd").unwrap_or_else(|| "/workspace".into());
+    let command = required_field(&fields, "command").unwrap_or_default();
+    let args = fields
+        .get("args")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = fields
+        .get("env")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow().build_process_info(
+            &session_id,
+            &RunRequest {
+                cwd,
+                command,
+                args,
+                env,
+            },
+        );
+
+        match result {
+            Ok(process_info) => set_last_result(render_process_info_json(&process_info)),
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -662,6 +714,31 @@ fn render_run_plan_json(plan: &crate::protocol::RunPlan) -> String {
         plan.env_count,
         command_kind,
         resolved_script,
+    )
+}
+
+fn render_process_info_json(process_info: &HostProcessInfo) -> String {
+    let command_kind = match process_info.command_kind {
+        crate::protocol::RunCommandKind::NpmScript => "npm-script",
+        crate::protocol::RunCommandKind::NodeEntrypoint => "node-entrypoint",
+    };
+    let env = process_info
+        .env
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value),))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"cwd\":\"{}\",\"argv\":{},\"env\":{{{}}},\"execPath\":\"{}\",\"platform\":\"{}\",\"entrypoint\":\"{}\",\"commandLine\":\"{}\",\"commandKind\":\"{}\"}}",
+        escape_json(&process_info.cwd),
+        render_string_array_json(&process_info.argv),
+        env,
+        escape_json(&process_info.exec_path),
+        escape_json(&process_info.platform),
+        escape_json(&process_info.entrypoint),
+        escape_json(&process_info.command_line),
+        command_kind,
     )
 }
 

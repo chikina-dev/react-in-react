@@ -4,8 +4,8 @@ use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostProcessInfo, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot,
+    SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -195,6 +195,42 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 command_line
             },
         ))
+    }
+
+    pub fn build_process_info(
+        &self,
+        session_id: &str,
+        request: &RunRequest,
+    ) -> RuntimeHostResult<HostProcessInfo> {
+        let plan = self.plan_run(session_id, request)?;
+        let argv = match plan.command_kind {
+            crate::protocol::RunCommandKind::NodeEntrypoint => {
+                let mut argv = vec![String::from("/virtual/node"), plan.entrypoint.clone()];
+                argv.extend(request.args.iter().skip(1).cloned());
+                argv
+            }
+            crate::protocol::RunCommandKind::NpmScript => {
+                let mut argv = vec![
+                    String::from("/virtual/node"),
+                    String::from("npm"),
+                    String::from("run"),
+                ];
+                argv.push(plan.entrypoint.clone());
+                argv.extend(request.args.iter().skip(2).cloned());
+                argv
+            }
+        };
+
+        Ok(HostProcessInfo {
+            cwd: plan.cwd,
+            argv,
+            env: request.env.clone(),
+            exec_path: String::from("/virtual/node"),
+            platform: String::from("browser"),
+            entrypoint: plan.entrypoint,
+            command_line: plan.command_line,
+            command_kind: plan.command_kind,
+        })
     }
 
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {

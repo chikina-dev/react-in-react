@@ -17,6 +17,17 @@ export type HostRunPlan = {
   resolvedScript: string | null;
 };
 
+export type HostProcessInfo = {
+  cwd: string;
+  argv: string[];
+  env: Record<string, string>;
+  execPath: string;
+  platform: string;
+  entrypoint: string;
+  commandLine: string;
+  commandKind: "npm-script" | "node-entrypoint";
+};
+
 export type HostSessionHandle = {
   sessionId: string;
   workspaceRoot: string;
@@ -137,6 +148,7 @@ export interface RuntimeHostAdapter {
     files: Map<string, WorkspaceFileRecord>;
   }): Promise<HostSessionHandle>;
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
+  buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
   readWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary[]>;
@@ -168,6 +180,7 @@ type WasmRuntimeHostExports = {
   runtime_host_boot_summary_json(): number;
   runtime_host_create_session_json(ptr: number, len: number): number;
   runtime_host_plan_run_json(ptr: number, len: number): number;
+  runtime_host_build_process_info_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_stat_workspace_path_json(ptr: number, len: number): number;
   runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
@@ -269,6 +282,25 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     throw new Error(`unsupported command: ${commandLine || request.command || "<empty>"}`);
+  }
+
+  async buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo> {
+    const runPlan = await this.planRun(sessionId, request);
+    const argv =
+      runPlan.commandKind === "node-entrypoint"
+        ? ["/virtual/node", runPlan.entrypoint, ...request.args.slice(1)]
+        : ["/virtual/node", "npm", "run", runPlan.entrypoint, ...request.args.slice(2)];
+
+    return {
+      cwd: runPlan.cwd,
+      argv,
+      env: request.env ?? {},
+      execPath: "/virtual/node",
+      platform: "browser",
+      entrypoint: runPlan.entrypoint,
+      commandLine: runPlan.commandLine,
+      commandKind: runPlan.commandKind,
+    };
   }
 
   async listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]> {
@@ -763,6 +795,21 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       .join("\u001f");
 
     return this.invokeWithInput<HostRunPlan>("runtime_host_plan_run_json", [
+      `session_id=${sessionId}`,
+      `cwd=${request.cwd}`,
+      `command=${request.command}`,
+      `args=${args}`,
+      `env=${env}`,
+    ]);
+  }
+
+  async buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo> {
+    const args = request.args.join("\u001f");
+    const env = Object.entries(request.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\u001f");
+
+    return this.invokeWithInput<HostProcessInfo>("runtime_host_build_process_info_json", [
       `session_id=${sessionId}`,
       `cwd=${request.cwd}`,
       `command=${request.command}`,
