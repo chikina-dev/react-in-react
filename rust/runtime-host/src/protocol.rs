@@ -89,6 +89,13 @@ pub struct HostProcessInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeContext {
+    pub context_id: String,
+    pub session_id: String,
+    pub process: HostProcessInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileSummary {
     pub path: String,
     pub size: usize,
@@ -137,6 +144,49 @@ pub enum HostFsCommand {
         bytes: Vec<u8>,
         is_text: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostContextFsCommand {
+    Exists {
+        path: String,
+    },
+    Stat {
+        path: String,
+    },
+    ReadDir {
+        path: String,
+    },
+    ReadFile {
+        path: String,
+    },
+    CreateDirAll {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        bytes: Vec<u8>,
+        is_text: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeCommand {
+    ProcessInfo,
+    ProcessCwd,
+    ProcessArgv,
+    ProcessEnv,
+    ProcessChdir { path: String },
+    Fs(HostContextFsCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeResponse {
+    ProcessInfo(HostProcessInfo),
+    ProcessCwd { cwd: String },
+    ProcessArgv { argv: Vec<String> },
+    ProcessEnv { env: BTreeMap<String, String> },
+    Fs(HostFsResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

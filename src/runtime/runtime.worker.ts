@@ -1,7 +1,7 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
 import {
   createRuntimeHostAdapter,
-  type HostProcessInfo,
+  type HostRuntimeContext,
   type HostPreviewRequestHint,
   type HostRunPlan,
 } from "./host-adapter";
@@ -29,6 +29,7 @@ type ActiveProcess = {
 type SessionRecord = {
   session: SessionSnapshot;
   process: ActiveProcess | null;
+  runtimeContext: HostRuntimeContext | null;
   hostFiles: {
     count: number;
     index: Array<{
@@ -70,7 +71,7 @@ async function handleMessage(message: UiToWorkerMessage): Promise<void> {
       await runSession(message.sessionId, message.request);
       break;
     case "session.stop":
-      stopSession(message.sessionId);
+      await stopSession(message.sessionId);
       emitAck(message.requestId);
       break;
     case "preview.http":
@@ -99,6 +100,7 @@ async function createSession(
     sessions.set(sessionId, {
       session: mounted.snapshot,
       process: null,
+      runtimeContext: null,
       hostFiles: {
         count: hostFiles.length,
         index: hostFiles,
@@ -142,7 +144,7 @@ async function runSession(
     return;
   }
 
-  stopSession(sessionId);
+  await disposeActiveRun(sessionId);
 
   const pid = nextPid++;
   const activeProcess: ActiveProcess = {
@@ -158,7 +160,7 @@ async function runSession(
   const hostAdapter = await hostAdapterPromise;
   const bootSummary = await hostAdapter.bootSummary();
   let runPlan: HostRunPlan;
-  let processInfo: HostProcessInfo;
+  let runtimeContext: HostRuntimeContext;
 
   try {
     runPlan = await hostAdapter.planRun(sessionId, {
@@ -166,12 +168,39 @@ async function runSession(
       command: request.command,
       args: request.args,
     });
-    processInfo = await hostAdapter.buildProcessInfo(sessionId, {
+    runtimeContext = await hostAdapter.createRuntimeContext(sessionId, {
       cwd: request.cwd,
       command: request.command,
       args: request.args,
     });
+    record.runtimeContext = runtimeContext;
   } catch (error) {
+    record.session.state = "errored";
+    emitState(sessionId, "errored");
+    emitError({
+      sessionId,
+      error: mapRunPlanError(error),
+    });
+    return;
+  }
+
+  let processInfo = runtimeContext.process;
+  let processCwd = runtimeContext.process.cwd;
+
+  try {
+    const processInfoResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.info",
+    });
+    const cwdResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.cwd",
+    });
+    processInfo =
+      processInfoResponse.kind === "process-info"
+        ? processInfoResponse.process
+        : runtimeContext.process;
+    processCwd = cwdResponse.kind === "process-cwd" ? cwdResponse.cwd : processInfo.cwd;
+  } catch (error) {
+    await disposeActiveRun(sessionId);
     record.session.state = "errored";
     emitState(sessionId, "errored");
     emitError({
@@ -210,8 +239,9 @@ async function runSession(
   await emitStdout(
     sessionId,
     pid,
-    `[process] exec=${processInfo.execPath} cwd=${processInfo.cwd} argv=${processInfo.argv.join(" ")}`,
+    `[process] exec=${processInfo.execPath} cwd=${processCwd} argv=${processInfo.argv.join(" ")}`,
   );
+  await emitStdout(sessionId, pid, `[context] id=${runtimeContext.contextId}`);
 
   await emitStdout(
     sessionId,
@@ -264,11 +294,28 @@ async function runSession(
   await emitStdout(sessionId, pid, `[preview] server-ready ${url}`);
 }
 
-function stopSession(sessionId: string): void {
+async function stopSession(sessionId: string): Promise<void> {
+  await disposeActiveRun(sessionId);
+}
+
+async function disposeActiveRun(sessionId: string): Promise<void> {
   const record = sessions.get(sessionId);
 
-  if (!record?.process) {
-    void hostAdapterPromise.then((adapter) => adapter.stopSession(sessionId));
+  if (!record) {
+    return;
+  }
+
+  if (record.runtimeContext) {
+    const contextId = record.runtimeContext.contextId;
+    record.runtimeContext = null;
+    const hostAdapter = await hostAdapterPromise;
+    await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
+  }
+
+  if (!record.process) {
+    record.preview = null;
+    record.session.state = "stopped";
+    emitState(sessionId, "stopped");
     return;
   }
 
@@ -279,7 +326,6 @@ function stopSession(sessionId: string): void {
   record.preview = null;
   record.session.state = "stopped";
   emitState(sessionId, "stopped");
-  void hostAdapterPromise.then((adapter) => adapter.stopSession(sessionId));
 
   postMessage({
     type: "process.exit",

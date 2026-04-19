@@ -9,9 +9,10 @@ pub use engine::{EngineAdapter, EngineDescriptor, NullEngineAdapter};
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
-    HostProcessInfo, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot,
-    SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
+    HostFsResponse, HostProcessInfo, HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -187,6 +188,46 @@ mod tests {
                 "--watch".to_string(),
             ]
         );
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should resolve");
+        assert!(matches!(
+            host.execute_context_fs_command(
+                &runtime_context.context_id,
+                HostContextFsCommand::ReadFile {
+                    path: String::from("main.tsx"),
+                },
+            ),
+            Ok(HostFsResponse::File { path, .. }) if path == "/workspace/src/main.tsx"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::ProcessInfo),
+            Ok(HostRuntimeResponse::ProcessInfo(process)) if process.cwd == "/workspace/src"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::ProcessChdir {
+                    path: String::from("generated"),
+                },
+            ),
+            Ok(HostRuntimeResponse::ProcessCwd { cwd }) if cwd == "/workspace/src/generated"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::Fs(HostContextFsCommand::WriteFile {
+                    path: String::from("runtime.log"),
+                    bytes: b"context write".to_vec(),
+                    is_text: true,
+                }),
+            ),
+            Ok(HostRuntimeResponse::Fs(HostFsResponse::Entry(entry)))
+                if entry.path == "/workspace/src/generated/runtime.log"
+        ));
         assert_eq!(
             host.plan_run(
                 &session.session_id,

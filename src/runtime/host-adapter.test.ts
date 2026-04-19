@@ -494,4 +494,81 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       isText: true,
     },
   });
+
+  const runtimeContext = await adapter.createRuntimeContext(session.sessionId, {
+    cwd: "/workspace/src",
+    command: "node",
+    args: ["server"],
+  });
+
+  await expect(
+    adapter.executeContextFsCommand(runtimeContext.contextId, {
+      kind: "read-file",
+      path: "server.ts",
+    }),
+  ).resolves.toEqual({
+    kind: "file",
+    path: "/workspace/src/server.ts",
+    size: 20,
+    isText: true,
+    textContent: "console.log('server')",
+    bytes: new TextEncoder().encode("console.log('server')"),
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.info",
+    }),
+  ).resolves.toEqual({
+    kind: "process-info",
+    process: {
+      cwd: "/workspace/src",
+      argv: ["/virtual/node", "/workspace/src/server.ts"],
+      env: {},
+      execPath: "/virtual/node",
+      platform: "browser",
+      entrypoint: "/workspace/src/server.ts",
+      commandLine: "node server",
+      commandKind: "node-entrypoint",
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.chdir",
+      path: "../src/generated/nested",
+    }),
+  ).resolves.toEqual({
+    kind: "process-cwd",
+    cwd: "/workspace/src/generated/nested",
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "fs.write-file",
+      path: "context.log",
+      bytes: new TextEncoder().encode("context write"),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    kind: "fs",
+    response: {
+      kind: "entry",
+      entry: {
+        path: "/workspace/src/generated/nested/context.log",
+        kind: "file",
+        size: 13,
+        isText: true,
+      },
+    },
+  });
+
+  await expect(adapter.dropRuntimeContext(runtimeContext.contextId)).resolves.toBeUndefined();
+
+  await expect(
+    adapter.executeContextFsCommand(runtimeContext.contextId, {
+      kind: "read-file",
+      path: "server.ts",
+    }),
+  ).rejects.toThrow("runtime context not found");
 });

@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostFsCommand, HostFsResponse,
-    HostProcessInfo, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot,
-    SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
+    HostFsResponse, HostProcessInfo, HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -54,10 +55,18 @@ struct SessionRecord {
     vfs: VirtualFileSystem,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeContextRecord {
+    session_id: String,
+    process: HostProcessInfo,
+}
+
 pub struct RuntimeHostCore<E: EngineAdapter> {
     engine: E,
     sessions: BTreeMap<String, SessionRecord>,
     next_session_id: u64,
+    runtime_contexts: BTreeMap<String, RuntimeContextRecord>,
+    next_runtime_context_id: u64,
 }
 
 impl<E: EngineAdapter> RuntimeHostCore<E> {
@@ -66,6 +75,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             engine,
             sessions: BTreeMap::new(),
             next_session_id: 1,
+            runtime_contexts: BTreeMap::new(),
+            next_runtime_context_id: 1,
         }
     }
 
@@ -230,6 +241,30 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             entrypoint: plan.entrypoint,
             command_line: plan.command_line,
             command_kind: plan.command_kind,
+        })
+    }
+
+    pub fn create_runtime_context(
+        &mut self,
+        session_id: &str,
+        request: &RunRequest,
+    ) -> RuntimeHostResult<HostRuntimeContext> {
+        let process = self.build_process_info(session_id, request)?;
+        let context_id = format!("runtime-context-{}", self.next_runtime_context_id);
+        self.next_runtime_context_id += 1;
+
+        self.runtime_contexts.insert(
+            context_id.clone(),
+            RuntimeContextRecord {
+                session_id: session_id.to_string(),
+                process: process.clone(),
+            },
+        );
+
+        Ok(HostRuntimeContext {
+            context_id,
+            session_id: session_id.to_string(),
+            process,
         })
     }
 
@@ -442,6 +477,133 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .write_file(&resolved, bytes, is_text)
                     .map(HostFsResponse::Entry)
             }
+        }
+    }
+
+    pub fn execute_context_fs_command(
+        &mut self,
+        context_id: &str,
+        command: HostContextFsCommand,
+    ) -> RuntimeHostResult<HostFsResponse> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+        let fs_command = match command {
+            HostContextFsCommand::Exists { path } => HostFsCommand::Exists {
+                cwd: context.process.cwd.clone(),
+                path,
+            },
+            HostContextFsCommand::Stat { path } => HostFsCommand::Stat {
+                cwd: context.process.cwd.clone(),
+                path,
+            },
+            HostContextFsCommand::ReadDir { path } => HostFsCommand::ReadDir {
+                cwd: context.process.cwd.clone(),
+                path,
+            },
+            HostContextFsCommand::ReadFile { path } => HostFsCommand::ReadFile {
+                cwd: context.process.cwd.clone(),
+                path,
+            },
+            HostContextFsCommand::CreateDirAll { path } => HostFsCommand::CreateDirAll {
+                cwd: context.process.cwd.clone(),
+                path,
+            },
+            HostContextFsCommand::WriteFile {
+                path,
+                bytes,
+                is_text,
+            } => HostFsCommand::WriteFile {
+                cwd: context.process.cwd.clone(),
+                path,
+                bytes,
+                is_text,
+            },
+        };
+
+        self.execute_fs_command(&context.session_id, fs_command)
+    }
+
+    pub fn execute_runtime_command(
+        &mut self,
+        context_id: &str,
+        command: HostRuntimeCommand,
+    ) -> RuntimeHostResult<HostRuntimeResponse> {
+        match command {
+            HostRuntimeCommand::ProcessInfo => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .cloned()
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::ProcessInfo(context.process))
+            }
+            HostRuntimeCommand::ProcessCwd => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::ProcessCwd {
+                    cwd: context.process.cwd.clone(),
+                })
+            }
+            HostRuntimeCommand::ProcessArgv => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::ProcessArgv {
+                    argv: context.process.argv.clone(),
+                })
+            }
+            HostRuntimeCommand::ProcessEnv => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::ProcessEnv {
+                    env: context.process.env.clone(),
+                })
+            }
+            HostRuntimeCommand::ProcessChdir { path } => {
+                let (session_id, cwd) = {
+                    let context = self.runtime_contexts.get(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    (context.session_id.clone(), context.process.cwd.clone())
+                };
+                let record = self
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.clone()))?;
+                let resolved = resolve_fs_command_path(record, &cwd, &path)?;
+
+                match record.vfs.stat(&resolved) {
+                    Some(WorkspaceEntrySummary {
+                        kind: crate::protocol::WorkspaceEntryKind::Directory,
+                        ..
+                    }) => {
+                        let context =
+                            self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                                RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                            })?;
+                        context.process.cwd = resolved.clone();
+                        Ok(HostRuntimeResponse::ProcessCwd { cwd: resolved })
+                    }
+                    Some(_) => Err(RuntimeHostError::NotADirectory(resolved)),
+                    None => Err(RuntimeHostError::DirectoryNotFound(resolved)),
+                }
+            }
+            HostRuntimeCommand::Fs(command) => self
+                .execute_context_fs_command(context_id, command)
+                .map(HostRuntimeResponse::Fs),
         }
     }
 
@@ -662,8 +824,18 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
     pub fn stop_session(&mut self, session_id: &str) -> RuntimeHostResult<()> {
         self.sessions
             .remove(session_id)
-            .map(|_| ())
+            .map(|_| {
+                self.runtime_contexts
+                    .retain(|_, context| context.session_id != session_id);
+            })
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))
+    }
+
+    pub fn drop_runtime_context(&mut self, context_id: &str) -> RuntimeHostResult<()> {
+        self.runtime_contexts
+            .remove(context_id)
+            .map(|_| ())
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))
     }
 }
 

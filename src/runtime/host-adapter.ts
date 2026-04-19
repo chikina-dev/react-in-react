@@ -28,6 +28,30 @@ export type HostProcessInfo = {
   commandKind: "npm-script" | "node-entrypoint";
 };
 
+export type HostRuntimeContext = {
+  contextId: string;
+  sessionId: string;
+  process: HostProcessInfo;
+};
+
+export type HostRuntimeCommand =
+  | { kind: "process.info" | "process.cwd" | "process.argv" | "process.env" }
+  | { kind: "process.chdir"; path: string }
+  | (
+      | {
+          kind: "fs.exists" | "fs.stat" | "fs.read-dir" | "fs.read-file" | "fs.mkdir";
+          path: string;
+        }
+      | { kind: "fs.write-file"; path: string; bytes: Uint8Array; isText: boolean }
+    );
+
+export type HostRuntimeResponse =
+  | { kind: "process-info"; process: HostProcessInfo }
+  | { kind: "process-cwd"; cwd: string }
+  | { kind: "process-argv"; argv: string[] }
+  | { kind: "process-env"; env: Record<string, string> }
+  | { kind: "fs"; response: HostFsResponse };
+
 export type HostSessionHandle = {
   sessionId: string;
   workspaceRoot: string;
@@ -62,6 +86,18 @@ export type HostFsCommand =
   | {
       kind: "write-file";
       cwd?: string;
+      path: string;
+      bytes: Uint8Array;
+      isText: boolean;
+    };
+
+export type HostContextFsCommand =
+  | {
+      kind: "exists" | "stat" | "read-dir" | "read-file" | "mkdir";
+      path: string;
+    }
+  | {
+      kind: "write-file";
       path: string;
       bytes: Uint8Array;
       isText: boolean;
@@ -149,6 +185,7 @@ export interface RuntimeHostAdapter {
   }): Promise<HostSessionHandle>;
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo>;
+  createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
   readWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary[]>;
@@ -162,6 +199,15 @@ export interface RuntimeHostAdapter {
     },
   ): Promise<HostWorkspaceEntrySummary>;
   executeFsCommand(sessionId: string, command: HostFsCommand): Promise<HostFsResponse>;
+  executeContextFsCommand(
+    contextId: string,
+    command: HostContextFsCommand,
+  ): Promise<HostFsResponse>;
+  executeRuntimeCommand(
+    contextId: string,
+    command: HostRuntimeCommand,
+  ): Promise<HostRuntimeResponse>;
+  dropRuntimeContext(contextId: string): Promise<void>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -181,12 +227,16 @@ type WasmRuntimeHostExports = {
   runtime_host_create_session_json(ptr: number, len: number): number;
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_build_process_info_json(ptr: number, len: number): number;
+  runtime_host_create_runtime_context_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_stat_workspace_path_json(ptr: number, len: number): number;
   runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
   runtime_host_create_workspace_directory_json(ptr: number, len: number): number;
   runtime_host_write_workspace_file_json(ptr: number, len: number): number;
   runtime_host_execute_fs_command_json(ptr: number, len: number): number;
+  runtime_host_execute_context_fs_command_json(ptr: number, len: number): number;
+  runtime_host_execute_runtime_command_json(ptr: number, len: number): number;
+  runtime_host_drop_runtime_context_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
@@ -202,8 +252,16 @@ type HostSessionRecord = {
   directories: Set<string>;
 };
 
+type HostRuntimeContextRecord = {
+  contextId: string;
+  sessionId: string;
+  process: HostProcessInfo;
+};
+
 export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   private readonly sessions = new Map<string, HostSessionRecord>();
+  private readonly runtimeContexts = new Map<string, HostRuntimeContextRecord>();
+  private nextRuntimeContextId = 1;
 
   async bootSummary(): Promise<HostBootstrapSummary> {
     return {
@@ -301,6 +359,18 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       commandLine: runPlan.commandLine,
       commandKind: runPlan.commandKind,
     };
+  }
+
+  async createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext> {
+    const process = await this.buildProcessInfo(sessionId, request);
+    const contextId = `runtime-context-${this.nextRuntimeContextId++}`;
+    const context = {
+      contextId,
+      sessionId,
+      process,
+    };
+    this.runtimeContexts.set(contextId, context);
+    return context;
   }
 
   async listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]> {
@@ -552,6 +622,118 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
   }
 
+  async executeContextFsCommand(
+    contextId: string,
+    command: HostContextFsCommand,
+  ): Promise<HostFsResponse> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+
+    return this.executeFsCommand(context.sessionId, {
+      ...command,
+      cwd: context.process.cwd,
+    });
+  }
+
+  async executeRuntimeCommand(
+    contextId: string,
+    command: HostRuntimeCommand,
+  ): Promise<HostRuntimeResponse> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+
+    switch (command.kind) {
+      case "process.info":
+        return {
+          kind: "process-info",
+          process: {
+            ...context.process,
+            argv: [...context.process.argv],
+            env: { ...context.process.env },
+          },
+        };
+      case "process.cwd":
+        return {
+          kind: "process-cwd",
+          cwd: context.process.cwd,
+        };
+      case "process.argv":
+        return {
+          kind: "process-argv",
+          argv: [...context.process.argv],
+        };
+      case "process.env":
+        return {
+          kind: "process-env",
+          env: { ...context.process.env },
+        };
+      case "process.chdir": {
+        const record = this.sessions.get(context.sessionId);
+
+        if (!record) {
+          throw new Error(`Rust host session not found: ${context.sessionId}`);
+        }
+
+        const nextCwd = resolveMockRunCwd(
+          record.handle.workspaceRoot,
+          record.directories,
+          record.files,
+          resolveMockFsCommandPath(context.process.cwd, command.path),
+        );
+        context.process.cwd = nextCwd;
+        return {
+          kind: "process-cwd",
+          cwd: nextCwd,
+        };
+      }
+      case "fs.exists":
+      case "fs.stat":
+      case "fs.read-dir":
+      case "fs.read-file":
+      case "fs.mkdir":
+      case "fs.write-file": {
+        const fsCommand: HostContextFsCommand =
+          command.kind === "fs.write-file"
+            ? {
+                kind: "write-file",
+                path: command.path,
+                bytes: command.bytes,
+                isText: command.isText,
+              }
+            : {
+                kind:
+                  command.kind === "fs.exists"
+                    ? "exists"
+                    : command.kind === "fs.stat"
+                      ? "stat"
+                      : command.kind === "fs.read-dir"
+                        ? "read-dir"
+                        : command.kind === "fs.read-file"
+                          ? "read-file"
+                          : "mkdir",
+                path: command.path,
+              };
+
+        return {
+          kind: "fs",
+          response: await this.executeContextFsCommand(contextId, fsCommand),
+        };
+      }
+    }
+  }
+
+  async dropRuntimeContext(contextId: string): Promise<void> {
+    if (!this.runtimeContexts.delete(contextId)) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+  }
+
   private getPreviewRootHint(sessionId: string): MockPreviewRootHint {
     const record = this.sessions.get(sessionId);
 
@@ -738,6 +920,11 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async stopSession(sessionId: string): Promise<void> {
+    for (const [contextId, context] of this.runtimeContexts.entries()) {
+      if (context.sessionId === sessionId) {
+        this.runtimeContexts.delete(contextId);
+      }
+    }
     this.sessions.delete(sessionId);
   }
 }
@@ -810,6 +997,21 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       .join("\u001f");
 
     return this.invokeWithInput<HostProcessInfo>("runtime_host_build_process_info_json", [
+      `session_id=${sessionId}`,
+      `cwd=${request.cwd}`,
+      `command=${request.command}`,
+      `args=${args}`,
+      `env=${env}`,
+    ]);
+  }
+
+  async createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext> {
+    const args = request.args.join("\u001f");
+    const env = Object.entries(request.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\u001f");
+
+    return this.invokeWithInput<HostRuntimeContext>("runtime_host_create_runtime_context_json", [
       `session_id=${sessionId}`,
       `cwd=${request.cwd}`,
       `command=${request.command}`,
@@ -929,6 +1131,152 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     return response;
+  }
+
+  async executeContextFsCommand(
+    contextId: string,
+    command: HostContextFsCommand,
+  ): Promise<HostFsResponse> {
+    const lines = [`context_id=${contextId}`, `command=${command.kind}`];
+
+    if ("path" in command) {
+      lines.push(`path=${encodeHex(command.path)}`);
+    }
+
+    if (command.kind === "write-file") {
+      lines.push(`is_text=${String(command.isText)}`);
+      lines.push(`bytes=${encodeHex(command.bytes)}`);
+    }
+
+    const response = await this.invokeWithInput<
+      | {
+          kind: "exists";
+          path: string;
+          exists: boolean;
+        }
+      | {
+          kind: "entry";
+          entry: HostWorkspaceEntrySummary;
+        }
+      | {
+          kind: "directory-entries";
+          entries: HostWorkspaceEntrySummary[];
+        }
+      | {
+          kind: "file";
+          path: string;
+          size: number;
+          isText: boolean;
+          textContent: string | null;
+          bytesHex: string;
+        }
+    >("runtime_host_execute_context_fs_command_json", lines);
+
+    if (response.kind === "file") {
+      return {
+        kind: "file",
+        path: response.path,
+        size: response.size,
+        isText: response.isText,
+        textContent: response.textContent,
+        bytes: decodeHex(response.bytesHex),
+      };
+    }
+
+    return response;
+  }
+
+  async executeRuntimeCommand(
+    contextId: string,
+    command: HostRuntimeCommand,
+  ): Promise<HostRuntimeResponse> {
+    const lines = [`context_id=${contextId}`];
+
+    switch (command.kind) {
+      case "process.info":
+        lines.push("command=process-info");
+        break;
+      case "process.cwd":
+        lines.push("command=process-cwd");
+        break;
+      case "process.argv":
+        lines.push("command=process-argv");
+        break;
+      case "process.env":
+        lines.push("command=process-env");
+        break;
+      case "process.chdir":
+        lines.push("command=process-chdir");
+        lines.push(`path=${encodeHex(command.path)}`);
+        break;
+      case "fs.exists":
+      case "fs.stat":
+      case "fs.read-dir":
+      case "fs.read-file":
+      case "fs.mkdir":
+      case "fs.write-file":
+        lines.push(`command=${command.kind.replace(".", "-")}`);
+        lines.push(`path=${encodeHex(command.path)}`);
+        if (command.kind === "fs.write-file") {
+          lines.push(`is_text=${String(command.isText)}`);
+          lines.push(`bytes=${encodeHex(command.bytes)}`);
+        }
+        break;
+    }
+
+    const response = await this.invokeWithInput<
+      | { kind: "process-info"; process: HostProcessInfo }
+      | { kind: "process-cwd"; cwd: string }
+      | { kind: "process-argv"; argv: string[] }
+      | { kind: "process-env"; env: Record<string, string> }
+      | {
+          kind: "fs";
+          response:
+            | {
+                kind: "exists";
+                path: string;
+                exists: boolean;
+              }
+            | {
+                kind: "entry";
+                entry: HostWorkspaceEntrySummary;
+              }
+            | {
+                kind: "directory-entries";
+                entries: HostWorkspaceEntrySummary[];
+              }
+            | {
+                kind: "file";
+                path: string;
+                size: number;
+                isText: boolean;
+                textContent: string | null;
+                bytesHex: string;
+              };
+        }
+    >("runtime_host_execute_runtime_command_json", lines);
+
+    if (response.kind === "fs" && response.response.kind === "file") {
+      return {
+        kind: "fs",
+        response: {
+          kind: "file",
+          path: response.response.path,
+          size: response.response.size,
+          isText: response.response.isText,
+          textContent: response.response.textContent,
+          bytes: decodeHex(response.response.bytesHex),
+        },
+      };
+    }
+
+    return response as HostRuntimeResponse;
+  }
+
+  async dropRuntimeContext(contextId: string): Promise<void> {
+    await this.invokeWithInput<{ contextId: string }>("runtime_host_drop_runtime_context_json", [
+      `context_id=${contextId}`,
+    ]);
   }
 
   async resolvePreviewRequestHint(

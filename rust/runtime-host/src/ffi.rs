@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 
 use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
-use crate::protocol::{ArchiveStats, HostFsCommand, HostFsResponse, HostProcessInfo, RunRequest};
+use crate::protocol::{
+    ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
+    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, RunRequest,
+};
 use crate::vfs::VirtualFile;
 
 thread_local! {
@@ -197,6 +200,58 @@ pub extern "C" fn runtime_host_build_process_info_json(ptr: *const u8, len: usiz
 
         match result {
             Ok(process_info) => set_last_result(render_process_info_json(&process_info)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_create_runtime_context_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let cwd = required_field(&fields, "cwd").unwrap_or_else(|| "/workspace".into());
+    let command = required_field(&fields, "command").unwrap_or_default();
+    let args = fields
+        .get("args")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = fields
+        .get("env")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow_mut().create_runtime_context(
+            &session_id,
+            &RunRequest {
+                cwd,
+                command,
+                args,
+                env,
+            },
+        );
+
+        match result {
+            Ok(context) => set_last_result(render_runtime_context_json(&context)),
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -453,6 +508,87 @@ pub extern "C" fn runtime_host_execute_fs_command_json(ptr: *const u8, len: usiz
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_execute_context_fs_command_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+    let command = match parse_context_fs_command(&fields) {
+        Ok(command) => command,
+        Err(error) => return write_error(error),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .execute_context_fs_command(&context_id, command);
+
+        match result {
+            Ok(response) => set_last_result(render_fs_response_json(&response)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_execute_runtime_command_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+    let command = match parse_runtime_command(&fields) {
+        Ok(command) => command,
+        Err(error) => return write_error(error),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .execute_runtime_command(&context_id, command);
+
+        match result {
+            Ok(response) => set_last_result(render_runtime_response_json(&response)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_drop_runtime_context_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow_mut().drop_runtime_context(&context_id);
+
+        match result {
+            Ok(()) => set_last_result(format!(
+                "{{\"contextId\":\"{}\"}}",
+                escape_json(&context_id)
+            )),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn runtime_host_resolve_preview_request_hint_json(
     ptr: *const u8,
     len: usize,
@@ -584,6 +720,106 @@ fn parse_fs_command(fields: &BTreeMap<String, String>) -> Result<HostFsCommand, 
             })
         }
         _ => Err(format!("unsupported fs command: {kind}")),
+    }
+}
+
+fn parse_context_fs_command(
+    fields: &BTreeMap<String, String>,
+) -> Result<HostContextFsCommand, String> {
+    let kind = required_field(fields, "command").ok_or_else(|| "missing fs command".to_string())?;
+    let path = match required_field(fields, "path") {
+        Some(encoded) => decode_hex(&encoded)?,
+        None => ".".into(),
+    };
+
+    match kind.as_str() {
+        "exists" => Ok(HostContextFsCommand::Exists { path }),
+        "stat" => Ok(HostContextFsCommand::Stat { path }),
+        "read-dir" => Ok(HostContextFsCommand::ReadDir { path }),
+        "read-file" => Ok(HostContextFsCommand::ReadFile { path }),
+        "mkdir" => Ok(HostContextFsCommand::CreateDirAll { path }),
+        "write-file" => {
+            let is_text = fields
+                .get("is_text")
+                .map(|value| value == "true" || value == "1")
+                .unwrap_or(false);
+            let encoded_bytes = required_field(fields, "bytes").unwrap_or_default();
+            let bytes = decode_hex_bytes(&encoded_bytes)?;
+
+            Ok(HostContextFsCommand::WriteFile {
+                path,
+                bytes,
+                is_text,
+            })
+        }
+        _ => Err(format!("unsupported fs command: {kind}")),
+    }
+}
+
+fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntimeCommand, String> {
+    let kind =
+        required_field(fields, "command").ok_or_else(|| "missing runtime command".to_string())?;
+
+    match kind.as_str() {
+        "process-info" => Ok(HostRuntimeCommand::ProcessInfo),
+        "process-cwd" => Ok(HostRuntimeCommand::ProcessCwd),
+        "process-argv" => Ok(HostRuntimeCommand::ProcessArgv),
+        "process-env" => Ok(HostRuntimeCommand::ProcessEnv),
+        "process-chdir" => Ok(HostRuntimeCommand::ProcessChdir {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        }),
+        "fs-exists" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::Exists {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        })),
+        "fs-stat" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::Stat {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        })),
+        "fs-read-dir" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::ReadDir {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        })),
+        "fs-read-file" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::ReadFile {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        })),
+        "fs-mkdir" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::CreateDirAll {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        })),
+        "fs-write-file" => {
+            let path = match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            };
+            let is_text = fields
+                .get("is_text")
+                .map(|value| value == "true" || value == "1")
+                .unwrap_or(false);
+            let encoded_bytes = required_field(fields, "bytes").unwrap_or_default();
+            let bytes = decode_hex_bytes(&encoded_bytes)?;
+
+            Ok(HostRuntimeCommand::Fs(HostContextFsCommand::WriteFile {
+                path,
+                bytes,
+                is_text,
+            }))
+        }
+        _ => Err(format!("unsupported runtime command: {kind}")),
     }
 }
 
@@ -740,6 +976,44 @@ fn render_process_info_json(process_info: &HostProcessInfo) -> String {
         escape_json(&process_info.command_line),
         command_kind,
     )
+}
+
+fn render_runtime_context_json(context: &HostRuntimeContext) -> String {
+    format!(
+        "{{\"contextId\":\"{}\",\"sessionId\":\"{}\",\"process\":{}}}",
+        escape_json(&context.context_id),
+        escape_json(&context.session_id),
+        render_process_info_json(&context.process),
+    )
+}
+
+fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
+    match response {
+        HostRuntimeResponse::ProcessInfo(process) => format!(
+            "{{\"kind\":\"process-info\",\"process\":{}}}",
+            render_process_info_json(process)
+        ),
+        HostRuntimeResponse::ProcessCwd { cwd } => format!(
+            "{{\"kind\":\"process-cwd\",\"cwd\":\"{}\"}}",
+            escape_json(cwd)
+        ),
+        HostRuntimeResponse::ProcessArgv { argv } => format!(
+            "{{\"kind\":\"process-argv\",\"argv\":{}}}",
+            render_string_array_json(argv)
+        ),
+        HostRuntimeResponse::ProcessEnv { env } => {
+            let entries = env
+                .iter()
+                .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"kind\":\"process-env\",\"env\":{{{entries}}}}}")
+        }
+        HostRuntimeResponse::Fs(response) => format!(
+            "{{\"kind\":\"fs\",\"response\":{}}}",
+            render_fs_response_json(response)
+        ),
+    }
 }
 
 fn render_error_json(message: &str) -> String {

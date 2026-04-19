@@ -9,6 +9,7 @@ pub enum RuntimeHostError {
     IsADirectory(String),
     DuplicateFilePath(String),
     SessionNotFound(String),
+    RuntimeContextNotFound(String),
     FileNotFound(String),
     ScriptNotFound(String),
     NodeEntrypointRequired,
@@ -30,6 +31,9 @@ impl Display for RuntimeHostError {
             Self::IsADirectory(path) => write!(f, "workspace path is a directory: {path}"),
             Self::DuplicateFilePath(path) => write!(f, "duplicate workspace file path: {path}"),
             Self::SessionNotFound(session_id) => write!(f, "session not found: {session_id}"),
+            Self::RuntimeContextNotFound(context_id) => {
+                write!(f, "runtime context not found: {context_id}")
+            }
             Self::FileNotFound(path) => write!(f, "workspace file not found: {path}"),
             Self::ScriptNotFound(script) => write!(f, "script not found: {script}"),
             Self::NodeEntrypointRequired => write!(f, "node entrypoint is required"),
