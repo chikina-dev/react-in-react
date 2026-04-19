@@ -110,6 +110,10 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     },
   ]);
 
+  await expect(adapter.resolvePreviewHydrationPaths(session.sessionId, "/")).resolves.toEqual([
+    "/workspace/package.json",
+  ]);
+
   await expect(
     adapter.readWorkspaceFile(session.sessionId, "/workspace/package.json"),
   ).resolves.toEqual({

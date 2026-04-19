@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
@@ -7,6 +7,24 @@ use crate::protocol::{
     SessionState, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem};
+
+const PREVIEW_DOCUMENT_CANDIDATES: [&str; 4] = [
+    "/workspace/index.html",
+    "/workspace/dist/index.html",
+    "/workspace/build/index.html",
+    "/workspace/public/index.html",
+];
+
+const PREVIEW_APP_ENTRY_CANDIDATES: [&str; 8] = [
+    "/workspace/src/main.tsx",
+    "/workspace/src/main.jsx",
+    "/workspace/src/main.ts",
+    "/workspace/src/main.js",
+    "/workspace/src/index.tsx",
+    "/workspace/src/index.jsx",
+    "/workspace/src/index.ts",
+    "/workspace/src/index.js",
+];
 
 #[derive(Debug)]
 struct SessionRecord {
@@ -146,10 +164,138 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .ok_or_else(|| RuntimeHostError::FileNotFound(path.into()))
     }
 
+    pub fn resolve_preview_hydration_paths(
+        &self,
+        session_id: &str,
+        relative_path: &str,
+    ) -> RuntimeHostResult<Vec<String>> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let mut paths = BTreeSet::new();
+
+        for file in record.vfs.files() {
+            if file.path.ends_with("/package.json") {
+                paths.insert(file.path.clone());
+            }
+        }
+
+        match relative_path {
+            "/" | "/index.html" => {
+                for candidate in PREVIEW_DOCUMENT_CANDIDATES {
+                    if record.vfs.read(candidate).is_some() {
+                        paths.insert(candidate.into());
+                    }
+                }
+
+                for candidate in PREVIEW_APP_ENTRY_CANDIDATES {
+                    if record.vfs.read(candidate).is_some() {
+                        paths.insert(candidate.into());
+                    }
+                }
+            }
+            path if path.starts_with("/files/") => {
+                let workspace_path = decode_workspace_path(path);
+
+                if record.vfs.read(&workspace_path).is_some() {
+                    paths.insert(workspace_path);
+                }
+            }
+            "/assets/runtime.css" => {}
+            path if path.starts_with("/__") => {}
+            path => {
+                let normalized = normalize_workspace_asset_path(path);
+
+                for root in collect_preview_workspace_roots() {
+                    let candidate = format!("{root}{normalized}");
+
+                    if record.vfs.read(&candidate).is_some() {
+                        paths.insert(candidate);
+                    }
+
+                    if normalized.ends_with('/') {
+                        let index_candidate = format!("{root}{normalized}index.html");
+
+                        if record.vfs.read(&index_candidate).is_some() {
+                            paths.insert(index_candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(paths.into_iter().collect())
+    }
+
     pub fn stop_session(&mut self, session_id: &str) -> RuntimeHostResult<()> {
         self.sessions
             .remove(session_id)
             .map(|_| ())
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))
+    }
+}
+
+fn collect_preview_workspace_roots() -> BTreeSet<&'static str> {
+    PREVIEW_DOCUMENT_CANDIDATES
+        .iter()
+        .map(|path| dirname(path))
+        .collect()
+}
+
+fn dirname(path: &str) -> &str {
+    let normalized = path.trim_end_matches('/');
+
+    match normalized.rfind('/') {
+        Some(index) if index > 0 => &normalized[..index],
+        _ => "/workspace",
+    }
+}
+
+fn normalize_workspace_asset_path(relative_path: &str) -> String {
+    let normalized = if relative_path.starts_with('/') {
+        relative_path.to_string()
+    } else {
+        format!("/{relative_path}")
+    };
+
+    normalized.replace("//", "/")
+}
+
+fn decode_workspace_path(relative_path: &str) -> String {
+    let suffix = relative_path.strip_prefix("/files").unwrap_or(relative_path);
+    format!("/workspace{}", decode_percent_path(suffix))
+}
+
+fn decode_percent_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = bytes[index + 1] as char;
+            let low = bytes[index + 2] as char;
+
+            if let (Some(high), Some(low)) = (hex_value(high), hex_value(low)) {
+                output.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+
+        output.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(input: char) -> Option<u8> {
+    match input {
+        '0'..='9' => Some((input as u8) - b'0'),
+        'a'..='f' => Some((input as u8) - b'a' + 10),
+        'A'..='F' => Some((input as u8) - b'A' + 10),
+        _ => None,
     }
 }

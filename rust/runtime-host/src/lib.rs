@@ -64,5 +64,13 @@ mod tests {
                 .bytes,
             b"export default null;"
         );
+        assert_eq!(
+            host.resolve_preview_hydration_paths(&session.session_id, "/")
+                .expect("preview hydration paths should resolve"),
+            vec![
+                "/workspace/package.json".to_string(),
+                "/workspace/src/main.tsx".to_string(),
+            ]
+        );
     }
 }

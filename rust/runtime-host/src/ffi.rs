@@ -253,6 +253,40 @@ pub extern "C" fn runtime_host_read_workspace_files_json(ptr: *const u8, len: us
     1
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_resolve_preview_hydration_paths_json(
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let relative_path = match required_field(&fields, "relative_path") {
+        Some(path) => match decode_hex(&path) {
+            Ok(path) => path,
+            Err(error) => return write_error(error),
+        },
+        None => "/".into(),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow()
+            .resolve_preview_hydration_paths(&session_id, &relative_path);
+
+        match result {
+            Ok(paths) => set_last_result(render_string_array_json(&paths)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
 fn read_input(ptr: *const u8, len: usize) -> Result<String, String> {
     if ptr.is_null() || len == 0 {
         return Ok(String::new());
@@ -448,6 +482,16 @@ fn render_workspace_files_json(files: &[VirtualFile]) -> String {
     let items = files
         .iter()
         .map(render_workspace_file_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
+}
+
+fn render_string_array_json(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("\"{}\"", escape_json(value)))
         .collect::<Vec<_>>()
         .join(",");
 

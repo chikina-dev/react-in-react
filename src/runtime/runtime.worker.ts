@@ -1,11 +1,6 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
 import { createRuntimeHostAdapter } from "./host-adapter";
-import {
-  buildPreviewResponse,
-  isPreviewPath,
-  PREVIEW_APP_ENTRY_CANDIDATES,
-  PREVIEW_DOCUMENT_CANDIDATES,
-} from "./preview-server";
+import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
   PreviewModel,
   ProcessId,
@@ -421,7 +416,10 @@ async function ensurePreviewFiles(
   }
 
   const hostAdapter = await hostAdapterPromise;
-  const hydrationPaths = collectPreviewHydrationPaths(request, record);
+  const hydrationPaths = await hostAdapter.resolvePreviewHydrationPaths(
+    record.session.sessionId,
+    getPreviewRelativePath(request),
+  );
   const nextPaths = hydrationPaths.filter(
     (path) => !record.hostFileCache.has(path) && files.has(path),
   );
@@ -445,53 +443,6 @@ async function ensurePreviewFiles(
   return files;
 }
 
-function collectPreviewHydrationPaths(
-  request: Extract<UiToWorkerMessage, { type: "preview.http" }>["request"],
-  record: SessionRecord,
-): string[] {
-  const paths = new Set<string>();
-  const relativePath = getPreviewRelativePath(request);
-
-  for (const summary of record.hostFiles.index) {
-    if (summary.path.endsWith("/package.json")) {
-      paths.add(summary.path);
-    }
-  }
-
-  if (relativePath === "/" || relativePath === "/index.html") {
-    for (const candidate of PREVIEW_DOCUMENT_CANDIDATES) {
-      paths.add(candidate);
-    }
-
-    for (const candidate of PREVIEW_APP_ENTRY_CANDIDATES) {
-      paths.add(candidate);
-    }
-
-    return [...paths];
-  }
-
-  if (relativePath.startsWith("/files/")) {
-    paths.add(decodeWorkspacePath(relativePath));
-    return [...paths];
-  }
-
-  if (relativePath.startsWith("/__") || relativePath === "/assets/runtime.css") {
-    return [...paths];
-  }
-
-  const normalized = normalizeWorkspaceAssetPath(relativePath);
-
-  for (const root of collectPreviewWorkspaceRoots()) {
-    paths.add(`${root}${normalized}`);
-
-    if (normalized.endsWith("/")) {
-      paths.add(`${root}${normalized}index.html`);
-    }
-  }
-
-  return [...paths];
-}
-
 function createPreviewFileStub(summary: {
   path: string;
   size: number;
@@ -507,16 +458,6 @@ function createPreviewFileStub(summary: {
   };
 }
 
-function collectPreviewWorkspaceRoots(): string[] {
-  return [...new Set(PREVIEW_DOCUMENT_CANDIDATES.map((path) => dirname(path)))];
-}
-
-function dirname(path: string): string {
-  const normalized = path.replace(/\/+$/, "");
-  const index = normalized.lastIndexOf("/");
-  return index <= 0 ? "/workspace" : normalized.slice(0, index);
-}
-
 function getPreviewRelativePath(
   request: Extract<UiToWorkerMessage, { type: "preview.http" }>["request"],
 ): string {
@@ -525,19 +466,4 @@ function getPreviewRelativePath(
     ? request.pathname.slice(basePath.length)
     : "";
   return suffix || "/";
-}
-
-function decodeWorkspacePath(relativePath: string): string {
-  const encodedSuffix = relativePath.replace(/^\/files/, "");
-  const suffix = encodedSuffix
-    .split("/")
-    .map((segment) => decodeURIComponent(segment))
-    .join("/");
-
-  return `/workspace${suffix}`;
-}
-
-function normalizeWorkspaceAssetPath(relativePath: string): string {
-  const normalized = relativePath.startsWith("/") ? relativePath : `/${relativePath}`;
-  return normalized.replace(/\/+/g, "/");
 }
