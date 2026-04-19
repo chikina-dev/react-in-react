@@ -5,6 +5,7 @@ import { RuntimeController } from "./runtime/controller";
 import type {
   PreviewDiagnostics,
   PreviewReadyEvent,
+  PreviewWorkspaceFile,
   RunRequest,
   RuntimeEvent,
   SessionCreatedEvent,
@@ -24,6 +25,10 @@ import {
 type TerminalLine = {
   kind: "stdout" | "stderr" | "system";
   text: string;
+};
+
+type HostPreviewFileSelection = PreviewWorkspaceFile & {
+  content: string;
 };
 
 const DEFAULT_REQUEST: RunRequest = {
@@ -46,6 +51,11 @@ export function App() {
   const [preview, setPreview] = useState<PreviewReadyEvent | null>(null);
   const [previewDiagnostics, setPreviewDiagnostics] = useState<PreviewDiagnostics | null>(null);
   const [previewDiagnosticsError, setPreviewDiagnosticsError] = useState<string | null>(null);
+  const [previewFiles, setPreviewFiles] = useState<PreviewWorkspaceFile[] | null>(null);
+  const [previewFileSelection, setPreviewFileSelection] = useState<HostPreviewFileSelection | null>(
+    null,
+  );
+  const [previewFilesError, setPreviewFilesError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [previewRouter, setPreviewRouter] = useState("registering");
   const [previewRouterDetail, setPreviewRouterDetail] = useState<string | null>(null);
@@ -66,6 +76,9 @@ export function App() {
     setPreview(null);
     setPreviewDiagnostics(null);
     setPreviewDiagnosticsError(null);
+    setPreviewFiles(null);
+    setPreviewFileSelection(null);
+    setPreviewFilesError(null);
     setTerminal([
       {
         kind: "system",
@@ -100,12 +113,18 @@ export function App() {
           text: `Process ${event.pid} exited with code ${event.code}.`,
         });
         setPreviewDiagnostics(null);
+        setPreviewFiles(null);
+        setPreviewFileSelection(null);
+        setPreviewFilesError(null);
         setSessionState("stopped");
         break;
       case "preview.ready":
         setPreview(event);
         setPreviewDiagnostics(null);
         setPreviewDiagnosticsError(null);
+        setPreviewFiles(null);
+        setPreviewFileSelection(null);
+        setPreviewFilesError(null);
         void registerPreview(event);
         appendTerminal({
           kind: "system",
@@ -119,6 +138,9 @@ export function App() {
         });
         setPreviewDiagnostics(null);
         setPreviewDiagnosticsError(null);
+        setPreviewFiles(null);
+        setPreviewFileSelection(null);
+        setPreviewFilesError(null);
         setSessionState("errored");
         break;
     }
@@ -180,6 +202,65 @@ export function App() {
         setPreviewDiagnostics(null);
         setPreviewDiagnosticsError(
           error instanceof Error ? error.message : "Failed to load preview diagnostics.",
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [controller, preview]);
+
+  useEffect(() => {
+    if (!preview) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void controller
+      .requestPreviewJson<PreviewWorkspaceFile[]>(
+        createPreviewRouteRequest(preview, `${preview.url}__files.json`),
+      )
+      .then(async (files) => {
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewFiles(files);
+        setPreviewFilesError(null);
+
+        const preferredFile =
+          files.find((file) => file.path.endsWith("/package.json")) ??
+          files.find((file) => file.path.includes("/src/")) ??
+          files[0];
+
+        if (!preferredFile) {
+          setPreviewFileSelection(null);
+          return;
+        }
+
+        const content = await controller.requestPreviewText(
+          createPreviewRouteRequest(preview, preferredFile.url),
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewFileSelection({
+          ...preferredFile,
+          content,
+        });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+
+        setPreviewFiles(null);
+        setPreviewFileSelection(null);
+        setPreviewFilesError(
+          error instanceof Error ? error.message : "Failed to load preview file index.",
         );
       });
 
@@ -269,6 +350,9 @@ export function App() {
       setPreview(null);
       setPreviewDiagnostics(null);
       setPreviewDiagnosticsError(null);
+      setPreviewFiles(null);
+      setPreviewFileSelection(null);
+      setPreviewFilesError(null);
       await controller.run(session.sessionId, request);
     } finally {
       setIsBusy(false);
@@ -291,6 +375,9 @@ export function App() {
       setPreview(null);
       setPreviewDiagnostics(null);
       setPreviewDiagnosticsError(null);
+      setPreviewFiles(null);
+      setPreviewFileSelection(null);
+      setPreviewFilesError(null);
     } finally {
       setIsBusy(false);
     }
@@ -540,6 +627,33 @@ export function App() {
           )}
         </div>
 
+        <div className="panel inspector-panel">
+          <div className="panel-header">
+            <div>
+              <p className="panel-kicker">7. Preview inspector</p>
+              <h2>ホスト側から preview 配信を検査</h2>
+            </div>
+          </div>
+
+          {previewFiles && previewFileSelection ? (
+            <div className="meta-grid">
+              <MetaRow label="Indexed files">{String(previewFiles.length)}</MetaRow>
+              <MetaRow label="Selected file">{previewFileSelection.path}</MetaRow>
+              <MetaRow label="Content type">{previewFileSelection.contentType}</MetaRow>
+              <MetaRow label="Preview route">{previewFileSelection.previewUrl}</MetaRow>
+              <MetaRow label="Raw route">{previewFileSelection.url}</MetaRow>
+              <MetaRow label="Body preview">
+                <code>{truncateInspectorSource(previewFileSelection.content)}</code>
+              </MetaRow>
+            </div>
+          ) : (
+            <p className="empty-copy">
+              {previewFilesError ??
+                "preview 実行後に __files.json と実ファイル本文を読み、ホスト側からも preview ルートを検査します。"}
+            </p>
+          )}
+        </div>
+
         <div className="panel architecture-panel">
           <div className="panel-header">
             <div>
@@ -595,6 +709,31 @@ function decodeVirtualHttpBody(body: string | Uint8Array): string {
   }
 
   return new TextDecoder().decode(body);
+}
+
+function createPreviewRouteRequest(
+  preview: PreviewReadyEvent,
+  pathname: string,
+): {
+  sessionId: string;
+  port: number;
+  method: string;
+  pathname: string;
+  search: string;
+  headers: Record<string, string>;
+} {
+  return {
+    sessionId: preview.sessionId,
+    port: preview.port,
+    method: "GET",
+    pathname,
+    search: "",
+    headers: {},
+  };
+}
+
+function truncateInspectorSource(source: string): string {
+  return source.split("\n").slice(0, 4).join(" ").slice(0, 140);
 }
 
 function StatusPill(props: { label: string; value: string }) {

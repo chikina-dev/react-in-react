@@ -116,6 +116,26 @@ export class RuntimeController {
     });
   }
 
+  async requestPreviewJson<T>(request: VirtualHttpRequest): Promise<T> {
+    const response = await this.requestPreviewResponse(request);
+
+    if (response.status >= 400) {
+      throw new Error(`Preview request failed with status ${response.status}.`);
+    }
+
+    return JSON.parse(decodeVirtualHttpBody(response.body)) as T;
+  }
+
+  async requestPreviewText(request: VirtualHttpRequest): Promise<string> {
+    const response = await this.requestPreviewResponse(request);
+
+    if (response.status >= 400) {
+      throw new Error(`Preview request failed with status ${response.status}.`);
+    }
+
+    return decodeVirtualHttpBody(response.body);
+  }
+
   dispose(): void {
     for (const pending of this.pendingPreviewResponses.values()) {
       pending.reject(new Error("Runtime controller disposed."));
@@ -161,4 +181,12 @@ function createRequestId(): string {
   }
 
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function decodeVirtualHttpBody(body: string | Uint8Array): string {
+  if (typeof body === "string") {
+    return body;
+  }
+
+  return new TextDecoder().decode(body);
 }
