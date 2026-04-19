@@ -375,6 +375,7 @@ async function resolvePreviewHttpResponse(
 ): Promise<VirtualHttpResponse> {
   if (isPreviewPath(request.pathname)) {
     const files = record ? await ensurePreviewFiles(request, record) : null;
+    const hostAdapter = await hostAdapterPromise;
 
     return buildPreviewResponse(
       request,
@@ -386,6 +387,10 @@ async function resolvePreviewHttpResponse(
             url: record.preview.url,
             model: record.preview.model,
             rootHint: record.preview.rootHint,
+            assetHint: await hostAdapter.resolvePreviewAssetHint(
+              record.session.sessionId,
+              getPreviewRelativePath(request),
+            ),
             session: record.session,
             files: files ?? new Map(),
           }

@@ -120,6 +120,11 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     root: null,
   });
 
+  await expect(adapter.resolvePreviewAssetHint(session.sessionId, "/logo.png")).resolves.toEqual({
+    workspacePath: "/workspace/logo.png",
+    documentRoot: "/workspace",
+  });
+
   await expect(
     adapter.readWorkspaceFile(session.sessionId, "/workspace/package.json"),
   ).resolves.toEqual({
@@ -151,4 +156,52 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
       bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
     },
   ]);
+});
+
+test("MockRuntimeHostAdapter resolves document-root preview assets", async () => {
+  const adapter = new MockRuntimeHostAdapter();
+  const distFiles = new Map<string, WorkspaceFileRecord>([
+    [
+      "/workspace/dist/index.html",
+      {
+        path: "/workspace/dist/index.html",
+        size: 51,
+        contentType: "text/html; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode('<script type="module" src="/assets/app.js"></script>'),
+        textContent: '<script type="module" src="/assets/app.js"></script>',
+      },
+    ],
+    [
+      "/workspace/dist/assets/app.js",
+      {
+        path: "/workspace/dist/assets/app.js",
+        size: 20,
+        contentType: "text/javascript; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("console.log('dist');"),
+        textContent: "console.log('dist');",
+      },
+    ],
+  ]);
+
+  await adapter.createSession({
+    sessionId: "session-dist",
+    session: {
+      ...session,
+      sessionId: "session-dist",
+    },
+    files: distFiles,
+  });
+
+  await expect(adapter.resolvePreviewRootHint("session-dist")).resolves.toEqual({
+    kind: "workspace-document",
+    path: "/workspace/dist/index.html",
+    root: "/workspace/dist",
+  });
+
+  await expect(adapter.resolvePreviewAssetHint("session-dist", "/assets/app.js")).resolves.toEqual({
+    workspacePath: "/workspace/dist/assets/app.js",
+    documentRoot: "/workspace/dist",
+  });
 });

@@ -287,6 +287,40 @@ test("buildPreviewResponse resolves document-root assets from dist/index.html", 
   expect(response.body).toContain("console.log('dist')");
 });
 
+test("buildPreviewResponse prefers host-provided asset hints for document-root assets", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/assets/app.js",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/dist/assets/app.js",
+            {
+              path: "/workspace/dist/assets/app.js",
+              size: 21,
+              contentType: "text/javascript; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("console.log('hint');"),
+              textContent: "console.log('hint');",
+            },
+          ],
+        ]),
+      ),
+      assetHint: {
+        workspacePath: "/workspace/dist/assets/app.js",
+        documentRoot: "/workspace/dist",
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toContain("text/javascript");
+  expect(response.body).toContain("console.log('hint')");
+});
+
 test("buildPreviewResponse rewrites root-relative urls inside stylesheets", () => {
   const response = buildPreviewResponse(
     {

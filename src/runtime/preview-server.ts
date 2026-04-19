@@ -16,7 +16,7 @@ import type {
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type { HostPreviewRootHint } from "./host-adapter";
+import type { HostPreviewAssetHint, HostPreviewRootHint } from "./host-adapter";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewServerState = {
@@ -26,6 +26,7 @@ type PreviewServerState = {
   url: string;
   model: PreviewModel;
   rootHint?: HostPreviewRootHint;
+  assetHint?: HostPreviewAssetHint;
   session: SessionSnapshot;
   files: Map<string, WorkspaceFileRecord>;
 };
@@ -448,7 +449,16 @@ function buildWorkspaceAssetResponse(
     return null;
   }
 
-  const documentRoot = resolvePreviewDocumentRoot(preview);
+  const documentRoot = preview.assetHint?.documentRoot ?? resolvePreviewDocumentRoot(preview);
+
+  if (preview.assetHint?.workspacePath) {
+    const hintedFile = preview.files.get(preview.assetHint.workspacePath);
+
+    if (hintedFile) {
+      return buildWorkspaceFileResponse(hintedFile, preview, documentRoot);
+    }
+  }
+
   const candidates = resolveWorkspaceAssetCandidates(relativePath, documentRoot);
 
   for (const candidate of candidates) {

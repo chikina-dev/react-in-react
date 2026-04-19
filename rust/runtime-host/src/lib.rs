@@ -9,8 +9,8 @@ pub use engine::{EngineAdapter, EngineDescriptor, NullEngineAdapter};
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRootHint, PreviewRootKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRootHint,
+    PreviewRootKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -76,6 +76,13 @@ mod tests {
             host.resolve_preview_root_hint(&session.session_id)
                 .expect("preview root hint should resolve")
                 .path
+                .as_deref(),
+            Some("/workspace/src/main.tsx")
+        );
+        assert_eq!(
+            host.resolve_preview_asset_hint(&session.session_id, "/src/main.tsx")
+                .expect("preview asset hint should resolve")
+                .workspace_path
                 .as_deref(),
             Some("/workspace/src/main.tsx")
         );

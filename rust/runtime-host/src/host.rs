@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewRootHint, PreviewRootKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
+    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, PreviewAssetHint, PreviewRootHint,
+    PreviewRootKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem};
 
@@ -263,6 +263,63 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             kind: PreviewRootKind::Fallback,
             path: None,
             root: None,
+        })
+    }
+
+    pub fn resolve_preview_asset_hint(
+        &self,
+        session_id: &str,
+        relative_path: &str,
+    ) -> RuntimeHostResult<PreviewAssetHint> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let root_hint = self.resolve_preview_root_hint(session_id)?;
+
+        if relative_path.starts_with("/__") || relative_path == "/assets/runtime.css" {
+            return Ok(PreviewAssetHint {
+                workspace_path: None,
+                document_root: None,
+            });
+        }
+
+        if relative_path.starts_with("/files/") {
+            let workspace_path = decode_workspace_path(relative_path);
+            return Ok(PreviewAssetHint {
+                workspace_path: record
+                    .vfs
+                    .read(&workspace_path)
+                    .map(|file| file.path.clone()),
+                document_root: Some("/workspace".into()),
+            });
+        }
+
+        let document_root = root_hint.root.unwrap_or_else(|| "/workspace".into());
+        let normalized = normalize_workspace_asset_path(relative_path);
+
+        let mut candidates = vec![
+            format!("{document_root}{normalized}"),
+            format!("/workspace{normalized}"),
+        ];
+
+        if normalized.ends_with('/') {
+            candidates.push(format!("{document_root}{normalized}index.html"));
+            candidates.push(format!("/workspace{normalized}index.html"));
+        }
+
+        for candidate in candidates {
+            if let Some(file) = record.vfs.read(&candidate) {
+                return Ok(PreviewAssetHint {
+                    workspace_path: Some(file.path.clone()),
+                    document_root: Some(document_root),
+                });
+            }
+        }
+
+        Ok(PreviewAssetHint {
+            workspace_path: None,
+            document_root: Some(document_root),
         })
     }
 

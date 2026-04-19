@@ -88,3 +88,9 @@ pub struct PreviewRootHint {
     pub path: Option<String>,
     pub root: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewAssetHint {
+    pub workspace_path: Option<String>,
+    pub document_root: Option<String>,
+}
