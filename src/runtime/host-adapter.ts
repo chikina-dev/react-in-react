@@ -50,11 +50,6 @@ export type HostPreviewRootHint =
       root: null;
     };
 
-export type HostPreviewAssetHint = {
-  workspacePath: string | null;
-  documentRoot: string | null;
-};
-
 export type HostPreviewRequestHint =
   | {
       kind: "root-document";
@@ -97,12 +92,10 @@ export interface RuntimeHostAdapter {
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   resolvePreviewRootHint(sessionId: string): Promise<HostPreviewRootHint>;
-  resolvePreviewAssetHint(sessionId: string, relativePath: string): Promise<HostPreviewAssetHint>;
   resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
   ): Promise<HostPreviewRequestHint>;
-  resolvePreviewHydrationPaths(sessionId: string, relativePath: string): Promise<string[]>;
   readWorkspaceFile(sessionId: string, path: string): Promise<HostWorkspaceFileContent>;
   readWorkspaceFiles(sessionId: string, paths: string[]): Promise<HostWorkspaceFileContent[]>;
   stopSession(sessionId: string): Promise<void>;
@@ -119,9 +112,7 @@ type WasmRuntimeHostExports = {
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_root_hint_json(ptr: number, len: number): number;
-  runtime_host_resolve_preview_asset_hint_json(ptr: number, len: number): number;
   runtime_host_resolve_preview_request_hint_json(ptr: number, len: number): number;
-  runtime_host_resolve_preview_hydration_paths_json(ptr: number, len: number): number;
   runtime_host_read_workspace_file_json(ptr: number, len: number): number;
   runtime_host_read_workspace_files_json(ptr: number, len: number): number;
   runtime_host_stop_session_json(ptr: number, len: number): number;
@@ -247,106 +238,18 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     };
   }
 
-  async resolvePreviewAssetHint(
-    sessionId: string,
-    relativePath: string,
-  ): Promise<HostPreviewAssetHint> {
-    const record = this.sessions.get(sessionId);
-
-    if (!record) {
-      throw new Error(`Rust host session not found: ${sessionId}`);
-    }
-
-    const rootHint = await this.resolvePreviewRootHint(sessionId);
-    const documentRoot = rootHint.kind === "workspace-document" ? rootHint.root : "/workspace";
-
-    if (relativePath.startsWith("/__") || relativePath === "/assets/runtime.css") {
-      return {
-        workspacePath: null,
-        documentRoot: null,
-      };
-    }
-
-    if (relativePath.startsWith("/files/")) {
-      const workspacePath = `/workspace${relativePath.replace(/^\/files/, "")}`;
-
-      return {
-        workspacePath: record.files.has(workspacePath) ? workspacePath : null,
-        documentRoot: "/workspace",
-      };
-    }
-
-    const normalized = (relativePath.startsWith("/") ? relativePath : `/${relativePath}`).replace(
-      /\/+/g,
-      "/",
-    );
-    const candidates = [`${documentRoot}${normalized}`, `/workspace${normalized}`];
-
-    if (normalized.endsWith("/")) {
-      candidates.push(
-        `${documentRoot}${normalized}index.html`,
-        `/workspace${normalized}index.html`,
-      );
-    }
-
-    return {
-      workspacePath: candidates.find((candidate) => record.files.has(candidate)) ?? null,
-      documentRoot,
-    };
-  }
-
-  async resolvePreviewHydrationPaths(sessionId: string, relativePath: string): Promise<string[]> {
-    const record = this.sessions.get(sessionId);
-
-    if (!record) {
-      throw new Error(`Rust host session not found: ${sessionId}`);
-    }
-
-    const paths = new Set<string>();
-
-    for (const file of record.files.values()) {
-      if (file.path.endsWith("/package.json")) {
-        paths.add(file.path);
-      }
-    }
-
-    if (relativePath === "/" || relativePath === "/index.html") {
-      const rootHint = await this.resolvePreviewRootHint(sessionId);
-
-      if (rootHint.path) {
-        paths.add(rootHint.path);
-      }
-
-      return [...paths];
-    }
-
-    if (relativePath.startsWith("/files/")) {
-      const workspacePath = `/workspace${relativePath.replace(/^\/files/, "")}`;
-
-      if (record.files.has(workspacePath)) {
-        paths.add(workspacePath);
-      }
-
-      return [...paths];
-    }
-
-    if (relativePath.startsWith("/__") || relativePath === "/assets/runtime.css") {
-      return [...paths];
-    }
-
-    const assetHint = await this.resolvePreviewAssetHint(sessionId, relativePath);
-
-    if (assetHint.workspacePath) {
-      paths.add(assetHint.workspacePath);
-    }
-
-    return [...paths];
-  }
-
   async resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
   ): Promise<HostPreviewRequestHint> {
+    const record = this.sessions.get(sessionId);
+
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+
+    const hydrationPaths = collectMockPreviewHydrationPaths(record.files);
+
     if (relativePath === "/" || relativePath === "/index.html") {
       const rootHint = await this.resolvePreviewRootHint(sessionId);
 
@@ -355,7 +258,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "root-document",
           workspacePath: rootHint.path,
           documentRoot: rootHint.root,
-          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
+          hydratePaths: [...hydrationPaths, rootHint.path],
         };
       }
 
@@ -364,7 +267,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "root-entry",
           workspacePath: rootHint.path,
           documentRoot: null,
-          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
+          hydratePaths: [...hydrationPaths, rootHint.path],
         };
       }
 
@@ -372,7 +275,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         kind: "fallback-root",
         workspacePath: null,
         documentRoot: null,
-        hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
+        hydratePaths: hydrationPaths,
       };
     }
 
@@ -400,26 +303,32 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     if (relativePath.startsWith("/files/")) {
       const workspacePath = `/workspace${relativePath.replace(/^\/files/, "")}`;
 
-      if (this.sessions.get(sessionId)?.files.has(workspacePath)) {
+      if (record.files.has(workspacePath)) {
         return {
           kind: "workspace-file",
           workspacePath,
           documentRoot: "/workspace",
-          hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
+          hydratePaths: [...hydrationPaths, workspacePath],
         };
       }
 
       return { kind: "not-found", workspacePath: null, documentRoot: null, hydratePaths: [] };
     }
 
-    const assetHint = await this.resolvePreviewAssetHint(sessionId, relativePath);
+    const rootHint = await this.resolvePreviewRootHint(sessionId);
+    const documentRoot = rootHint.kind === "workspace-document" ? rootHint.root : "/workspace";
+    const workspacePath = resolveMockPreviewAssetWorkspacePath(
+      record.files,
+      relativePath,
+      documentRoot,
+    );
 
-    if (assetHint.workspacePath && assetHint.documentRoot) {
+    if (workspacePath) {
       return {
         kind: "workspace-asset",
-        workspacePath: assetHint.workspacePath,
-        documentRoot: assetHint.documentRoot,
-        hydratePaths: await this.resolvePreviewHydrationPaths(sessionId, relativePath),
+        workspacePath,
+        documentRoot,
+        hydratePaths: [...hydrationPaths, workspacePath],
       };
     }
 
@@ -540,16 +449,6 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     );
   }
 
-  async resolvePreviewAssetHint(
-    sessionId: string,
-    relativePath: string,
-  ): Promise<HostPreviewAssetHint> {
-    return this.invokeWithInput<HostPreviewAssetHint>(
-      "runtime_host_resolve_preview_asset_hint_json",
-      [`session_id=${sessionId}`, `relative_path=${encodeHex(relativePath)}`],
-    );
-  }
-
   async resolvePreviewRequestHint(
     sessionId: string,
     relativePath: string,
@@ -558,13 +457,6 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       "runtime_host_resolve_preview_request_hint_json",
       [`session_id=${sessionId}`, `relative_path=${encodeHex(relativePath)}`],
     );
-  }
-
-  async resolvePreviewHydrationPaths(sessionId: string, relativePath: string): Promise<string[]> {
-    return this.invokeWithInput<string[]>("runtime_host_resolve_preview_hydration_paths_json", [
-      `session_id=${sessionId}`,
-      `relative_path=${encodeHex(relativePath)}`,
-    ]);
   }
 
   async readWorkspaceFile(sessionId: string, path: string): Promise<HostWorkspaceFileContent> {
@@ -672,6 +564,34 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
 
     return parsed;
   }
+}
+
+function collectMockPreviewHydrationPaths(files: Map<string, WorkspaceFileRecord>): string[] {
+  return [...files.values()]
+    .filter((file) => file.path.endsWith("/package.json"))
+    .map((file) => file.path);
+}
+
+function resolveMockPreviewAssetWorkspacePath(
+  files: Map<string, WorkspaceFileRecord>,
+  relativePath: string,
+  documentRoot: string,
+): string | null {
+  if (relativePath.startsWith("/__") || relativePath === "/assets/runtime.css") {
+    return null;
+  }
+
+  const normalized = (relativePath.startsWith("/") ? relativePath : `/${relativePath}`).replace(
+    /\/+/g,
+    "/",
+  );
+  const candidates = [`${documentRoot}${normalized}`, `/workspace${normalized}`];
+
+  if (normalized.endsWith("/")) {
+    candidates.push(`${documentRoot}${normalized}index.html`, `/workspace${normalized}index.html`);
+  }
+
+  return candidates.find((candidate) => files.has(candidate)) ?? null;
 }
 
 export async function createRuntimeHostAdapter(): Promise<RuntimeHostAdapter> {

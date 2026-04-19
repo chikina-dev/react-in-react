@@ -110,19 +110,10 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     },
   ]);
 
-  await expect(adapter.resolvePreviewHydrationPaths(session.sessionId, "/")).resolves.toEqual([
-    "/workspace/package.json",
-  ]);
-
   await expect(adapter.resolvePreviewRootHint(session.sessionId)).resolves.toEqual({
     kind: "fallback",
     path: null,
     root: null,
-  });
-
-  await expect(adapter.resolvePreviewAssetHint(session.sessionId, "/logo.png")).resolves.toEqual({
-    workspacePath: "/workspace/logo.png",
-    documentRoot: "/workspace",
   });
 
   await expect(adapter.resolvePreviewRequestHint(session.sessionId, "/logo.png")).resolves.toEqual({
@@ -131,10 +122,6 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     documentRoot: "/workspace",
     hydratePaths: ["/workspace/package.json", "/workspace/logo.png"],
   });
-
-  await expect(
-    adapter.resolvePreviewHydrationPaths(session.sessionId, "/logo.png"),
-  ).resolves.toEqual(["/workspace/package.json", "/workspace/logo.png"]);
 
   await expect(
     adapter.readWorkspaceFile(session.sessionId, "/workspace/package.json"),
@@ -211,11 +198,6 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
     root: "/workspace/dist",
   });
 
-  await expect(adapter.resolvePreviewAssetHint("session-dist", "/assets/app.js")).resolves.toEqual({
-    workspacePath: "/workspace/dist/assets/app.js",
-    documentRoot: "/workspace/dist",
-  });
-
   await expect(adapter.resolvePreviewRequestHint("session-dist", "/")).resolves.toEqual({
     kind: "root-document",
     workspacePath: "/workspace/dist/index.html",
@@ -223,11 +205,12 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
     hydratePaths: ["/workspace/dist/index.html"],
   });
 
-  await expect(adapter.resolvePreviewHydrationPaths("session-dist", "/")).resolves.toEqual([
-    "/workspace/dist/index.html",
-  ]);
-
   await expect(
-    adapter.resolvePreviewHydrationPaths("session-dist", "/assets/app.js"),
-  ).resolves.toEqual(["/workspace/dist/assets/app.js"]);
+    adapter.resolvePreviewRequestHint("session-dist", "/assets/app.js"),
+  ).resolves.toEqual({
+    kind: "workspace-asset",
+    workspacePath: "/workspace/dist/assets/app.js",
+    documentRoot: "/workspace/dist",
+    hydratePaths: ["/workspace/dist/assets/app.js"],
+  });
 });
