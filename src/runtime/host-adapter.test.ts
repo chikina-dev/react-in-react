@@ -92,9 +92,11 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     }),
   ).resolves.toEqual({
     cwd: "/workspace",
-    entrypoint: "npm",
+    entrypoint: "dev",
     commandLine: "npm run dev",
     envCount: 1,
+    commandKind: "npm-script",
+    resolvedScript: "vite",
   });
 
   await expect(adapter.listWorkspaceFiles(session.sessionId)).resolves.toEqual([
@@ -200,5 +202,20 @@ test("MockRuntimeHostAdapter resolves document-root preview assets", async () =>
     workspacePath: "/workspace/dist/assets/app.js",
     documentRoot: "/workspace/dist",
     hydratePaths: ["/workspace/dist/assets/app.js"],
+  });
+
+  await expect(
+    adapter.planRun("session-dist", {
+      cwd: "/workspace",
+      command: "node",
+      args: ["server.js"],
+    }),
+  ).resolves.toEqual({
+    cwd: "/workspace",
+    entrypoint: "server.js",
+    commandLine: "node server.js",
+    envCount: 0,
+    commandKind: "node-entrypoint",
+    resolvedScript: null,
   });
 });

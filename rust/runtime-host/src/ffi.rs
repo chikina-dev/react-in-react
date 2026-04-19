@@ -67,6 +67,10 @@ pub extern "C" fn runtime_host_create_session_json(ptr: *const u8, len: usize) -
     let archive_file_name =
         required_field(&fields, "archive_file_name").unwrap_or_else(|| "guest.zip".into());
     let package_name = optional_field(&fields, "package_name");
+    let package_scripts = match parse_string_map_field(&fields, "package_scripts") {
+        Ok(scripts) => scripts,
+        Err(error) => return write_error(error),
+    };
     let files = match parse_virtual_files(&fields) {
         Ok(files) => files,
         Err(error) => return write_error(error),
@@ -80,8 +84,13 @@ pub extern "C" fn runtime_host_create_session_json(ptr: *const u8, len: usize) -
 
     HOST.with(|host| {
         let result =
-            host.borrow_mut()
-                .create_session_with_id(session_id, archive, package_name, files);
+            host.borrow_mut().create_session_with_id(
+                session_id,
+                archive,
+                package_name,
+                package_scripts,
+                files,
+            );
 
         match result {
             Ok(snapshot) => set_last_result(render_session_handle_json(&snapshot)),
@@ -369,6 +378,36 @@ fn parse_hex_path_list(input: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn parse_string_map_field(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(encoded) = fields.get(key) else {
+        return Ok(BTreeMap::new());
+    };
+
+    if encoded.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    encoded
+        .split('\u{1e}')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let mut segments = entry.split('\u{1f}');
+            let map_key = segments
+                .next()
+                .ok_or_else(|| format!("missing map key for field: {key}"))
+                .and_then(decode_hex)?;
+            let map_value = segments
+                .next()
+                .ok_or_else(|| format!("missing map value for field: {key}"))
+                .and_then(decode_hex)?;
+            Ok((map_key, map_value))
+        })
+        .collect()
+}
+
 fn decode_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
     if input.len() % 2 != 0 {
         return Err("hex payload must have an even length".into());
@@ -431,12 +470,24 @@ fn render_session_handle_json(snapshot: &crate::protocol::SessionSnapshot) -> St
 }
 
 fn render_run_plan_json(plan: &crate::protocol::RunPlan) -> String {
+    let command_kind = match plan.command_kind {
+        crate::protocol::RunCommandKind::NpmScript => "npm-script",
+        crate::protocol::RunCommandKind::NodeEntrypoint => "node-entrypoint",
+    };
+    let resolved_script = plan
+        .resolved_script
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+
     format!(
-        "{{\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"commandLine\":\"{}\",\"envCount\":{}}}",
+        "{{\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"commandLine\":\"{}\",\"envCount\":{},\"commandKind\":\"{}\",\"resolvedScript\":{}}}",
         escape_json(&plan.cwd),
         escape_json(&plan.entrypoint),
         escape_json(&plan.command_line),
         plan.env_count,
+        command_kind,
+        resolved_script,
     )
 }
 

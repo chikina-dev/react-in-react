@@ -13,6 +13,8 @@ export type HostRunPlan = {
   entrypoint: string;
   commandLine: string;
   envCount: number;
+  commandKind: "npm-script" | "node-entrypoint";
+  resolvedScript: string | null;
 };
 
 export type HostSessionHandle = {
@@ -121,6 +123,7 @@ const DEFAULT_RUNTIME_HOST_WASM_URL = "/runtime-host.wasm";
 
 type HostSessionRecord = {
   handle: HostSessionHandle;
+  packageScripts: Record<string, string>;
   files: Map<string, WorkspaceFileRecord>;
 };
 
@@ -150,6 +153,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
     this.sessions.set(input.sessionId, {
       handle,
+      packageScripts: input.session.packageJson?.scripts ?? {},
       files: input.files,
     });
 
@@ -164,13 +168,43 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     const commandLine = [request.command, ...request.args].join(" ").trim();
+    const cwd = request.cwd || record.handle.workspaceRoot;
 
-    return {
-      cwd: request.cwd || record.handle.workspaceRoot,
-      entrypoint: request.command,
-      commandLine,
-      envCount: Object.keys(request.env ?? {}).length,
-    };
+    if (request.command === "npm" && request.args[0] === "run") {
+      const scriptName = request.args[1];
+
+      if (!scriptName || !(scriptName in record.packageScripts)) {
+        throw new Error(`script not found: ${scriptName ?? "<missing>"}`);
+      }
+
+      return {
+        cwd,
+        entrypoint: scriptName,
+        commandLine,
+        envCount: Object.keys(request.env ?? {}).length,
+        commandKind: "npm-script",
+        resolvedScript: record.packageScripts[scriptName] ?? null,
+      };
+    }
+
+    if (request.command === "node") {
+      const entrypoint = request.args[0];
+
+      if (!entrypoint) {
+        throw new Error("node entrypoint is required");
+      }
+
+      return {
+        cwd,
+        entrypoint,
+        commandLine,
+        envCount: Object.keys(request.env ?? {}).length,
+        commandKind: "node-entrypoint",
+        resolvedScript: null,
+      };
+    }
+
+    throw new Error(`unsupported command: ${commandLine || request.command || "<empty>"}`);
   }
 
   async listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]> {
@@ -415,6 +449,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       `directory_count=${input.session.archive.directoryCount}`,
       `root_prefix=${input.session.archive.rootPrefix ?? ""}`,
       `package_name=${input.session.packageJson?.name ?? ""}`,
+      `package_scripts=${serializeStringMap(input.session.packageJson?.scripts ?? {})}`,
       `workspace_root=${input.session.workspaceRoot}`,
       `detected_react=${String(input.session.capabilities.detectedReact)}`,
       `detected_vite=${String(input.session.capabilities.detectedVite)}`,
@@ -608,6 +643,12 @@ function serializeWorkspaceFiles(files: Map<string, WorkspaceFileRecord>): strin
     .map((file) =>
       [encodeHex(file.path), file.isText ? "1" : "0", encodeHex(file.bytes)].join("\u001f"),
     )
+    .join("\u001e");
+}
+
+function serializeStringMap(values: Record<string, string>): string {
+  return Object.entries(values)
+    .map(([key, value]) => [encodeHex(key), encodeHex(value)].join("\u001f"))
     .join("\u001e");
 }
 

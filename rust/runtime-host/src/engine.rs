@@ -1,4 +1,4 @@
-use crate::protocol::{RunPlan, RunRequest};
+use crate::protocol::{RunCommandKind, RunPlan, RunRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineDescriptor {
@@ -36,6 +36,8 @@ impl EngineAdapter for NullEngineAdapter {
             entrypoint: request.command.clone(),
             command_line,
             env_count: request.env.len(),
+            command_kind: RunCommandKind::NodeEntrypoint,
+            resolved_script: None,
         }
     }
 }

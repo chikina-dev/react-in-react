@@ -16,6 +16,8 @@ pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -42,6 +44,7 @@ mod tests {
             .create_session(
                 archive,
                 Some("demo-app".into()),
+                BTreeMap::from([(String::from("dev"), String::from("vite"))]),
                 vec![
                     VirtualFile::text("/workspace/package.json", r#"{"name":"demo-app"}"#),
                     VirtualFile::text("/workspace/src/main.tsx", "export default null;"),

@@ -1,5 +1,9 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
-import { createRuntimeHostAdapter, type HostPreviewRequestHint } from "./host-adapter";
+import {
+  createRuntimeHostAdapter,
+  type HostPreviewRequestHint,
+  type HostRunPlan,
+} from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
   PreviewModel,
@@ -144,14 +148,22 @@ async function runSession(
   record.session.state = "running";
   emitState(sessionId, "running");
 
-  const resolved = resolveCommand(record.session, request.command, request.args);
+  const hostAdapter = await hostAdapterPromise;
+  const bootSummary = await hostAdapter.bootSummary();
+  let runPlan;
 
-  if (!resolved.ok) {
+  try {
+    runPlan = await hostAdapter.planRun(sessionId, {
+      cwd: request.cwd,
+      command: request.command,
+      args: request.args,
+    });
+  } catch (error) {
     record.session.state = "errored";
     emitState(sessionId, "errored");
     emitError({
       sessionId,
-      error: resolved.error,
+      error: mapRunPlanError(error),
     });
     return;
   }
@@ -163,17 +175,9 @@ async function runSession(
   );
   await emitStdout(sessionId, pid, `[exec] ${request.command} ${request.args.join(" ")}`.trim());
 
-  if (resolved.script) {
-    await emitStdout(sessionId, pid, `[script] ${resolved.script}`);
+  if (runPlan.resolvedScript) {
+    await emitStdout(sessionId, pid, `[script] ${runPlan.resolvedScript}`);
   }
-
-  const hostAdapter = await hostAdapterPromise;
-  const bootSummary = await hostAdapter.bootSummary();
-  const runPlan = await hostAdapter.planRun(sessionId, {
-    cwd: request.cwd,
-    command: request.command,
-    args: request.args,
-  });
 
   await emitStdout(
     sessionId,
@@ -203,7 +207,7 @@ async function runSession(
 
   const port = 3000;
   const url = `/preview/${sessionId}/${port}/`;
-  const model = buildPreviewModel(record.session, request.command, request.args, resolved.script);
+  const model = buildPreviewModel(record.session, runPlan);
 
   record.preview = {
     pid,
@@ -250,25 +254,22 @@ function stopSession(sessionId: string): void {
   } satisfies WorkerToUiMessage);
 }
 
-function buildPreviewModel(
-  session: SessionSnapshot,
-  command: string,
-  args: string[],
-  script: string | null,
-): PreviewModel {
+function buildPreviewModel(session: SessionSnapshot, runPlan: HostRunPlan): PreviewModel {
   const packageName = session.packageJson?.name ?? session.archive.fileName;
-  const commandLine = [command, ...args].join(" ");
 
   return {
     title: `${packageName} guest app`,
     summary:
       "Host React から iframe 内 DOM に別 root を生やして描画しています。次の段階でこの生成責務を Service Worker + WASM host へ寄せます。",
-    cwd: "/workspace",
-    command: commandLine,
+    cwd: runPlan.cwd,
+    command: runPlan.commandLine,
     highlights: [
       `session=${session.sessionId}`,
       `files=${session.archive.fileCount}`,
-      script ? `resolved-script=${script}` : "resolved-script=<direct>",
+      `run-kind=${runPlan.commandKind}`,
+      runPlan.resolvedScript
+        ? `resolved-script=${runPlan.resolvedScript}`
+        : "resolved-script=<direct>",
       `react-detected=${String(session.capabilities.detectedReact)}`,
     ],
   };
@@ -322,51 +323,42 @@ async function handlePreviewHttpRequest(
   } satisfies WorkerToUiMessage);
 }
 
-function resolveCommand(
-  session: SessionSnapshot,
-  command: string,
-  args: string[],
-): { ok: true; script: string | null } | { ok: false; error: RuntimeError } {
-  if (command === "npm" && args[0] === "run" && args[1]) {
-    const scriptName = args[1];
-    const script = session.packageJson?.scripts[scriptName];
-
-    if (!script) {
-      return {
-        ok: false,
-        error: {
-          code: "SCRIPT_NOT_FOUND",
-          message: `Script "${scriptName}" was not found in package.json.`,
-        },
-      };
-    }
-
-    return {
-      ok: true,
-      script,
-    };
-  }
-
-  if (command === "node" && args[0]) {
-    return {
-      ok: true,
-      script: null,
-    };
-  }
-
-  return {
-    ok: false,
-    error: {
-      code: "UNSUPPORTED_COMMAND",
-      message: "Only `npm run <script>` and `node <entry>` are supported in this prototype.",
-    },
-  };
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function mapRunPlanError(error: unknown): RuntimeError {
+  const message = error instanceof Error ? error.message : "Failed to resolve run plan.";
+
+  if (message.startsWith("script not found: ")) {
+    const scriptName = message.slice("script not found: ".length);
+    return {
+      code: "SCRIPT_NOT_FOUND",
+      message: `Script "${scriptName}" was not found in package.json.`,
+    };
+  }
+
+  if (message === "node entrypoint is required") {
+    return {
+      code: "ENTRYPOINT_REQUIRED",
+      message: "A node entrypoint is required for `node <entry>` commands.",
+    };
+  }
+
+  if (message.startsWith("unsupported command: ")) {
+    return {
+      code: "UNSUPPORTED_COMMAND",
+      message: "Only `npm run <script>` and `node <entry>` are supported in this prototype.",
+      detail: message.slice("unsupported command: ".length),
+    };
+  }
+
+  return {
+    code: "RUN_PLAN_FAILED",
+    message,
+  };
 }
 
 async function resolvePreviewHttpResponse(

@@ -53,11 +53,19 @@ impl RunRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunCommandKind {
+    NpmScript,
+    NodeEntrypoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunPlan {
     pub cwd: String,
     pub entrypoint: String,
     pub command_line: String,
     pub env_count: usize,
+    pub command_kind: RunCommandKind,
+    pub resolved_script: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

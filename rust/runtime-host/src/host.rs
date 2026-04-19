@@ -49,6 +49,7 @@ struct PreviewAssetHint {
 #[derive(Debug)]
 struct SessionRecord {
     snapshot: SessionSnapshot,
+    package_scripts: BTreeMap<String, String>,
     vfs: VirtualFileSystem,
 }
 
@@ -82,12 +83,13 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         &mut self,
         archive: ArchiveStats,
         package_name: Option<String>,
+        package_scripts: BTreeMap<String, String>,
         files: Vec<VirtualFile>,
     ) -> RuntimeHostResult<SessionSnapshot> {
         let session_id = format!("rust-session-{}", self.next_session_id);
         self.next_session_id += 1;
 
-        self.create_session_with_id(session_id, archive, package_name, files)
+        self.create_session_with_id(session_id, archive, package_name, package_scripts, files)
     }
 
     pub fn create_session_with_id(
@@ -95,6 +97,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         session_id: String,
         archive: ArchiveStats,
         package_name: Option<String>,
+        package_scripts: BTreeMap<String, String>,
         files: Vec<VirtualFile>,
     ) -> RuntimeHostResult<SessionSnapshot> {
         self.next_session_id = self.next_session_id.max(
@@ -124,6 +127,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
+                package_scripts,
                 vfs,
             },
         );
@@ -132,11 +136,72 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
     }
 
     pub fn plan_run(&self, session_id: &str, request: &RunRequest) -> RuntimeHostResult<RunPlan> {
-        if !self.sessions.contains_key(session_id) {
-            return Err(RuntimeHostError::SessionNotFound(session_id.into()));
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+
+        let cwd = if request.cwd.is_empty() {
+            record.snapshot.workspace_root.clone()
+        } else {
+            request.cwd.clone()
+        };
+        let command_line = std::iter::once(request.command.as_str())
+            .chain(request.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if request.command == "npm" && request.args.first().map(String::as_str) == Some("run") {
+            let script_name = request
+                .args
+                .get(1)
+                .ok_or(RuntimeHostError::ScriptNotFound("<missing>".into()))?;
+            let script = record
+                .package_scripts
+                .get(script_name)
+                .cloned()
+                .ok_or_else(|| RuntimeHostError::ScriptNotFound(script_name.clone()))?;
+
+            return Ok(RunPlan {
+                cwd,
+                entrypoint: script_name.clone(),
+                command_line,
+                env_count: request.env.len(),
+                command_kind: crate::protocol::RunCommandKind::NpmScript,
+                resolved_script: Some(script),
+            });
         }
 
-        Ok(self.engine.plan_run(request))
+        if request.command == "node" {
+            let entrypoint = request
+                .args
+                .first()
+                .cloned()
+                .ok_or(RuntimeHostError::NodeEntrypointRequired)?;
+
+            return Ok(RunPlan {
+                cwd,
+                entrypoint,
+                command_line,
+                env_count: request.env.len(),
+                command_kind: crate::protocol::RunCommandKind::NodeEntrypoint,
+                resolved_script: None,
+            });
+        }
+
+        let engine_plan = self.engine.plan_run(request);
+
+        if request.command.is_empty() {
+            return Err(RuntimeHostError::UnsupportedCommand("<empty>".into()));
+        }
+
+        Err(RuntimeHostError::UnsupportedCommand(
+            if command_line.is_empty() {
+                engine_plan.entrypoint
+            } else {
+                command_line
+            },
+        ))
     }
 
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
