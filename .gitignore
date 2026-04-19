@@ -24,3 +24,8 @@ public/runtime-host.wasm
 *.njsproj
 *.sln
 *.sw?
+
+
+# 個人用のやつ
+docs/*
+AGENTS.md
