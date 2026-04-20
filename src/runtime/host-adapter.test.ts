@@ -563,6 +563,36 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     },
   });
 
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "path.resolve",
+      segments: ["../package.json"],
+    }),
+  ).resolves.toEqual({
+    kind: "path-value",
+    value: "/workspace/src/generated/package.json",
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "path.join",
+      segments: ["/workspace", "src", "..", "logo.png"],
+    }),
+  ).resolves.toEqual({
+    kind: "path-value",
+    value: "/workspace/logo.png",
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "path.extname",
+      path: "/workspace/src/generated/nested/context.log",
+    }),
+  ).resolves.toEqual({
+    kind: "path-value",
+    value: ".log",
+  });
+
   await expect(adapter.dropRuntimeContext(runtimeContext.contextId)).resolves.toBeUndefined();
 
   await expect(

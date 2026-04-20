@@ -37,6 +37,8 @@ export type HostRuntimeContext = {
 export type HostRuntimeCommand =
   | { kind: "process.info" | "process.cwd" | "process.argv" | "process.env" }
   | { kind: "process.chdir"; path: string }
+  | { kind: "path.resolve" | "path.join"; segments: string[] }
+  | { kind: "path.dirname" | "path.basename" | "path.extname" | "path.normalize"; path: string }
   | (
       | {
           kind: "fs.exists" | "fs.stat" | "fs.read-dir" | "fs.read-file" | "fs.mkdir";
@@ -50,6 +52,7 @@ export type HostRuntimeResponse =
   | { kind: "process-cwd"; cwd: string }
   | { kind: "process-argv"; argv: string[] }
   | { kind: "process-env"; env: Record<string, string> }
+  | { kind: "path-value"; value: string }
   | { kind: "fs"; response: HostFsResponse };
 
 export type HostSessionHandle = {
@@ -692,6 +695,36 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           cwd: nextCwd,
         };
       }
+      case "path.resolve":
+        return {
+          kind: "path-value",
+          value: resolveMockRuntimePath(context.process.cwd, command.segments),
+        };
+      case "path.join":
+        return {
+          kind: "path-value",
+          value: joinMockRuntimePath(command.segments),
+        };
+      case "path.dirname":
+        return {
+          kind: "path-value",
+          value: dirnameMockRuntimePath(command.path),
+        };
+      case "path.basename":
+        return {
+          kind: "path-value",
+          value: basenameMockRuntimePath(command.path),
+        };
+      case "path.extname":
+        return {
+          kind: "path-value",
+          value: extnameMockRuntimePath(command.path),
+        };
+      case "path.normalize":
+        return {
+          kind: "path-value",
+          value: normalizeMockPosixPath(command.path),
+        };
       case "fs.exists":
       case "fs.stat":
       case "fs.read-dir":
@@ -1209,6 +1242,34 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         lines.push("command=process-chdir");
         lines.push(`path=${encodeHex(command.path)}`);
         break;
+      case "path.resolve":
+        lines.push("command=path-resolve");
+        lines.push(
+          `segments=${command.segments.map((segment) => encodeHex(segment)).join("\u001f")}`,
+        );
+        break;
+      case "path.join":
+        lines.push("command=path-join");
+        lines.push(
+          `segments=${command.segments.map((segment) => encodeHex(segment)).join("\u001f")}`,
+        );
+        break;
+      case "path.dirname":
+        lines.push("command=path-dirname");
+        lines.push(`path=${encodeHex(command.path)}`);
+        break;
+      case "path.basename":
+        lines.push("command=path-basename");
+        lines.push(`path=${encodeHex(command.path)}`);
+        break;
+      case "path.extname":
+        lines.push("command=path-extname");
+        lines.push(`path=${encodeHex(command.path)}`);
+        break;
+      case "path.normalize":
+        lines.push("command=path-normalize");
+        lines.push(`path=${encodeHex(command.path)}`);
+        break;
       case "fs.exists":
       case "fs.stat":
       case "fs.read-dir":
@@ -1229,6 +1290,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | { kind: "process-cwd"; cwd: string }
       | { kind: "process-argv"; argv: string[] }
       | { kind: "process-env"; env: Record<string, string> }
+      | { kind: "path-value"; value: string }
       | {
           kind: "fs";
           response:
@@ -1520,6 +1582,69 @@ function resolveMockFsCommandPath(cwd: string, path: string): string {
   }
 
   return normalizeMockPosixPath(path.startsWith("/") ? path : `${cwd}/${path}`);
+}
+
+function resolveMockRuntimePath(cwd: string, segments: string[]): string {
+  let resolved = cwd;
+
+  for (const segment of segments) {
+    if (!segment) {
+      continue;
+    }
+
+    resolved = segment.startsWith("/")
+      ? segment
+      : resolved === "/"
+        ? `/${segment}`
+        : `${resolved}/${segment}`;
+  }
+
+  return normalizeMockPosixPath(resolved);
+}
+
+function joinMockRuntimePath(segments: string[]): string {
+  const joined = segments.filter(Boolean).join("/");
+  return joined ? normalizeMockPosixPath(joined) : ".";
+}
+
+function dirnameMockRuntimePath(path: string): string {
+  const normalized = normalizeMockPosixPath(path);
+
+  if (normalized === "/") {
+    return "/";
+  }
+
+  const trimmed = normalized.replace(/\/+$/, "");
+  const index = trimmed.lastIndexOf("/");
+  if (index === -1) {
+    return ".";
+  }
+  if (index === 0) {
+    return "/";
+  }
+  return trimmed.slice(0, index);
+}
+
+function basenameMockRuntimePath(path: string): string {
+  const normalized = normalizeMockPosixPath(path);
+
+  if (normalized === "/") {
+    return "/";
+  }
+
+  return normalized.replace(/\/+$/, "").split("/").at(-1) ?? ".";
+}
+
+function extnameMockRuntimePath(path: string): string {
+  const basename = basenameMockRuntimePath(path);
+  if (basename === "/" || basename === "." || basename === "..") {
+    return "";
+  }
+  const index = basename.lastIndexOf(".");
+  if (index <= 0) {
+    return "";
+  }
+  return basename.slice(index);
 }
 
 function assertMockWorkspacePathWithinRoot(workspaceRoot: string, path: string): void {

@@ -228,6 +228,24 @@ mod tests {
             Ok(HostRuntimeResponse::Fs(HostFsResponse::Entry(entry)))
                 if entry.path == "/workspace/src/generated/runtime.log"
         ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PathResolve {
+                    segments: vec![String::from("../package.json")],
+                },
+            ),
+            Ok(HostRuntimeResponse::PathValue { value }) if value == "/workspace/src/package.json"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PathExtname {
+                    path: String::from("/workspace/src/generated/runtime.log"),
+                },
+            ),
+            Ok(HostRuntimeResponse::PathValue { value }) if value == ".log"
+        ));
         assert_eq!(
             host.plan_run(
                 &session.session_id,

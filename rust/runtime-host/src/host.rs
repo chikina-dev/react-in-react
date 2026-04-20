@@ -601,6 +601,31 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     None => Err(RuntimeHostError::DirectoryNotFound(resolved)),
                 }
             }
+            HostRuntimeCommand::PathResolve { segments } => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::PathValue {
+                    value: resolve_runtime_path(&context.process.cwd, &segments),
+                })
+            }
+            HostRuntimeCommand::PathJoin { segments } => Ok(HostRuntimeResponse::PathValue {
+                value: join_runtime_path(&segments),
+            }),
+            HostRuntimeCommand::PathDirname { path } => Ok(HostRuntimeResponse::PathValue {
+                value: runtime_dirname(&path),
+            }),
+            HostRuntimeCommand::PathBasename { path } => Ok(HostRuntimeResponse::PathValue {
+                value: runtime_basename(&path),
+            }),
+            HostRuntimeCommand::PathExtname { path } => Ok(HostRuntimeResponse::PathValue {
+                value: runtime_extname(&path),
+            }),
+            HostRuntimeCommand::PathNormalize { path } => Ok(HostRuntimeResponse::PathValue {
+                value: normalize_runtime_path(&path),
+            }),
             HostRuntimeCommand::Fs(command) => self
                 .execute_context_fs_command(context_id, command)
                 .map(HostRuntimeResponse::Fs),
@@ -969,6 +994,101 @@ fn normalize_workspace_asset_path(relative_path: &str) -> String {
     };
 
     normalized.replace("//", "/")
+}
+
+fn normalize_runtime_path(path: &str) -> String {
+    let normalized = normalize_posix_path(path);
+    if normalized.is_empty() {
+        ".".into()
+    } else {
+        normalized
+    }
+}
+
+fn join_runtime_path(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return ".".into();
+    }
+
+    let joined = segments.iter().filter(|segment| !segment.is_empty()).fold(
+        String::new(),
+        |current, segment| {
+            if current.is_empty() {
+                segment.clone()
+            } else {
+                format!("{current}/{segment}")
+            }
+        },
+    );
+
+    if joined.is_empty() {
+        ".".into()
+    } else {
+        normalize_runtime_path(&joined)
+    }
+}
+
+fn resolve_runtime_path(cwd: &str, segments: &[String]) -> String {
+    let mut resolved = cwd.to_string();
+
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+
+        if segment.starts_with('/') {
+            resolved = segment.clone();
+        } else if resolved == "/" {
+            resolved = format!("/{segment}");
+        } else {
+            resolved = format!("{resolved}/{segment}");
+        }
+    }
+
+    normalize_runtime_path(&resolved)
+}
+
+fn runtime_dirname(path: &str) -> String {
+    let normalized = normalize_runtime_path(path);
+
+    if normalized == "/" {
+        return "/".into();
+    }
+
+    let trimmed = normalized.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/".into(),
+        Some(index) => trimmed[..index].to_string(),
+        None => ".".into(),
+    }
+}
+
+fn runtime_basename(path: &str) -> String {
+    let normalized = normalize_runtime_path(path);
+
+    if normalized == "/" {
+        return "/".into();
+    }
+
+    normalized
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(".")
+        .to_string()
+}
+
+fn runtime_extname(path: &str) -> String {
+    let basename = runtime_basename(path);
+
+    if basename == "/" || basename == "." || basename == ".." {
+        return String::new();
+    }
+
+    match basename.rfind('.') {
+        Some(0) | None => String::new(),
+        Some(index) => basename[index..].to_string(),
+    }
 }
 
 fn decode_workspace_path(relative_path: &str) -> String {

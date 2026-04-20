@@ -771,6 +771,40 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 None => ".".into(),
             },
         }),
+        "path-resolve" => Ok(HostRuntimeCommand::PathResolve {
+            segments: parse_hex_path_list(
+                fields.get("segments").map(String::as_str).unwrap_or(""),
+            )?,
+        }),
+        "path-join" => Ok(HostRuntimeCommand::PathJoin {
+            segments: parse_hex_path_list(
+                fields.get("segments").map(String::as_str).unwrap_or(""),
+            )?,
+        }),
+        "path-dirname" => Ok(HostRuntimeCommand::PathDirname {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        }),
+        "path-basename" => Ok(HostRuntimeCommand::PathBasename {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        }),
+        "path-extname" => Ok(HostRuntimeCommand::PathExtname {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        }),
+        "path-normalize" => Ok(HostRuntimeCommand::PathNormalize {
+            path: match required_field(fields, "path") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => ".".into(),
+            },
+        }),
         "fs-exists" => Ok(HostRuntimeCommand::Fs(HostContextFsCommand::Exists {
             path: match required_field(fields, "path") {
                 Some(encoded) => decode_hex(&encoded)?,
@@ -1009,6 +1043,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
                 .join(",");
             format!("{{\"kind\":\"process-env\",\"env\":{{{entries}}}}}")
         }
+        HostRuntimeResponse::PathValue { value } => format!(
+            "{{\"kind\":\"path-value\",\"value\":\"{}\"}}",
+            escape_json(value)
+        ),
         HostRuntimeResponse::Fs(response) => format!(
             "{{\"kind\":\"fs\",\"response\":{}}}",
             render_fs_response_json(response)

@@ -177,6 +177,12 @@ pub enum HostRuntimeCommand {
     ProcessArgv,
     ProcessEnv,
     ProcessChdir { path: String },
+    PathResolve { segments: Vec<String> },
+    PathJoin { segments: Vec<String> },
+    PathDirname { path: String },
+    PathBasename { path: String },
+    PathExtname { path: String },
+    PathNormalize { path: String },
     Fs(HostContextFsCommand),
 }
 
@@ -186,6 +192,7 @@ pub enum HostRuntimeResponse {
     ProcessCwd { cwd: String },
     ProcessArgv { argv: Vec<String> },
     ProcessEnv { env: BTreeMap<String, String> },
+    PathValue { value: String },
     Fs(HostFsResponse),
 }
 
