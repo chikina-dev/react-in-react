@@ -151,6 +151,37 @@ mod tests {
             b"export const generated = true;"
         );
         assert_eq!(
+            host.write_workspace_file(
+                &session.session_id,
+                "/workspace/package.json",
+                br#"{"name":"renamed-app","scripts":{"preview":"vite preview"},"dependencies":{"react":"^19.0.0"},"devDependencies":{"vite":"^8.0.0"}}"#.to_vec(),
+                true,
+            )
+            .expect("package manifest should be writable")
+            .path,
+            "/workspace/package.json"
+        );
+        assert_eq!(
+            host.plan_run(
+                &session.session_id,
+                &RunRequest::new(
+                    "/workspace",
+                    "npm",
+                    vec![String::from("run"), String::from("preview")],
+                ),
+            )
+            .expect("updated package scripts should be used")
+            .resolved_script,
+            Some(String::from("vite preview"))
+        );
+        assert_eq!(
+            host.session_snapshot(&session.session_id)
+                .expect("session snapshot should exist")
+                .package_name
+                .as_deref(),
+            Some("renamed-app")
+        );
+        assert_eq!(
             host.execute_fs_command(
                 &session.session_id,
                 HostFsCommand::Exists {
@@ -537,6 +568,7 @@ mod tests {
                             size: 11,
                             is_text: true,
                         },
+                        revision: 1,
                     }]
         ));
         assert!(matches!(
@@ -698,6 +730,7 @@ mod tests {
                                 size: 13,
                                 is_text: true,
                             },
+                            revision: 2,
                         },
                         HostRuntimeEvent::ProcessExit { code: 0 },
                     ]

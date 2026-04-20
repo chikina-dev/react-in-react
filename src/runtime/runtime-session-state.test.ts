@@ -11,6 +11,7 @@ function createSession(): SessionSnapshot {
   return {
     sessionId: "session-1",
     state: "mounted",
+    revision: 0,
     workspaceRoot: "/workspace",
     archive: {
       fileName: "demo.zip",

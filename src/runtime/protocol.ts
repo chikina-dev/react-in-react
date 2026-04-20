@@ -33,6 +33,7 @@ export type PackageJsonSummary = {
 export type SessionSnapshot = {
   sessionId: SessionId;
   state: SessionState;
+  revision: number;
   workspaceRoot: string;
   archive: ArchiveSummary;
   packageJson: PackageJsonSummary | null;

@@ -27,6 +27,7 @@ pub enum SessionState {
 pub struct SessionSnapshot {
     pub session_id: String,
     pub state: SessionState,
+    pub revision: u64,
     pub workspace_root: String,
     pub archive: ArchiveStats,
     pub package_name: Option<String>,
@@ -195,6 +196,7 @@ pub enum HostRuntimeEvent {
     },
     WorkspaceChange {
         entry: WorkspaceEntrySummary,
+        revision: u64,
     },
 }
 

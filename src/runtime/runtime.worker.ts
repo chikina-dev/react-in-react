@@ -467,6 +467,7 @@ function buildPreviewModel(session: SessionSnapshot, runPlan: HostRunPlan): Prev
     command: runPlan.commandLine,
     highlights: [
       `session=${session.sessionId}`,
+      `revision=${session.revision}`,
       `files=${session.archive.fileCount}`,
       `run-kind=${runPlan.commandKind}`,
       runPlan.resolvedScript
@@ -549,6 +550,7 @@ async function flushRuntimeEvents(
       case "workspace-change": {
         const record = sessions.get(sessionId);
         if (record) {
+          record.session.revision = event.revision;
           applyWorkspaceEntryChange(record, event.entry);
           await syncSessionSnapshotFromWorkspaceChange(record, hostAdapter, sessionId, event.entry);
           const refreshed = await refreshPreviewRootPlan(record, hostAdapter, contextId);

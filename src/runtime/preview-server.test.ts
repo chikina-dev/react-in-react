@@ -51,6 +51,7 @@ function createPreviewState(files: PreviewState["files"] = new Map()): PreviewSt
     session: {
       sessionId: "session-1",
       state: "running",
+      revision: 0,
       workspaceRoot: "/workspace",
       archive: {
         fileName: "guest.zip",

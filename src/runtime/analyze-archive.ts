@@ -45,6 +45,7 @@ export function mountArchive(
     snapshot: {
       sessionId,
       state: "mounted",
+      revision: 0,
       workspaceRoot: "/workspace",
       archive: parsed.archive,
       packageJson: parsed.packageJson,

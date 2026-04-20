@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::Deserialize;
+
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
@@ -57,6 +59,15 @@ struct SessionRecord {
     snapshot: SessionSnapshot,
     package_scripts: BTreeMap<String, String>,
     vfs: VirtualFileSystem,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageManifest {
+    name: Option<String>,
+    scripts: Option<BTreeMap<String, String>>,
+    dependencies: Option<BTreeMap<String, String>>,
+    #[serde(rename = "devDependencies")]
+    dev_dependencies: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,16 +168,25 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
         let mut vfs = VirtualFileSystem::new("/workspace");
         vfs.mount_files(files)?;
+        let package_manifest = read_package_manifest(&vfs);
 
         let snapshot = SessionSnapshot {
             session_id: session_id.clone(),
             state: SessionState::Mounted,
+            revision: 0,
             workspace_root: "/workspace".into(),
             archive,
-            package_name,
+            package_name: package_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.name.clone())
+                .or(package_name),
             capabilities: CapabilityMatrix {
-                detected_react: vfs.read("/workspace/package.json").is_some(),
-                detected_vite: vfs.file_count() > 0,
+                detected_react: package_manifest
+                    .as_ref()
+                    .is_some_and(detect_react_dependency),
+                detected_vite: package_manifest
+                    .as_ref()
+                    .is_some_and(detect_vite_dependency),
             },
         };
 
@@ -174,7 +194,10 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             session_id,
             SessionRecord {
                 snapshot: snapshot.clone(),
-                package_scripts,
+                package_scripts: package_manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.scripts.clone())
+                    .unwrap_or(package_scripts),
                 vfs,
             },
         );
@@ -417,7 +440,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
         let resolved = resolve_workspace_path(record, path);
 
-        record.vfs.write_file(&resolved, bytes, is_text)
+        let entry = record.vfs.write_file(&resolved, bytes, is_text)?;
+        sync_session_package_manifest(record, &resolved);
+        Ok(entry)
     }
 
     pub fn execute_fs_command(
@@ -514,10 +539,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
                 let resolved = resolve_fs_command_path(record, &cwd, &path)?;
 
-                record
-                    .vfs
-                    .write_file(&resolved, bytes, is_text)
-                    .map(HostFsResponse::Entry)
+                let entry = record.vfs.write_file(&resolved, bytes, is_text)?;
+                sync_session_package_manifest(record, &resolved);
+                Ok(HostFsResponse::Entry(entry))
             }
         }
     }
@@ -999,12 +1023,27 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
                 if emit_workspace_change {
                     if let HostFsResponse::Entry(entry) = &response {
+                        let session_id = {
+                            let context =
+                                self.runtime_contexts.get(context_id).ok_or_else(|| {
+                                    RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                                })?;
+                            context.session_id.clone()
+                        };
+                        let revision = {
+                            let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+                                RuntimeHostError::SessionNotFound(session_id.clone())
+                            })?;
+                            session.snapshot.revision += 1;
+                            session.snapshot.revision
+                        };
                         let context =
                             self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
                                 RuntimeHostError::RuntimeContextNotFound(context_id.into())
                             })?;
                         context.events.push_back(HostRuntimeEvent::WorkspaceChange {
                             entry: entry.clone(),
+                            revision,
                         });
                     }
                 }
@@ -1337,6 +1376,53 @@ fn describe_preview_response(
         },
         omit_body,
     }
+}
+
+fn read_package_manifest(vfs: &VirtualFileSystem) -> Option<PackageManifest> {
+    let file = vfs.read("/workspace/package.json")?;
+    if !file.is_text {
+        return None;
+    }
+
+    serde_json::from_slice::<PackageManifest>(&file.bytes).ok()
+}
+
+fn detect_react_dependency(manifest: &PackageManifest) -> bool {
+    dependency_keys(manifest).any(|name| name == "react" || name == "react-dom")
+}
+
+fn detect_vite_dependency(manifest: &PackageManifest) -> bool {
+    dependency_keys(manifest).any(|name| name == "vite")
+}
+
+fn dependency_keys(manifest: &PackageManifest) -> impl Iterator<Item = &str> {
+    manifest
+        .dependencies
+        .iter()
+        .flat_map(|deps| deps.keys().map(String::as_str))
+        .chain(
+            manifest
+                .dev_dependencies
+                .iter()
+                .flat_map(|deps| deps.keys().map(String::as_str)),
+        )
+}
+
+fn sync_session_package_manifest(record: &mut SessionRecord, path: &str) {
+    if path != "/workspace/package.json" {
+        return;
+    }
+
+    let manifest = read_package_manifest(&record.vfs);
+    record.package_scripts = manifest
+        .as_ref()
+        .and_then(|package| package.scripts.clone())
+        .unwrap_or_default();
+    record.snapshot.package_name = manifest.as_ref().and_then(|package| package.name.clone());
+    record.snapshot.capabilities.detected_react =
+        manifest.as_ref().is_some_and(detect_react_dependency);
+    record.snapshot.capabilities.detected_vite =
+        manifest.as_ref().is_some_and(detect_vite_dependency);
 }
 
 fn guess_preview_content_type(

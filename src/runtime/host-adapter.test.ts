@@ -7,6 +7,7 @@ import type { SessionSnapshot } from "./protocol";
 const session: SessionSnapshot = {
   sessionId: "session-1",
   state: "mounted",
+  revision: 0,
   workspaceRoot: "/workspace",
   archive: {
     fileName: "demo.zip",
@@ -111,6 +112,49 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
   });
 
   await expect(
+    adapter.writeWorkspaceFile(session.sessionId, {
+      path: "/workspace/package.json",
+      bytes: new TextEncoder().encode(
+        JSON.stringify({
+          name: "renamed-app",
+          scripts: {
+            dev: "vite",
+            preview: "vite preview",
+          },
+          dependencies: {
+            react: "^19.0.0",
+          },
+          devDependencies: {
+            vite: "^8.0.0",
+          },
+        }),
+      ),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    path: "/workspace/package.json",
+    kind: "file",
+    size: 143,
+    isText: true,
+  });
+
+  await expect(
+    adapter.planRun(session.sessionId, {
+      cwd: "/workspace",
+      command: "npm",
+      args: ["run", "preview"],
+      env: {},
+    }),
+  ).resolves.toEqual({
+    cwd: "/workspace",
+    entrypoint: "preview",
+    commandLine: "npm run preview",
+    envCount: 0,
+    commandKind: "npm-script",
+    resolvedScript: "vite preview",
+  });
+
+  await expect(
     adapter.buildProcessInfo(session.sessionId, {
       cwd: "/workspace",
       command: "npm",
@@ -135,7 +179,7 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
   await expect(adapter.listWorkspaceFiles(session.sessionId)).resolves.toEqual([
     {
       path: "/workspace/package.json",
-      size: 19,
+      size: 143,
       isText: true,
     },
     {
@@ -167,7 +211,7 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     {
       path: "/workspace/package.json",
       kind: "file",
-      size: 19,
+      size: 143,
       isText: true,
     },
     {
@@ -189,10 +233,13 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     adapter.readWorkspaceFile(session.sessionId, "/workspace/package.json"),
   ).resolves.toEqual({
     path: "/workspace/package.json",
-    size: 19,
+    size: 143,
     isText: true,
-    textContent: '{"name":"demo-app"}',
-    bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+    textContent:
+      '{"name":"renamed-app","scripts":{"dev":"vite","preview":"vite preview"},"dependencies":{"react":"^19.0.0"},"devDependencies":{"vite":"^8.0.0"}}',
+    bytes: new TextEncoder().encode(
+      '{"name":"renamed-app","scripts":{"dev":"vite","preview":"vite preview"},"dependencies":{"react":"^19.0.0"},"devDependencies":{"vite":"^8.0.0"}}',
+    ),
   });
 
   await expect(
@@ -203,10 +250,13 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
   ).resolves.toEqual([
     {
       path: "/workspace/package.json",
-      size: 19,
+      size: 143,
       isText: true,
-      textContent: '{"name":"demo-app"}',
-      bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+      textContent:
+        '{"name":"renamed-app","scripts":{"dev":"vite","preview":"vite preview"},"dependencies":{"react":"^19.0.0"},"devDependencies":{"vite":"^8.0.0"}}',
+      bytes: new TextEncoder().encode(
+        '{"name":"renamed-app","scripts":{"dev":"vite","preview":"vite preview"},"dependencies":{"react":"^19.0.0"},"devDependencies":{"vite":"^8.0.0"}}',
+      ),
     },
     {
       path: "/workspace/logo.png",
@@ -893,6 +943,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           size: 11,
           isText: true,
         },
+        revision: 1,
       },
     ],
   });
@@ -1135,6 +1186,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           size: 13,
           isText: true,
         },
+        revision: 2,
       },
       {
         kind: "process-exit",

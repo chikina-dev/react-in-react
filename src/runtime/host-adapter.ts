@@ -1,5 +1,6 @@
 import { guessContentType, type WorkspaceFileRecord } from "./analyze-archive";
 import type { RunRequest, SessionSnapshot } from "./protocol";
+import { parsePackageJsonSummary } from "./runtime-session-state";
 
 export type HostBootstrapSummary = {
   engineName: string;
@@ -59,7 +60,7 @@ export type HostRuntimeEvent =
   | { kind: "process-exit"; code: number }
   | { kind: "port-listen"; port: HostRuntimePort }
   | { kind: "port-close"; port: number }
-  | { kind: "workspace-change"; entry: HostWorkspaceEntrySummary };
+  | { kind: "workspace-change"; entry: HostWorkspaceEntrySummary; revision: number };
 
 export type HostRuntimePortProtocol = "http";
 
@@ -404,6 +405,7 @@ const DEFAULT_RUNTIME_HOST_WASM_URL = "/runtime-host.wasm";
 
 type HostSessionRecord = {
   handle: HostSessionHandle;
+  revision: number;
   packageScripts: Record<string, string>;
   files: Map<string, WorkspaceFileRecord>;
   directories: Set<string>;
@@ -538,8 +540,11 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
     this.sessions.set(input.sessionId, {
       handle,
+      revision: input.session.revision,
       packageScripts: input.session.packageJson?.scripts ?? {},
-      files: input.files,
+      files: new Map(
+        [...input.files.entries()].map(([path, file]) => [path, cloneWorkspaceFileRecord(file)]),
+      ),
       directories: collectMockDirectories(input.files, input.session.workspaceRoot),
     });
 
@@ -797,6 +802,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       bytes,
       textContent,
     });
+    syncMockPackageManifest(record, resolved, textContent);
 
     return {
       path: resolved,
@@ -1256,9 +1262,12 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         const response = await this.executeContextFsCommand(contextId, fsCommand);
 
         if (shouldEmitWorkspaceChange && response.kind === "entry") {
+          const session = this.sessions.get(context.sessionId);
+          const revision = session ? ++session.revision : 0;
           context.events.push({
             kind: "workspace-change",
             entry: response.entry,
+            revision,
           });
         }
 
@@ -1469,6 +1478,27 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
     this.sessions.delete(sessionId);
   }
+}
+
+function cloneWorkspaceFileRecord(file: WorkspaceFileRecord): WorkspaceFileRecord {
+  return {
+    ...file,
+    bytes: new Uint8Array(file.bytes),
+  };
+}
+
+function syncMockPackageManifest(
+  record: HostSessionRecord,
+  resolvedPath: string,
+  textContent: string | null,
+): void {
+  if (resolvedPath !== "/workspace/package.json") {
+    return;
+  }
+
+  const parsed = parsePackageJsonSummary(textContent);
+  record.packageScripts = parsed?.scripts ?? {};
+  record.handle.packageName = parsed?.name ?? null;
 }
 
 export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
