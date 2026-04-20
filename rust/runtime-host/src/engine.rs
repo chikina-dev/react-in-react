@@ -88,6 +88,12 @@ pub struct EngineJobDrain {
     pub pending_jobs: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineRegisteredModule {
+    pub specifier: String,
+    pub source: String,
+}
+
 pub trait EngineAdapter {
     fn descriptor(&self) -> EngineDescriptor;
 
@@ -113,6 +119,17 @@ pub trait EngineAdapter {
         plan: &HostRuntimeBootstrapPlan,
     ) -> Result<EngineEvalOutcome, String>;
 
+    fn list_modules(
+        &self,
+        handle: &EngineContextHandle,
+    ) -> Result<Vec<EngineRegisteredModule>, String>;
+
+    fn read_module(
+        &self,
+        handle: &EngineContextHandle,
+        specifier: &str,
+    ) -> Result<EngineRegisteredModule, String>;
+
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String>;
 
     fn interrupt(&mut self, handle: &EngineContextHandle, reason: &str) -> Result<(), String>;
@@ -131,6 +148,7 @@ struct EngineContextRecord {
     pending_jobs: usize,
     registered_modules: usize,
     bootstrap_specifier: Option<String>,
+    modules: BTreeMap<String, String>,
     state: EngineContextState,
 }
 
@@ -190,6 +208,7 @@ impl EngineStateStore {
                 pending_jobs: 0,
                 registered_modules: 0,
                 bootstrap_specifier: None,
+                modules: BTreeMap::new(),
                 state: EngineContextState::Booted,
             },
         );
@@ -232,8 +251,57 @@ impl EngineStateStore {
 
         context.registered_modules = plan.modules.len();
         context.bootstrap_specifier = Some(plan.bootstrap_specifier.clone());
+        context.modules = plan
+            .modules
+            .iter()
+            .map(|module| (module.specifier.clone(), module.source.clone()))
+            .collect();
 
         Ok(())
+    }
+
+    fn list_modules(
+        &self,
+        handle: &EngineContextHandle,
+        engine_label: &str,
+    ) -> Result<Vec<EngineRegisteredModule>, String> {
+        let context = self
+            .contexts
+            .get(&handle.engine_context_id)
+            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+
+        Ok(context
+            .modules
+            .iter()
+            .map(|(specifier, source)| EngineRegisteredModule {
+                specifier: specifier.clone(),
+                source: source.clone(),
+            })
+            .collect())
+    }
+
+    fn read_module(
+        &self,
+        handle: &EngineContextHandle,
+        specifier: &str,
+        engine_label: &str,
+    ) -> Result<EngineRegisteredModule, String> {
+        let context = self
+            .contexts
+            .get(&handle.engine_context_id)
+            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+
+        let source = context.modules.get(specifier).ok_or_else(|| {
+            format!(
+                "{engine_label} module not found in context {}: {specifier}",
+                handle.engine_context_id
+            )
+        })?;
+
+        Ok(EngineRegisteredModule {
+            specifier: specifier.to_string(),
+            source: source.clone(),
+        })
     }
 
     fn mark_ready(
@@ -394,6 +462,21 @@ impl EngineAdapter for NullEngineAdapter {
         Ok(outcome)
     }
 
+    fn list_modules(
+        &self,
+        handle: &EngineContextHandle,
+    ) -> Result<Vec<EngineRegisteredModule>, String> {
+        self.state.list_modules(handle, "null engine")
+    }
+
+    fn read_module(
+        &self,
+        handle: &EngineContextHandle,
+        specifier: &str,
+    ) -> Result<EngineRegisteredModule, String> {
+        self.state.read_module(handle, specifier, "null engine")
+    }
+
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
         self.state.interrupt(handle, "null engine")
     }
@@ -483,6 +566,21 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
 
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
         self.state.drain_jobs(handle, "quickjs-ng")
+    }
+
+    fn list_modules(
+        &self,
+        handle: &EngineContextHandle,
+    ) -> Result<Vec<EngineRegisteredModule>, String> {
+        self.state.list_modules(handle, "quickjs-ng")
+    }
+
+    fn read_module(
+        &self,
+        handle: &EngineContextHandle,
+        specifier: &str,
+    ) -> Result<EngineRegisteredModule, String> {
+        self.state.read_module(handle, specifier, "quickjs-ng")
     }
 
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {

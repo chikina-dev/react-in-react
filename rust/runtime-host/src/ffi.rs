@@ -897,6 +897,13 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
         "runtime-boot-engine" => Ok(HostRuntimeCommand::BootEngine),
+        "runtime-describe-modules" => Ok(HostRuntimeCommand::DescribeModules),
+        "runtime-read-module" => Ok(HostRuntimeCommand::ReadModule {
+            specifier: match required_field(fields, "specifier") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => String::new(),
+            },
+        }),
         "stdio-write" => Ok(HostRuntimeCommand::StdioWrite {
             stream: match required_field(fields, "stream").as_deref() {
                 Some("stderr") => HostRuntimeStdioStream::Stderr,
@@ -1301,6 +1308,14 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-engine-boot\",\"report\":{}}}",
             render_runtime_engine_boot_json(report)
         ),
+        HostRuntimeResponse::ModuleList { modules } => format!(
+            "{{\"kind\":\"runtime-module-list\",\"modules\":{}}}",
+            render_runtime_module_records_json(modules)
+        ),
+        HostRuntimeResponse::ModuleSource(module) => format!(
+            "{{\"kind\":\"runtime-module-source\",\"module\":{}}}",
+            render_runtime_module_source_json(module)
+        ),
         HostRuntimeResponse::EventQueued { queue_len } => {
             format!("{{\"kind\":\"event-queued\",\"queueLen\":{queue_len}}}")
         }
@@ -1433,6 +1448,33 @@ fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBo
         format!("\"{}\"", escape_json(&report.result_summary)),
         report.pending_jobs,
         report.drained_jobs,
+    )
+}
+
+fn render_runtime_module_records_json(modules: &[crate::protocol::HostRuntimeModuleRecord]) -> String {
+    format!(
+        "[{}]",
+        modules
+            .iter()
+            .map(render_runtime_module_record_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_runtime_module_record_json(module: &crate::protocol::HostRuntimeModuleRecord) -> String {
+    format!(
+        "{{\"specifier\":{},\"sourceLen\":{}}}",
+        format!("\"{}\"", escape_json(&module.specifier)),
+        module.source_len,
+    )
+}
+
+fn render_runtime_module_source_json(module: &crate::protocol::HostRuntimeModuleSource) -> String {
+    format!(
+        "{{\"specifier\":{},\"source\":{}}}",
+        format!("\"{}\"", escape_json(&module.specifier)),
+        format!("\"{}\"", escape_json(&module.source)),
     )
 }
 

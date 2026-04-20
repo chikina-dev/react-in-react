@@ -7,8 +7,8 @@ pub mod vfs;
 
 pub use engine::{
     EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextState,
-    EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain, EngineSessionHandle,
-    NullEngineAdapter, QuickJsNgEngineAdapter,
+    EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain,
+    EngineRegisteredModule, EngineSessionHandle, NullEngineAdapter, QuickJsNgEngineAdapter,
 };
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
@@ -17,8 +17,9 @@ pub use protocol::{
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
-    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeModuleRecord,
+    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
     RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
     WorkspaceFileSummary,
@@ -159,6 +160,18 @@ mod tests {
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
             Some("runtime:bootstrap")
+        );
+        assert_eq!(
+            host.list_engine_modules(&runtime_context.context_id)
+                .expect("engine modules should be listed")
+                .len(),
+            7
+        );
+        assert_eq!(
+            host.read_engine_module(&runtime_context.context_id, "runtime:bootstrap")
+                .expect("bootstrap module should resolve")
+                .specifier,
+            "runtime:bootstrap"
         );
     }
 

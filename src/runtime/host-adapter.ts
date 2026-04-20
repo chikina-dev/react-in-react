@@ -97,6 +97,16 @@ export type HostRuntimeEngineBoot = {
   drainedJobs: number;
 };
 
+export type HostRuntimeModuleRecord = {
+  specifier: string;
+  sourceLen: number;
+};
+
+export type HostRuntimeModuleSource = {
+  specifier: string;
+  source: string;
+};
+
 export type HostRuntimeStdioStream = "stdout" | "stderr";
 export type HostRuntimeConsoleLevel = "log" | "info" | "warn" | "error";
 
@@ -147,6 +157,7 @@ export type HostRuntimeCommand =
         | "runtime.describe"
         | "runtime.describe-bootstrap"
         | "runtime.boot-engine"
+        | "runtime.describe-modules"
         | "runtime.drain-events"
         | "port.list"
         | "timers.list"
@@ -157,6 +168,7 @@ export type HostRuntimeCommand =
         | "process.env";
     }
   | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
+  | { kind: "runtime.read-module"; specifier: string }
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
   | { kind: "port.listen"; port?: number | null; protocol: HostRuntimePortProtocol }
   | { kind: "port.close"; port: number }
@@ -183,6 +195,8 @@ export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
   | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
+  | { kind: "runtime-module-list"; modules: HostRuntimeModuleRecord[] }
+  | { kind: "runtime-module-source"; module: HostRuntimeModuleSource }
   | { kind: "event-queued"; queueLen: number }
   | { kind: "runtime-events"; events: HostRuntimeEvent[] }
   | { kind: "port-listening"; port: HostRuntimePort }
@@ -1281,6 +1295,27 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           },
         };
       }
+      case "runtime.describe-modules": {
+        const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        return {
+          kind: "runtime-module-list",
+          modules: plan.modules.map((module) => ({
+            specifier: module.specifier,
+            sourceLen: module.source.length,
+          })),
+        };
+      }
+      case "runtime.read-module": {
+        const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        const module = plan.modules.find((entry) => entry.specifier === command.specifier);
+        if (!module) {
+          throw new Error(`runtime module not found: ${command.specifier}`);
+        }
+        return {
+          kind: "runtime-module-source",
+          module,
+        };
+      }
       case "stdio.write":
         context.events.push({
           kind: command.stream,
@@ -2128,6 +2163,13 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         break;
       case "runtime.boot-engine":
         lines.push("command=runtime-boot-engine");
+        break;
+      case "runtime.describe-modules":
+        lines.push("command=runtime-describe-modules");
+        break;
+      case "runtime.read-module":
+        lines.push("command=runtime-read-module");
+        lines.push(`specifier=${encodeHex(command.specifier)}`);
         break;
       case "stdio.write":
         lines.push("command=stdio-write");

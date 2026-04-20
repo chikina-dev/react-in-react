@@ -710,6 +710,37 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe-modules",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-list",
+    modules: expect.arrayContaining([
+      {
+        specifier: "node:process",
+        sourceLen: expect.any(Number),
+      },
+      {
+        specifier: "runtime:bootstrap",
+        sourceLen: expect.any(Number),
+      },
+    ]),
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.read-module",
+      specifier: "runtime:bootstrap",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-source",
+    module: expect.objectContaining({
+      specifier: "runtime:bootstrap",
+      source: expect.stringContaining('import("/workspace/src/server.ts")'),
+    }),
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "stdio.write",
       stream: "stdout",
       chunk: "hello stdout",

@@ -12,8 +12,9 @@ use crate::protocol::{
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
-    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeModuleRecord,
+    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
     RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
     WorkspaceFileSummary,
@@ -448,6 +449,52 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map_err(RuntimeHostError::EngineFailure)
     }
 
+    pub fn list_engine_modules(
+        &self,
+        context_id: &str,
+    ) -> RuntimeHostResult<Vec<HostRuntimeModuleRecord>> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .list_modules(&engine_context)
+            .map(|modules| {
+                modules
+                    .into_iter()
+                    .map(|module| HostRuntimeModuleRecord {
+                        specifier: module.specifier,
+                        source_len: module.source.len(),
+                    })
+                    .collect()
+            })
+            .map_err(RuntimeHostError::EngineFailure)
+    }
+
+    pub fn read_engine_module(
+        &self,
+        context_id: &str,
+        specifier: &str,
+    ) -> RuntimeHostResult<HostRuntimeModuleSource> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .read_module(&engine_context, specifier)
+            .map(|module| HostRuntimeModuleSource {
+                specifier: module.specifier,
+                source: module.source,
+            })
+            .map_err(RuntimeHostError::EngineFailure)
+    }
+
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
         self.sessions.get(session_id).map(|record| &record.vfs)
     }
@@ -762,6 +809,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     pending_jobs: eval.pending_jobs,
                     drained_jobs: drained.drained_jobs,
                 }))
+            }
+            HostRuntimeCommand::DescribeModules => {
+                let modules = self.list_engine_modules(context_id)?;
+                Ok(HostRuntimeResponse::ModuleList { modules })
+            }
+            HostRuntimeCommand::ReadModule { specifier } => {
+                let module = self.read_engine_module(context_id, &specifier)?;
+                Ok(HostRuntimeResponse::ModuleSource(module))
             }
             HostRuntimeCommand::StdioWrite { stream, chunk } => {
                 let queue_len = {

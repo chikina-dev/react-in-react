@@ -137,6 +137,18 @@ pub struct HostRuntimeEngineBoot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeModuleRecord {
+    pub specifier: String,
+    pub source_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeModuleSource {
+    pub specifier: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeStdioStream {
     Stdout,
     Stderr,
@@ -303,6 +315,10 @@ pub enum HostRuntimeCommand {
     DescribeBindings,
     DescribeBootstrap,
     BootEngine,
+    DescribeModules,
+    ReadModule {
+        specifier: String,
+    },
     StdioWrite {
         stream: HostRuntimeStdioStream,
         chunk: String,
@@ -378,6 +394,10 @@ pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
     BootstrapPlan(HostRuntimeBootstrapPlan),
     EngineBoot(HostRuntimeEngineBoot),
+    ModuleList {
+        modules: Vec<HostRuntimeModuleRecord>,
+    },
+    ModuleSource(HostRuntimeModuleSource),
     EventQueued {
         queue_len: usize,
     },
