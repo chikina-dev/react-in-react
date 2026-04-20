@@ -21,6 +21,10 @@ import type {
   VirtualHttpResponse,
   WorkerToUiMessage,
 } from "./protocol";
+import {
+  applyPackageJsonTextToSessionSnapshot,
+  applyWorkspaceEntryToSessionSnapshot,
+} from "./runtime-session-state";
 
 type ActiveProcess = {
   pid: ProcessId;
@@ -546,6 +550,15 @@ async function flushRuntimeEvents(
         const record = sessions.get(sessionId);
         if (record) {
           applyWorkspaceEntryChange(record, event.entry);
+          await syncSessionSnapshotFromWorkspaceChange(record, hostAdapter, sessionId, event.entry);
+          const refreshed = await refreshPreviewRootPlan(record, hostAdapter, contextId);
+          if (refreshed) {
+            await emitStdout(
+              sessionId,
+              pid,
+              `[preview] root-plan ${record.preview?.rootResponseDescriptor.kind ?? "unknown"}`,
+            );
+          }
         }
         await emitStdout(sessionId, pid, `[vfs] ${event.entry.kind} ${event.entry.path} updated`);
         break;
@@ -555,6 +568,8 @@ async function flushRuntimeEvents(
 }
 
 function applyWorkspaceEntryChange(record: SessionRecord, entry: HostWorkspaceEntrySummary): void {
+  applyWorkspaceEntryToSessionSnapshot(record.session, entry);
+
   if (entry.kind === "file") {
     const nextIndex = record.hostFiles.index.filter((file) => file.path !== entry.path);
     nextIndex.push({
@@ -580,6 +595,67 @@ function applyWorkspaceEntryChange(record: SessionRecord, entry: HostWorkspaceEn
       sampleSize: record.hostFiles.sampleSize,
     };
   }
+}
+
+async function syncSessionSnapshotFromWorkspaceChange(
+  record: SessionRecord,
+  hostAdapter: Awaited<typeof hostAdapterPromise>,
+  sessionId: string,
+  entry: HostWorkspaceEntrySummary,
+): Promise<void> {
+  if (entry.path === "/workspace/package.json" && entry.kind === "file") {
+    const packageJsonFile = await hostAdapter
+      .readWorkspaceFile(sessionId, entry.path)
+      .catch(() => null);
+    applyPackageJsonTextToSessionSnapshot(record.session, packageJsonFile?.textContent ?? null);
+  }
+
+  if (record.preview) {
+    record.preview.model = buildPreviewModel(record.session, {
+      cwd: record.preview.run.cwd,
+      entrypoint: record.preview.run.entrypoint,
+      commandLine: record.preview.run.commandLine,
+      envCount: record.preview.run.envCount,
+      commandKind: record.preview.run.commandKind,
+      resolvedScript: record.preview.run.resolvedScript,
+    });
+  }
+}
+
+async function refreshPreviewRootPlan(
+  record: SessionRecord,
+  hostAdapter: Awaited<typeof hostAdapterPromise>,
+  contextId: string,
+): Promise<boolean> {
+  if (!record.preview) {
+    return false;
+  }
+
+  const previousRequestHint = JSON.stringify(record.preview.rootRequestHint);
+  const previousResponseDescriptor = JSON.stringify(record.preview.rootResponseDescriptor);
+  const refreshed = await hostAdapter
+    .executeRuntimeCommand(contextId, {
+      kind: "http.resolve-preview",
+      request: {
+        port: record.preview.port,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+      },
+    })
+    .catch(() => null);
+
+  if (refreshed?.kind !== "preview-request-resolved") {
+    return false;
+  }
+
+  record.preview.rootRequestHint = refreshed.requestHint;
+  record.preview.rootResponseDescriptor = refreshed.responseDescriptor;
+
+  return (
+    previousRequestHint !== JSON.stringify(refreshed.requestHint) ||
+    previousResponseDescriptor !== JSON.stringify(refreshed.responseDescriptor)
+  );
 }
 
 function emitState(sessionId: string, state: SessionSnapshot["state"]): void {
