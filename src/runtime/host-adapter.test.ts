@@ -64,6 +64,17 @@ const files = new Map<string, WorkspaceFileRecord>([
       textContent: "console.log('server')",
     },
   ],
+  [
+    "/workspace/src/boot.ts",
+    {
+      path: "/workspace/src/boot.ts",
+      size: 25,
+      contentType: "text/plain; charset=utf-8",
+      isText: true,
+      bytes: new TextEncoder().encode("export const boot = true;"),
+      textContent: "export const boot = true;",
+    },
+  ],
 ]);
 
 test("MockRuntimeHostAdapter reports the null engine boot summary", async () => {
@@ -90,7 +101,7 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     sessionId: "session-1",
     workspaceRoot: "/workspace",
     packageName: "demo-app",
-    fileCount: 3,
+    fileCount: 4,
   });
 
   await expect(
@@ -190,6 +201,11 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     {
       path: "/workspace/src/server.ts",
       size: 20,
+      isText: true,
+    },
+    {
+      path: "/workspace/src/boot.ts",
+      size: 25,
       isText: true,
     },
   ]);
@@ -438,6 +454,12 @@ test("MockRuntimeHostAdapter mutates the workspace tree", async () => {
   await expect(
     adapter.readWorkspaceDirectory(session.sessionId, "/workspace/src"),
   ).resolves.toEqual([
+    {
+      path: "/workspace/src/boot.ts",
+      kind: "file",
+      size: 25,
+      isText: true,
+    },
     {
       path: "/workspace/src/generated",
       kind: "directory",
@@ -737,6 +759,37 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       specifier: "runtime:bootstrap",
       source: expect.stringContaining('import("/workspace/src/server.ts")'),
     }),
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.resolve-module",
+      importer: "/workspace/src/server.ts",
+      specifier: "./boot",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-resolved",
+    module: {
+      requestedSpecifier: "./boot",
+      resolvedSpecifier: "/workspace/src/boot.ts",
+      kind: "workspace",
+      format: "module",
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.load-module",
+      resolvedSpecifier: "/workspace/src/boot.ts",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-loaded",
+    module: {
+      resolvedSpecifier: "/workspace/src/boot.ts",
+      kind: "workspace",
+      format: "module",
+      source: "export const boot = true;",
+    },
   });
 
   await expect(

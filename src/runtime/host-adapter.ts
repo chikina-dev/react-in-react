@@ -107,6 +107,23 @@ export type HostRuntimeModuleSource = {
   source: string;
 };
 
+export type HostRuntimeModuleKind = "registered" | "workspace";
+export type HostRuntimeModuleFormat = "module" | "commonjs" | "json";
+
+export type HostRuntimeResolvedModule = {
+  requestedSpecifier: string;
+  resolvedSpecifier: string;
+  kind: HostRuntimeModuleKind;
+  format: HostRuntimeModuleFormat;
+};
+
+export type HostRuntimeLoadedModule = {
+  resolvedSpecifier: string;
+  kind: HostRuntimeModuleKind;
+  format: HostRuntimeModuleFormat;
+  source: string;
+};
+
 export type HostRuntimeStdioStream = "stdout" | "stderr";
 export type HostRuntimeConsoleLevel = "log" | "info" | "warn" | "error";
 
@@ -169,6 +186,8 @@ export type HostRuntimeCommand =
     }
   | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
   | { kind: "runtime.read-module"; specifier: string }
+  | { kind: "runtime.resolve-module"; specifier: string; importer?: string | null }
+  | { kind: "runtime.load-module"; resolvedSpecifier: string }
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
   | { kind: "port.listen"; port?: number | null; protocol: HostRuntimePortProtocol }
   | { kind: "port.close"; port: number }
@@ -197,6 +216,8 @@ export type HostRuntimeResponse =
   | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
   | { kind: "runtime-module-list"; modules: HostRuntimeModuleRecord[] }
   | { kind: "runtime-module-source"; module: HostRuntimeModuleSource }
+  | { kind: "runtime-module-resolved"; module: HostRuntimeResolvedModule }
+  | { kind: "runtime-module-loaded"; module: HostRuntimeLoadedModule }
   | { kind: "event-queued"; queueLen: number }
   | { kind: "runtime-events"; events: HostRuntimeEvent[] }
   | { kind: "port-listening"; port: HostRuntimePort }
@@ -1316,6 +1337,69 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           module,
         };
       }
+      case "runtime.resolve-module": {
+        const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        const builtin = plan.modules.find((entry) => entry.specifier === command.specifier);
+        if (builtin) {
+          return {
+            kind: "runtime-module-resolved",
+            module: {
+              requestedSpecifier: command.specifier,
+              resolvedSpecifier: command.specifier,
+              kind: "registered",
+              format: "module",
+            },
+          };
+        }
+
+        const record = this.sessions.get(context.sessionId);
+        if (!record) {
+          throw new Error(`Rust host session not found: ${context.sessionId}`);
+        }
+        const importerDir =
+          command.importer && command.importer.startsWith("/workspace")
+            ? parentMockPosixPath(command.importer)
+            : context.process.cwd;
+        const resolved = resolveMockRuntimeModule(record, importerDir, command.specifier);
+        return {
+          kind: "runtime-module-resolved",
+          module: {
+            requestedSpecifier: command.specifier,
+            resolvedSpecifier: resolved,
+            kind: "workspace",
+            format: detectMockRuntimeModuleFormat(resolved),
+          },
+        };
+      }
+      case "runtime.load-module": {
+        const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        const builtin = plan.modules.find((entry) => entry.specifier === command.resolvedSpecifier);
+        if (builtin) {
+          return {
+            kind: "runtime-module-loaded",
+            module: {
+              resolvedSpecifier: builtin.specifier,
+              kind: "registered",
+              format: "module",
+              source: builtin.source,
+            },
+          };
+        }
+
+        const file = await this.readWorkspaceFile(context.sessionId, command.resolvedSpecifier);
+        if (!file.isText || file.textContent === null) {
+          throw new Error(`runtime module source must be text: ${command.resolvedSpecifier}`);
+        }
+        return {
+          kind: "runtime-module-loaded",
+          module: {
+            resolvedSpecifier: command.resolvedSpecifier,
+            kind: "workspace",
+            format: detectMockRuntimeModuleFormat(command.resolvedSpecifier),
+            source: file.textContent,
+          },
+        };
+      }
       case "stdio.write":
         context.events.push({
           kind: command.stream,
@@ -2171,6 +2255,17 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         lines.push("command=runtime-read-module");
         lines.push(`specifier=${encodeHex(command.specifier)}`);
         break;
+      case "runtime.resolve-module":
+        lines.push("command=runtime-resolve-module");
+        lines.push(`specifier=${encodeHex(command.specifier)}`);
+        if (command.importer) {
+          lines.push(`importer=${encodeHex(command.importer)}`);
+        }
+        break;
+      case "runtime.load-module":
+        lines.push("command=runtime-load-module");
+        lines.push(`resolved_specifier=${encodeHex(command.resolvedSpecifier)}`);
+        break;
       case "stdio.write":
         lines.push("command=stdio-write");
         lines.push(`stream=${command.stream}`);
@@ -2775,6 +2870,130 @@ function parentMockPosixPath(path: string): string {
   }
 
   return normalized.slice(0, index);
+}
+
+function resolveMockRuntimeModule(
+  record: HostSessionRecord,
+  importerDir: string,
+  specifier: string,
+): string {
+  if (specifier.startsWith("./") || specifier.startsWith("../") || specifier.startsWith("/")) {
+    const requested = normalizeMockPosixPath(
+      specifier.startsWith("/") ? specifier : `${importerDir}/${specifier}`,
+    );
+    return resolveMockWorkspaceModuleCandidate(record.files, requested);
+  }
+
+  const { packageName, subpath } = splitMockPackageSpecifier(specifier);
+  for (const packageRoot of buildMockNodeModuleSearchRoots(importerDir, packageName)) {
+    if (subpath) {
+      const requested = normalizeMockPosixPath(`${packageRoot}/${subpath}`);
+      try {
+        return resolveMockWorkspaceModuleCandidate(record.files, requested);
+      } catch {}
+    } else {
+      const manifest = record.files.get(`${packageRoot}/package.json`)?.textContent;
+      if (manifest) {
+        try {
+          const parsed = JSON.parse(manifest) as { main?: string; module?: string };
+          const entry = parsed.module ?? parsed.main;
+          if (entry) {
+            return resolveMockWorkspaceModuleCandidate(
+              record.files,
+              normalizeMockPosixPath(`${packageRoot}/${entry}`),
+            );
+          }
+        } catch {}
+      }
+    }
+
+    try {
+      return resolveMockWorkspaceModuleCandidate(record.files, `${packageRoot}/index`);
+    } catch {}
+  }
+
+  throw new Error(`module not found: ${specifier}`);
+}
+
+function resolveMockWorkspaceModuleCandidate(
+  files: Map<string, WorkspaceFileRecord>,
+  requested: string,
+): string {
+  const candidates = [
+    requested,
+    `${requested}.js`,
+    `${requested}.mjs`,
+    `${requested}.cjs`,
+    `${requested}.ts`,
+    `${requested}.tsx`,
+    `${requested}.jsx`,
+    `${requested}.json`,
+    `${requested}/index.js`,
+    `${requested}/index.mjs`,
+    `${requested}/index.cjs`,
+    `${requested}/index.ts`,
+    `${requested}/index.tsx`,
+    `${requested}/index.jsx`,
+    `${requested}/index.json`,
+  ];
+
+  for (const candidate of candidates) {
+    if (files.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(`module not found: ${requested}`);
+}
+
+function splitMockPackageSpecifier(specifier: string): {
+  packageName: string;
+  subpath: string | null;
+} {
+  if (specifier.startsWith("@")) {
+    const segments = specifier.split("/");
+    return {
+      packageName: segments.slice(0, 2).join("/"),
+      subpath: segments.slice(2).join("/") || null,
+    };
+  }
+
+  const segments = specifier.split("/");
+  return {
+    packageName: segments[0] ?? specifier,
+    subpath: segments.slice(1).join("/") || null,
+  };
+}
+
+function buildMockNodeModuleSearchRoots(importerDir: string, packageName: string): string[] {
+  const roots = new Set<string>();
+  let current = importerDir;
+
+  while (current.startsWith("/workspace")) {
+    if (current.endsWith("/node_modules")) {
+      roots.add(normalizeMockPosixPath(`${current}/${packageName}`));
+    } else {
+      roots.add(normalizeMockPosixPath(`${current}/node_modules/${packageName}`));
+    }
+
+    if (current === "/workspace") {
+      break;
+    }
+
+    current = parentMockPosixPath(current);
+  }
+
+  return [...roots];
+}
+
+function detectMockRuntimeModuleFormat(path: string): HostRuntimeModuleFormat {
+  if (path.endsWith(".cjs")) {
+    return "commonjs";
+  }
+  if (path.endsWith(".json")) {
+    return "json";
+  }
+  return "module";
 }
 
 export async function createRuntimeHostAdapter(): Promise<RuntimeHostAdapter> {

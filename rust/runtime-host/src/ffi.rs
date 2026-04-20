@@ -904,6 +904,21 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 None => String::new(),
             },
         }),
+        "runtime-resolve-module" => Ok(HostRuntimeCommand::ResolveModule {
+            specifier: match required_field(fields, "specifier") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => String::new(),
+            },
+            importer: required_field(fields, "importer")
+                .map(|encoded| decode_hex(&encoded))
+                .transpose()?,
+        }),
+        "runtime-load-module" => Ok(HostRuntimeCommand::LoadModule {
+            resolved_specifier: match required_field(fields, "resolved_specifier") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => String::new(),
+            },
+        }),
         "stdio-write" => Ok(HostRuntimeCommand::StdioWrite {
             stream: match required_field(fields, "stream").as_deref() {
                 Some("stderr") => HostRuntimeStdioStream::Stderr,
@@ -1316,6 +1331,14 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-module-source\",\"module\":{}}}",
             render_runtime_module_source_json(module)
         ),
+        HostRuntimeResponse::ModuleResolved { module } => format!(
+            "{{\"kind\":\"runtime-module-resolved\",\"module\":{}}}",
+            render_runtime_resolved_module_json(module)
+        ),
+        HostRuntimeResponse::ModuleLoaded { module } => format!(
+            "{{\"kind\":\"runtime-module-loaded\",\"module\":{}}}",
+            render_runtime_loaded_module_json(module)
+        ),
         HostRuntimeResponse::EventQueued { queue_len } => {
             format!("{{\"kind\":\"event-queued\",\"queueLen\":{queue_len}}}")
         }
@@ -1476,6 +1499,45 @@ fn render_runtime_module_source_json(module: &crate::protocol::HostRuntimeModule
         format!("\"{}\"", escape_json(&module.specifier)),
         format!("\"{}\"", escape_json(&module.source)),
     )
+}
+
+fn render_runtime_resolved_module_json(
+    module: &crate::protocol::HostRuntimeResolvedModule,
+) -> String {
+    format!(
+        "{{\"requestedSpecifier\":{},\"resolvedSpecifier\":{},\"kind\":\"{}\",\"format\":\"{}\"}}",
+        format!("\"{}\"", escape_json(&module.requested_specifier)),
+        format!("\"{}\"", escape_json(&module.resolved_specifier)),
+        render_runtime_module_kind(&module.kind),
+        render_runtime_module_format(&module.format),
+    )
+}
+
+fn render_runtime_loaded_module_json(module: &crate::protocol::HostRuntimeLoadedModule) -> String {
+    format!(
+        "{{\"resolvedSpecifier\":{},\"kind\":\"{}\",\"format\":\"{}\",\"source\":{}}}",
+        format!("\"{}\"", escape_json(&module.resolved_specifier)),
+        render_runtime_module_kind(&module.kind),
+        render_runtime_module_format(&module.format),
+        format!("\"{}\"", escape_json(&module.source)),
+    )
+}
+
+fn render_runtime_module_kind(kind: &crate::protocol::HostRuntimeModuleKind) -> &'static str {
+    match kind {
+        crate::protocol::HostRuntimeModuleKind::Registered => "registered",
+        crate::protocol::HostRuntimeModuleKind::Workspace => "workspace",
+    }
+}
+
+fn render_runtime_module_format(
+    format_kind: &crate::protocol::HostRuntimeModuleFormat,
+) -> &'static str {
+    match format_kind {
+        crate::protocol::HostRuntimeModuleFormat::Module => "module",
+        crate::protocol::HostRuntimeModuleFormat::CommonJs => "commonjs",
+        crate::protocol::HostRuntimeModuleFormat::Json => "json",
+    }
 }
 
 fn render_runtime_bindings_json(bindings: &HostRuntimeBindings) -> String {

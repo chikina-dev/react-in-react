@@ -173,6 +173,12 @@ mod tests {
                 .specifier,
             "runtime:bootstrap"
         );
+        assert_eq!(
+            host.resolve_runtime_module(&runtime_context.context_id, None, "node:process")
+                .expect("registered module should resolve")
+                .resolved_specifier,
+            "node:process"
+        );
     }
 
     #[test]
@@ -289,6 +295,24 @@ mod tests {
                 .bytes,
             b"export const generated = true;"
         );
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.tsx")]),
+            )
+            .expect("runtime context should be created");
+        let relative_module = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "./generated/app",
+            )
+            .expect("relative module should resolve");
+        assert_eq!(relative_module.resolved_specifier, "/workspace/src/generated/app.ts");
+        let relative_source = host
+            .load_runtime_module(&runtime_context.context_id, &relative_module.resolved_specifier)
+            .expect("relative module should load");
+        assert!(relative_source.source.contains("generated"));
         assert_eq!(
             host.write_workspace_file(
                 &session.session_id,

@@ -149,6 +149,35 @@ pub struct HostRuntimeModuleSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeModuleKind {
+    Registered,
+    Workspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeModuleFormat {
+    Module,
+    CommonJs,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeResolvedModule {
+    pub requested_specifier: String,
+    pub resolved_specifier: String,
+    pub kind: HostRuntimeModuleKind,
+    pub format: HostRuntimeModuleFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeLoadedModule {
+    pub resolved_specifier: String,
+    pub kind: HostRuntimeModuleKind,
+    pub format: HostRuntimeModuleFormat,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeStdioStream {
     Stdout,
     Stderr,
@@ -319,6 +348,13 @@ pub enum HostRuntimeCommand {
     ReadModule {
         specifier: String,
     },
+    ResolveModule {
+        specifier: String,
+        importer: Option<String>,
+    },
+    LoadModule {
+        resolved_specifier: String,
+    },
     StdioWrite {
         stream: HostRuntimeStdioStream,
         chunk: String,
@@ -398,6 +434,12 @@ pub enum HostRuntimeResponse {
         modules: Vec<HostRuntimeModuleRecord>,
     },
     ModuleSource(HostRuntimeModuleSource),
+    ModuleResolved {
+        module: HostRuntimeResolvedModule,
+    },
+    ModuleLoaded {
+        module: HostRuntimeLoadedModule,
+    },
     EventQueued {
         queue_len: usize,
     },

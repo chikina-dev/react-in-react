@@ -12,9 +12,10 @@ use crate::protocol::{
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeModuleRecord,
-    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeLoadedModule,
+    HostRuntimeModuleRecord, HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
     RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
     WorkspaceFileSummary,
@@ -70,6 +71,8 @@ struct SessionRecord {
 #[derive(Debug, Deserialize)]
 struct PackageManifest {
     name: Option<String>,
+    main: Option<String>,
+    module: Option<String>,
     scripts: Option<BTreeMap<String, String>>,
     dependencies: Option<BTreeMap<String, String>>,
     #[serde(rename = "devDependencies")]
@@ -495,6 +498,111 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map_err(RuntimeHostError::EngineFailure)
     }
 
+    pub fn resolve_runtime_module(
+        &self,
+        context_id: &str,
+        importer: Option<&str>,
+        specifier: &str,
+    ) -> RuntimeHostResult<HostRuntimeResolvedModule> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let record = self
+            .sessions
+            .get(&context.session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
+
+        if self
+            .engine
+            .read_module(&context.engine_context, specifier)
+            .is_ok()
+        {
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: specifier.to_string(),
+                kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                format: crate::protocol::HostRuntimeModuleFormat::Module,
+            });
+        }
+
+        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        {
+            let base_dir = importer
+                .filter(|value| value.starts_with("/workspace"))
+                .map(dirname)
+                .unwrap_or(&context.process.cwd);
+            let requested = if specifier.starts_with('/') {
+                normalize_posix_path(specifier)
+            } else {
+                normalize_posix_path(&format!("{base_dir}/{specifier}"))
+            };
+            let resolved = resolve_workspace_module(record, &requested)?;
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: resolved.clone(),
+                kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+                format: detect_module_format(&resolved),
+            });
+        }
+
+        let base_dir = importer
+            .filter(|value| value.starts_with("/workspace"))
+            .map(dirname)
+            .unwrap_or(&context.process.cwd);
+        let resolved = resolve_package_module(record, base_dir, specifier)?;
+        Ok(HostRuntimeResolvedModule {
+            requested_specifier: specifier.to_string(),
+            resolved_specifier: resolved.clone(),
+            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+            format: detect_module_format(&resolved),
+        })
+    }
+
+    pub fn load_runtime_module(
+        &self,
+        context_id: &str,
+        resolved_specifier: &str,
+    ) -> RuntimeHostResult<HostRuntimeLoadedModule> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let record = self
+            .sessions
+            .get(&context.session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
+
+        if let Ok(module) = self
+            .engine
+            .read_module(&context.engine_context, resolved_specifier)
+        {
+            return Ok(HostRuntimeLoadedModule {
+                resolved_specifier: module.specifier,
+                kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                format: crate::protocol::HostRuntimeModuleFormat::Module,
+                source: module.source,
+            });
+        }
+
+        let file = record
+            .vfs
+            .read(resolved_specifier)
+            .ok_or_else(|| RuntimeHostError::ModuleNotFound(resolved_specifier.to_string()))?;
+        if !file.is_text {
+            return Err(RuntimeHostError::EngineFailure(format!(
+                "module source must be text: {resolved_specifier}"
+            )));
+        }
+
+        Ok(HostRuntimeLoadedModule {
+            resolved_specifier: resolved_specifier.to_string(),
+            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+            format: detect_module_format(resolved_specifier),
+            source: String::from_utf8_lossy(&file.bytes).into_owned(),
+        })
+    }
+
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
         self.sessions.get(session_id).map(|record| &record.vfs)
     }
@@ -817,6 +925,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             HostRuntimeCommand::ReadModule { specifier } => {
                 let module = self.read_engine_module(context_id, &specifier)?;
                 Ok(HostRuntimeResponse::ModuleSource(module))
+            }
+            HostRuntimeCommand::ResolveModule { specifier, importer } => {
+                let module = self.resolve_runtime_module(context_id, importer.as_deref(), &specifier)?;
+                Ok(HostRuntimeResponse::ModuleResolved { module })
+            }
+            HostRuntimeCommand::LoadModule { resolved_specifier } => {
+                let module = self.load_runtime_module(context_id, &resolved_specifier)?;
+                Ok(HostRuntimeResponse::ModuleLoaded { module })
             }
             HostRuntimeCommand::StdioWrite { stream, chunk } => {
                 let queue_len = {
@@ -2002,6 +2118,121 @@ fn resolve_node_entrypoint(
     }
 
     Err(RuntimeHostError::EntrypointNotFound(requested))
+}
+
+fn resolve_workspace_module(record: &SessionRecord, requested: &str) -> RuntimeHostResult<String> {
+    for candidate in workspace_module_candidates(requested) {
+        if record.vfs.read(&candidate).is_some() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(RuntimeHostError::ModuleNotFound(requested.to_string()))
+}
+
+fn resolve_package_module(
+    record: &SessionRecord,
+    importer_dir: &str,
+    specifier: &str,
+) -> RuntimeHostResult<String> {
+    let (package_name, subpath) = split_package_specifier(specifier);
+    for package_root in node_module_search_roots(importer_dir, &package_name) {
+        let package_json_path = format!("{package_root}/package.json");
+        let manifest = record
+            .vfs
+            .read(&package_json_path)
+            .and_then(|file| serde_json::from_slice::<PackageManifest>(&file.bytes).ok());
+
+        if let Some(subpath) = subpath.as_deref() {
+            let requested = normalize_posix_path(&format!("{package_root}/{subpath}"));
+            if let Ok(resolved) = resolve_workspace_module(record, &requested) {
+                return Ok(resolved);
+            }
+        } else if let Some(manifest) = manifest {
+            if let Some(entry) = manifest.module.or(manifest.main) {
+                let requested = normalize_posix_path(&format!("{package_root}/{entry}"));
+                if let Ok(resolved) = resolve_workspace_module(record, &requested) {
+                    return Ok(resolved);
+                }
+            }
+        }
+
+        if let Ok(resolved) = resolve_workspace_module(record, &format!("{package_root}/index")) {
+            return Ok(resolved);
+        }
+    }
+
+    Err(RuntimeHostError::ModuleNotFound(specifier.to_string()))
+}
+
+fn workspace_module_candidates(requested: &str) -> Vec<String> {
+    let normalized = normalize_posix_path(requested);
+    [
+        normalized.clone(),
+        format!("{normalized}.js"),
+        format!("{normalized}.mjs"),
+        format!("{normalized}.cjs"),
+        format!("{normalized}.ts"),
+        format!("{normalized}.tsx"),
+        format!("{normalized}.jsx"),
+        format!("{normalized}.json"),
+        format!("{normalized}/index.js"),
+        format!("{normalized}/index.mjs"),
+        format!("{normalized}/index.cjs"),
+        format!("{normalized}/index.ts"),
+        format!("{normalized}/index.tsx"),
+        format!("{normalized}/index.jsx"),
+        format!("{normalized}/index.json"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn split_package_specifier(specifier: &str) -> (String, Option<String>) {
+    if let Some(stripped) = specifier.strip_prefix('@') {
+        let mut parts = stripped.splitn(3, '/');
+        let scope = parts.next().unwrap_or_default();
+        let name = parts.next().unwrap_or_default();
+        let package_name = format!("@{scope}/{name}");
+        let subpath = parts.next().map(ToOwned::to_owned);
+        return (package_name, subpath);
+    }
+
+    let mut parts = specifier.splitn(2, '/');
+    let package_name = parts.next().unwrap_or_default().to_string();
+    let subpath = parts.next().map(ToOwned::to_owned);
+    (package_name, subpath)
+}
+
+fn node_module_search_roots(importer_dir: &str, package_name: &str) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    let mut current = importer_dir.to_string();
+
+    while current.starts_with("/workspace") {
+        if current.ends_with("/node_modules") {
+            roots.insert(normalize_posix_path(&format!("{current}/{package_name}")));
+        } else {
+            roots.insert(normalize_posix_path(&format!("{current}/node_modules/{package_name}")));
+        }
+
+        if current == "/workspace" {
+            break;
+        }
+
+        current = dirname(&current).to_string();
+    }
+
+    roots.into_iter().collect()
+}
+
+fn detect_module_format(path: &str) -> crate::protocol::HostRuntimeModuleFormat {
+    if path.ends_with(".cjs") {
+        crate::protocol::HostRuntimeModuleFormat::CommonJs
+    } else if path.ends_with(".json") {
+        crate::protocol::HostRuntimeModuleFormat::Json
+    } else {
+        crate::protocol::HostRuntimeModuleFormat::Module
+    }
 }
 
 fn dirname(path: &str) -> &str {
