@@ -222,6 +222,10 @@ impl VirtualFileSystem {
         self.files.values()
     }
 
+    pub fn directories(&self) -> impl Iterator<Item = &String> {
+        self.directories.iter()
+    }
+
     pub fn file_count(&self) -> usize {
         self.files.len()
     }

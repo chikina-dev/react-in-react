@@ -160,7 +160,7 @@ mod tests {
         let snapshot = host
             .describe_engine_context(&runtime_context.context_id)
             .expect("engine context should exist");
-        assert_eq!(snapshot.registered_modules, 7);
+        assert_eq!(snapshot.registered_modules, 8);
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
             Some("runtime:bootstrap")
@@ -176,7 +176,7 @@ mod tests {
             host.list_engine_modules(&runtime_context.context_id)
                 .expect("engine modules should be listed")
                 .len(),
-            7
+            8
         );
         assert_eq!(
             host.read_engine_module(&runtime_context.context_id, "runtime:bootstrap")
@@ -212,38 +212,99 @@ mod tests {
 
     #[cfg(feature = "quickjs-ng-engine")]
     #[test]
-    fn quickjs_ng_engine_evaluates_scripts_but_loader_boot_is_still_stubbed() {
+    fn quickjs_ng_engine_evaluates_scripts_and_bootstraps_registered_modules() {
         let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
         let session = host
             .create_session(
                 ArchiveStats {
                     file_name: "quickjs.zip".into(),
-                    file_count: 1,
-                    directory_count: 1,
+                    file_count: 6,
+                    directory_count: 3,
                     root_prefix: None,
                 },
                 Some("quickjs-app".into()),
                 BTreeMap::new(),
-                vec![VirtualFile::text(
-                    "/workspace/src/main.js",
-                    "globalThis.answer = 40 + 2; globalThis.answer;",
-                )],
+                vec![
+                    VirtualFile::text(
+                        "/workspace/src/main.js",
+                        r#"import process from "node:process";
+import fs from "node:fs";
+import path from "node:path";
+import { answer as localAnswer } from "./boot.js";
+import packageAnswer from "demo-pkg";
+console.log("quickjs native bootstrap");
+globalThis.cwdValue = process.cwd();
+globalThis.argvCount = process.argv.length;
+globalThis.envValue = process.env.RUNTIME_SAMPLE;
+globalThis.bootExists = fs.existsSync("./boot.js");
+globalThis.bootSource = fs.readFileSync("./boot.js");
+globalThis.bootPath = path.resolve("./boot.js");
+fs.mkdirSync("../generated", { recursive: true });
+fs.writeFileSync("../generated/from-native.txt", "native quickjs");
+process.chdir("..");
+globalThis.cwdAfterChdir = process.cwd();
+setTimeout(() => {
+  globalThis.timerHit = 1;
+}, 0);
+globalThis.answer = localAnswer + packageAnswer;
+globalThis.answer;"#,
+                    ),
+                    VirtualFile::text("/workspace/src/boot.js", "export const answer = 40 + 2;"),
+                    VirtualFile::text(
+                        "/workspace/src/later.js",
+                        r#"import laterPackage from "late-pkg";
+export default laterPackage + 3;"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/package.json",
+                        r#"{"name":"demo-pkg","main":"./index.cjs"}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/index.cjs",
+                        r#"const extra = require("./util.cjs");
+const payload = require("./value.json");
+module.exports = extra + payload.offset;"#,
+                    ),
+                    VirtualFile::text("/workspace/node_modules/demo-pkg/util.cjs", "module.exports = 1;"),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/value.json",
+                        r#"{"offset":1}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/late-pkg/package.json",
+                        r#"{"name":"late-pkg","main":"./index.cjs"}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/late-pkg/index.cjs",
+                        r#"const payload = require("./value.json");
+module.exports = payload.offset + 4;"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/late-pkg/value.json",
+                        r#"{"offset":5}"#,
+                    ),
+                ],
             )
             .expect("session should be created");
+        let mut request =
+            RunRequest::new("/workspace/src", "node", vec![String::from("main")]);
+        request
+            .env
+            .insert(String::from("RUNTIME_SAMPLE"), String::from("present"));
         let runtime_context = host
-            .create_runtime_context(
-                &session.session_id,
-                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
-            )
+            .create_runtime_context(&session.session_id, &request)
             .expect("runtime context should be created");
 
-        assert_eq!(host.boot_summary().engine_name, "quickjs-ng-native-loader-stub");
+        assert_eq!(
+            host.boot_summary().engine_name,
+            "quickjs-ng-native-bootstrap-loader"
+        );
 
         let eval = host
             .eval_engine_context(
                 &runtime_context.context_id,
                 "/workspace/src/main.js",
-                "globalThis.answer = 40 + 2; globalThis.answer;",
+                "globalThis.quickjsWarmup = 40 + 2; globalThis.quickjsWarmup;",
                 false,
             )
             .expect("quickjs-ng should evaluate a simple script");
@@ -255,15 +316,145 @@ mod tests {
             .expect("engine context should exist");
         assert_eq!(snapshot.state, EngineContextState::Ready);
 
-        assert!(matches!(
-            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine),
-            Err(RuntimeHostError::EngineFailure(message))
-                if message.contains("module loader callback is not wired yet")
-        ));
+        let boot = host
+            .execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine)
+            .expect("quickjs-ng should bootstrap registered modules");
+        let report = match boot {
+            HostRuntimeResponse::EngineBoot(report) => report,
+            other => panic!("expected engine boot report, got {other:?}"),
+        };
+        assert_eq!(report.plan.bootstrap_specifier, "runtime:bootstrap");
+        assert_eq!(report.plan.modules.len(), 7);
+        assert_eq!(
+            report.loader_plan.node_module_search_roots,
+            vec![
+                String::from("/workspace/node_modules"),
+                String::from("/workspace/src/node_modules"),
+            ]
+        );
+        assert!(report
+            .result_summary
+            .contains("quickjs-ng booted 7 bootstrap modules"));
+
+        let imported_answer = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/answer.js",
+                "globalThis.answer",
+                false,
+            )
+            .expect("entry module side effects should run during bootstrap");
+        assert!(imported_answer.result_summary.contains("44"));
+
+        let globals = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/check.js",
+                r#"JSON.stringify({
+  process: typeof globalThis.process,
+  setTimeout: typeof globalThis.setTimeout,
+  Buffer: typeof globalThis.Buffer,
+})"#,
+                false,
+            )
+            .expect("bootstrap globals should be installed");
+        assert!(globals.result_summary.contains(r#""process":"object""#));
+        assert!(globals.result_summary.contains(r#""setTimeout":"function""#));
+        assert!(globals.result_summary.contains(r#""Buffer":"function""#));
+
+        let builtin_state = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/builtins.js",
+                r#"JSON.stringify({
+  cwd: globalThis.cwdValue,
+  argvCount: globalThis.argvCount,
+  envValue: globalThis.envValue,
+  bootExists: globalThis.bootExists,
+  bootPath: globalThis.bootPath,
+  timerHit: globalThis.timerHit,
+  cwdAfterChdir: globalThis.cwdAfterChdir,
+  bootSourceHasAnswer: globalThis.bootSource.includes("answer = 40 + 2"),
+})"#,
+                false,
+            )
+            .expect("native bridge builtins should be usable during bootstrap");
+        assert!(builtin_state.result_summary.contains(r#""cwd":"/workspace/src""#));
+        assert!(builtin_state.result_summary.contains(r#""argvCount":2"#));
+        assert!(builtin_state.result_summary.contains(r#""envValue":"present""#));
+        assert!(builtin_state.result_summary.contains(r#""bootExists":true"#));
+        assert!(builtin_state.result_summary.contains(r#""bootPath":"/workspace/src/boot.js""#));
+        assert!(builtin_state.result_summary.contains(r#""timerHit":1"#));
+        assert!(builtin_state
+            .result_summary
+            .contains(r#""cwdAfterChdir":"/workspace""#));
+        assert!(builtin_state
+            .result_summary
+            .contains(r#""bootSourceHasAnswer":true"#));
+
+        let generated = host
+            .read_workspace_file(&session.session_id, "/workspace/generated/from-native.txt")
+            .expect("native fs.writeFileSync should sync back to host workspace");
+        assert_eq!(String::from_utf8_lossy(&generated.bytes), "native quickjs");
+        assert_eq!(
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::ProcessCwd)
+                .expect("process cwd should reflect native process.chdir"),
+            HostRuntimeResponse::ProcessCwd {
+                cwd: String::from("/workspace"),
+            }
+        );
+        let session_snapshot = host
+            .session_snapshot(&session.session_id)
+            .expect("session snapshot should exist");
+        assert_eq!(session_snapshot.revision, 1);
+        assert_eq!(session_snapshot.archive.file_count, 11);
+        assert_eq!(session_snapshot.archive.directory_count, 6);
+        let runtime_events = host
+            .execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::DrainEvents)
+            .expect("workspace change events should be queued after native writes");
+        let HostRuntimeResponse::RuntimeEvents { events } = runtime_events else {
+            panic!("expected runtime events after native bridge sync");
+        };
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::WorkspaceChange { entry, revision }
+                    if entry.path == "/workspace/generated" && *revision == 1
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::WorkspaceChange { entry, revision }
+                    if entry.path == "/workspace/generated/from-native.txt" && *revision == 1
+            )
+        }));
+
+        host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/src/later-check.mjs",
+                r#"import laterAnswer from "./later.js";
+globalThis.lateAnswer = laterAnswer;
+export default laterAnswer;"#,
+                true,
+            )
+            .expect("native loader should resolve workspace and node_modules modules on demand");
+
+        let late_state = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/late-state.js",
+                "globalThis.lateAnswer",
+                false,
+            )
+            .expect("late import side effect should persist");
+        assert!(late_state.result_summary.contains("12"));
+
         let snapshot = host
             .describe_engine_context(&runtime_context.context_id)
             .expect("engine context should exist");
-        assert_eq!(snapshot.registered_modules, 7);
+        assert_eq!(snapshot.registered_modules, 15);
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
             Some("runtime:bootstrap")

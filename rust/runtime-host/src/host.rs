@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::Deserialize;
 
 use crate::engine::{
-    EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextSpec, EngineEvalMode,
-    EngineEvalOutcome, EngineEvalRequest, EngineJobDrain, EngineSessionHandle, EngineSessionSpec,
+    EngineAdapter, EngineBootstrapBridge, EngineBridgeSnapshot, EngineContextHandle, EngineContextSnapshot,
+    EngineContextSpec, EngineEvalMode, EngineEvalOutcome, EngineEvalRequest, EngineJobDrain,
+    EngineSessionHandle, EngineSessionSpec,
 };
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
@@ -525,7 +526,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .engine_context
             .clone();
 
-        self.engine
+        let outcome = self
+            .engine
             .eval(
                 &engine_context,
                 &EngineEvalRequest {
@@ -538,7 +540,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     },
                 },
             )
-            .map_err(RuntimeHostError::EngineFailure)
+            .map_err(RuntimeHostError::EngineFailure)?;
+        self.sync_engine_bridge_state(context_id)?;
+        Ok(outcome)
     }
 
     pub fn drain_engine_jobs(&mut self, context_id: &str) -> RuntimeHostResult<EngineJobDrain> {
@@ -549,9 +553,12 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .engine_context
             .clone();
 
-        self.engine
+        let drain = self
+            .engine
             .drain_jobs(&engine_context)
-            .map_err(RuntimeHostError::EngineFailure)
+            .map_err(RuntimeHostError::EngineFailure)?;
+        self.sync_engine_bridge_state(context_id)?;
+        Ok(drain)
     }
 
     pub fn interrupt_engine_context(
@@ -678,6 +685,69 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             resolved_module,
             loaded_module,
         })
+    }
+
+    fn collect_runtime_boot_import_graph(
+        &self,
+        context_id: &str,
+        plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
+    ) -> RuntimeHostResult<Vec<HostRuntimeModuleImportPlan>> {
+        let entry_module = self.load_runtime_module(
+            context_id,
+            &loader_plan.entry_module.resolved_specifier,
+        )?;
+        let mut imports = Vec::new();
+        let mut queue = VecDeque::from([HostRuntimeModuleImportPlan {
+            request_specifier: loader_plan.entry_module.requested_specifier.clone(),
+            importer: Some(plan.bootstrap_specifier.clone()),
+            resolved_module: loader_plan.entry_module.clone(),
+            loaded_module: entry_module,
+        }]);
+        let mut visited = BTreeSet::new();
+
+        while let Some(import_plan) = queue.pop_front() {
+            if !visited.insert(import_plan.resolved_module.resolved_specifier.clone()) {
+                continue;
+            }
+
+            let importer = import_plan.resolved_module.resolved_specifier.clone();
+            let loaded_module = import_plan.loaded_module.clone();
+            imports.push(import_plan);
+
+            for specifier in collect_module_dependency_specifiers(
+                &loaded_module.source,
+                &loaded_module.format,
+            ) {
+                let child = if let Some(module) =
+                    plan.modules.iter().find(|module| module.specifier == specifier)
+                {
+                    HostRuntimeModuleImportPlan {
+                        request_specifier: specifier.clone(),
+                        importer: Some(importer.clone()),
+                        resolved_module: HostRuntimeResolvedModule {
+                            requested_specifier: specifier.clone(),
+                            resolved_specifier: module.specifier.clone(),
+                            kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                            format: crate::protocol::HostRuntimeModuleFormat::Module,
+                        },
+                        loaded_module: HostRuntimeLoadedModule {
+                            resolved_specifier: module.specifier.clone(),
+                            kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                            format: crate::protocol::HostRuntimeModuleFormat::Module,
+                            source: module.source.clone(),
+                        },
+                    }
+                } else {
+                    self.prepare_runtime_module_import(context_id, &specifier, Some(&importer))?
+                };
+                if !visited.contains(&child.resolved_module.resolved_specifier) {
+                    queue.push_back(child);
+                }
+            }
+        }
+
+        Ok(imports)
     }
 
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
@@ -979,18 +1049,32 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .get(context_id)
                     .cloned()
                     .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+                let session = self
+                    .sessions
+                    .get(&context.session_id)
+                    .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
                 let bindings =
                     build_runtime_bindings(context_id, &context, self.engine.descriptor());
                 let plan = build_runtime_bootstrap_plan(&bindings);
                 let loader_plan = self.describe_runtime_module_loader(context_id)?;
+                let import_plans =
+                    self.collect_runtime_boot_import_graph(context_id, &plan, &loader_plan)?;
+                let bridge = build_engine_bootstrap_bridge(session, &context);
                 let eval = self
                     .engine
-                    .bootstrap(&context.engine_context, &plan, &loader_plan)
+                    .bootstrap(
+                        &context.engine_context,
+                        &plan,
+                        &loader_plan,
+                        &import_plans,
+                        &bridge,
+                    )
                     .map_err(RuntimeHostError::EngineFailure)?;
                 let drained = self
                     .engine
                     .drain_jobs(&context.engine_context)
                     .map_err(RuntimeHostError::EngineFailure)?;
+                self.sync_engine_bridge_state(context_id)?;
 
                 Ok(HostRuntimeResponse::EngineBoot(HostRuntimeEngineBoot {
                     plan,
@@ -1415,6 +1499,46 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         }
     }
 
+    fn sync_engine_bridge_state(&mut self, context_id: &str) -> RuntimeHostResult<()> {
+        let (session_id, engine_context) = {
+            let context = self
+                .runtime_contexts
+                .get(context_id)
+                .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+            (context.session_id.clone(), context.engine_context.clone())
+        };
+        let Some(snapshot) = self
+            .engine
+            .take_bridge_snapshot(&engine_context)
+            .map_err(RuntimeHostError::EngineFailure)?
+        else {
+            return Ok(());
+        };
+
+        let (revision, changed_entries) = {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.clone()))?;
+            apply_engine_bridge_snapshot(session, &snapshot)
+        };
+
+        let context = self
+            .runtime_contexts
+            .get_mut(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        context.process.cwd = snapshot.cwd;
+        if let Some(revision) = revision {
+            for entry in changed_entries {
+                context
+                    .events
+                    .push_back(HostRuntimeEvent::WorkspaceChange { entry, revision });
+            }
+        }
+
+        Ok(())
+    }
+
     fn resolve_preview_root_hint(&self, session_id: &str) -> RuntimeHostResult<PreviewRootHint> {
         let record = self
             .sessions
@@ -1728,6 +1852,18 @@ fn build_runtime_bindings(
     }
 }
 
+fn build_engine_bootstrap_bridge(
+    session: &SessionRecord,
+    context: &RuntimeContextRecord,
+) -> EngineBootstrapBridge {
+    EngineBootstrapBridge {
+        cwd: context.process.cwd.clone(),
+        argv: context.process.argv.clone(),
+        env: context.process.env.clone(),
+        vfs: session.vfs.clone(),
+    }
+}
+
 fn build_runtime_bootstrap_plan(bindings: &HostRuntimeBindings) -> HostRuntimeBootstrapPlan {
     let bootstrap_specifier = "runtime:bootstrap".to_string();
     let entrypoint_literal = serde_json::to_string(&bindings.entrypoint)
@@ -1851,27 +1987,93 @@ export default consoleValue;
 "#
                 .into(),
             },
-            HostRuntimeBootstrapModule {
-                specifier: bootstrap_specifier,
-                source: format!(
-                    r#"import process from "node:process";
-import {{ Buffer }} from "node:buffer";
-import consoleValue from "node:console";
-import {{ setTimeout, clearTimeout }} from "node:timers";
+	            HostRuntimeBootstrapModule {
+	                specifier: bootstrap_specifier,
+	                source: format!(
+	                    r#"import process from "node:process";
+	import {{ Buffer }} from "node:buffer";
+	import consoleValue from "node:console";
+	import {{ setTimeout, clearTimeout }} from "node:timers";
 
 globalThis.process = process;
-globalThis.Buffer = Buffer;
-globalThis.console = consoleValue;
-globalThis.setTimeout = setTimeout;
-globalThis.clearTimeout = clearTimeout;
-
-export async function boot() {{
-  return import({entrypoint_literal});
-}}
-"#
-                ),
-            },
+	globalThis.Buffer = Buffer;
+	globalThis.console = consoleValue;
+	globalThis.setTimeout = setTimeout;
+	globalThis.clearTimeout = clearTimeout;
+	
+	const entryPromise = import({entrypoint_literal});
+	
+	export async function boot() {{
+	  return entryPromise;
+	}}
+	
+	export {{ entryPromise }};
+	export default entryPromise;
+	"#
+	                ),
+	            },
         ],
+    }
+}
+
+fn collect_module_dependency_specifiers(
+    source: &str,
+    format: &crate::protocol::HostRuntimeModuleFormat,
+) -> Vec<String> {
+    let mut specifiers = Vec::new();
+    match format {
+        crate::protocol::HostRuntimeModuleFormat::Module => {
+            for marker in [" from \"", " from '", "import(\"", "import('", "export * from \"", "export * from '"] {
+                collect_string_literals_after_marker(source, marker, &mut specifiers);
+            }
+            for marker in ["import \"", "import '"] {
+                collect_line_prefixed_imports(source, marker, &mut specifiers);
+            }
+        }
+        crate::protocol::HostRuntimeModuleFormat::CommonJs => {
+            for marker in ["require(\"", "require('"] {
+                collect_string_literals_after_marker(source, marker, &mut specifiers);
+            }
+        }
+        crate::protocol::HostRuntimeModuleFormat::Json => {}
+    }
+    specifiers.sort();
+    specifiers.dedup();
+    specifiers
+}
+
+fn collect_string_literals_after_marker(
+    source: &str,
+    marker: &str,
+    output: &mut Vec<String>,
+) {
+    let mut search_start = 0usize;
+    while let Some(offset) = source[search_start..].find(marker) {
+        let start = search_start + offset + marker.len();
+        let quote = marker.as_bytes()[marker.len() - 1] as char;
+        if let Some(end_offset) = source[start..].find(quote) {
+            let candidate = &source[start..start + end_offset];
+            if !candidate.is_empty() {
+                output.push(candidate.to_string());
+            }
+            search_start = start + end_offset + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn collect_line_prefixed_imports(source: &str, marker: &str, output: &mut Vec<String>) {
+    for line in source.lines().map(str::trim_start) {
+        if let Some(rest) = line.strip_prefix(marker) {
+            let quote = marker.as_bytes()[marker.len() - 1] as char;
+            if let Some(end) = rest.find(quote) {
+                let candidate = &rest[..end];
+                if !candidate.is_empty() {
+                    output.push(candidate.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -2004,6 +2206,53 @@ fn sync_session_package_manifest(record: &mut SessionRecord, path: &str) {
         manifest.as_ref().is_some_and(detect_react_dependency);
     record.snapshot.capabilities.detected_vite =
         manifest.as_ref().is_some_and(detect_vite_dependency);
+}
+
+fn apply_engine_bridge_snapshot(
+    session: &mut SessionRecord,
+    snapshot: &EngineBridgeSnapshot,
+) -> (Option<u64>, Vec<WorkspaceEntrySummary>) {
+    let changed_entries = diff_workspace_entries(&session.vfs, &snapshot.vfs);
+    session.vfs = snapshot.vfs.clone();
+    session.snapshot.archive.file_count = session.vfs.file_count();
+    session.snapshot.archive.directory_count = session.vfs.directory_count();
+    sync_session_package_manifest(session, "/workspace/package.json");
+
+    if changed_entries.is_empty() {
+        return (None, changed_entries);
+    }
+
+    session.snapshot.revision += 1;
+    (Some(session.snapshot.revision), changed_entries)
+}
+
+fn diff_workspace_entries(
+    previous: &VirtualFileSystem,
+    next: &VirtualFileSystem,
+) -> Vec<WorkspaceEntrySummary> {
+    let mut changed = BTreeMap::new();
+
+    for directory in next.directories() {
+        if !previous.is_dir(directory) {
+            if let Some(entry) = next.stat(directory) {
+                changed.insert(entry.path.clone(), entry);
+            }
+        }
+    }
+
+    for file in next.files() {
+        let has_changed = match previous.read(&file.path) {
+            Some(existing) => existing.is_text != file.is_text || existing.bytes != file.bytes,
+            None => true,
+        };
+        if has_changed {
+            if let Some(entry) = next.stat(&file.path) {
+                changed.insert(entry.path.clone(), entry);
+            }
+        }
+    }
+
+    changed.into_values().collect()
 }
 
 fn guess_preview_content_type(
