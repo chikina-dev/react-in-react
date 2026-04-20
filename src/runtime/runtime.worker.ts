@@ -285,10 +285,9 @@ async function runSession(
   }
 
   const portResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-    kind: "port.listen",
-    protocol: "http",
+    kind: "http.serve-preview",
   });
-  const port = portResponse.kind === "port-listening" ? portResponse.port.port : 3000;
+  const port = portResponse.kind === "http-server-listening" ? portResponse.server.port.port : 3000;
   await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
   const url = `/preview/${sessionId}/${port}/`;
   const model = buildPreviewModel(record.session, runPlan);

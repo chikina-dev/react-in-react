@@ -6,9 +6,9 @@ use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
     HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
-    HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimePort,
-    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind, RunRequest,
+    HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer,
+    HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -806,6 +806,12 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 .unwrap_or(0),
         }),
         "port-list" => Ok(HostRuntimeCommand::PortList),
+        "http-serve-preview" => Ok(HostRuntimeCommand::HttpServePreview {
+            port: fields
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port > 0),
+        }),
         "http-resolve-preview" => Ok(HostRuntimeCommand::HttpResolvePreview {
             request: HostRuntimeHttpRequest {
                 port: fields
@@ -1129,12 +1135,18 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"port-list\",\"ports\":{}}}",
             render_runtime_ports_json(ports)
         ),
+        HostRuntimeResponse::HttpServerListening { server } => format!(
+            "{{\"kind\":\"http-server-listening\",\"server\":{}}}",
+            render_runtime_http_server_json(server)
+        ),
         HostRuntimeResponse::PreviewRequestResolved {
+            server,
             port,
             request,
             request_hint,
         } => format!(
-            "{{\"kind\":\"preview-request-resolved\",\"port\":{},\"request\":{},\"requestHint\":{}}}",
+            "{{\"kind\":\"preview-request-resolved\",\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{}}}",
+            render_runtime_http_server_json(server),
             render_runtime_port_json(port),
             render_runtime_http_request_json(request),
             render_preview_request_hint_json(request_hint)
@@ -1312,6 +1324,20 @@ fn render_runtime_http_request_json(request: &HostRuntimeHttpRequest) -> String 
         escape_json(&request.method),
         escape_json(&request.relative_path),
         escape_json(&request.search),
+    )
+}
+
+fn render_runtime_http_server_json(server: &HostRuntimeHttpServer) -> String {
+    let kind = match server.kind {
+        HostRuntimeHttpServerKind::Preview => "preview",
+    };
+
+    format!(
+        "{{\"port\":{},\"kind\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\"}}",
+        render_runtime_port_json(&server.port),
+        kind,
+        escape_json(&server.cwd),
+        escape_json(&server.entrypoint),
     )
 }
 

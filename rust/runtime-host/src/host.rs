@@ -6,10 +6,10 @@ use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeHttpRequest, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
-    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
+    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
+    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -65,6 +65,7 @@ struct RuntimeContextRecord {
     clock_ms: u64,
     next_port: u16,
     ports: BTreeMap<u16, RuntimePortRecord>,
+    http_servers: BTreeMap<u16, RuntimeHttpServerRecord>,
     timers: BTreeMap<String, RuntimeTimerRecord>,
     events: VecDeque<HostRuntimeEvent>,
     exit_code: Option<i32>,
@@ -82,6 +83,14 @@ struct RuntimeTimerRecord {
 struct RuntimePortRecord {
     port: u16,
     protocol: HostRuntimePortProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeHttpServerRecord {
+    port: RuntimePortRecord,
+    kind: HostRuntimeHttpServerKind,
+    cwd: String,
+    entrypoint: String,
 }
 
 pub struct RuntimeHostCore<E: EngineAdapter> {
@@ -286,6 +295,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 clock_ms: 0,
                 next_port: 3000,
                 ports: BTreeMap::new(),
+                http_servers: BTreeMap::new(),
                 timers: BTreeMap::new(),
                 events: VecDeque::new(),
                 exit_code: None,
@@ -697,6 +707,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                         RuntimeHostError::RuntimeContextNotFound(context_id.into())
                     })?;
                     let existed = context.ports.remove(&port).is_some();
+                    context.http_servers.remove(&port);
                     if existed {
                         context
                             .events
@@ -717,23 +728,50 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     ports: context.ports.values().map(runtime_port_view).collect(),
                 })
             }
+            HostRuntimeCommand::HttpServePreview { port } => {
+                let server = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let port = allocate_runtime_port(context, port)?;
+                    let port_record = RuntimePortRecord {
+                        port,
+                        protocol: HostRuntimePortProtocol::Http,
+                    };
+                    context.ports.insert(port, port_record.clone());
+                    let server_record = RuntimeHttpServerRecord {
+                        port: port_record.clone(),
+                        kind: HostRuntimeHttpServerKind::Preview,
+                        cwd: context.process.cwd.clone(),
+                        entrypoint: context.process.entrypoint.clone(),
+                    };
+                    context.http_servers.insert(port, server_record.clone());
+                    context.events.push_back(HostRuntimeEvent::PortListen {
+                        port: runtime_port_view(&port_record),
+                    });
+                    runtime_http_server_view(&server_record)
+                };
+
+                Ok(HostRuntimeResponse::HttpServerListening { server })
+            }
             HostRuntimeCommand::HttpResolvePreview { request } => {
-                let (session_id, port) = {
+                let (session_id, server) = {
                     let context = self.runtime_contexts.get(context_id).ok_or_else(|| {
                         RuntimeHostError::RuntimeContextNotFound(context_id.into())
                     })?;
-                    let port = context
-                        .ports
+                    let server = context
+                        .http_servers
                         .get(&request.port)
                         .cloned()
-                        .ok_or(RuntimeHostError::PortNotListening(request.port))?;
-                    (context.session_id.clone(), port)
+                        .ok_or(RuntimeHostError::HttpServerNotFound(request.port))?;
+                    (context.session_id.clone(), server)
                 };
                 let request_hint =
                     self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
 
                 Ok(HostRuntimeResponse::PreviewRequestResolved {
-                    port: runtime_port_view(&port),
+                    server: runtime_http_server_view(&server),
+                    port: runtime_port_view(&server.port),
                     request: runtime_http_request_view(&request),
                     request_hint,
                 })
@@ -1176,6 +1214,15 @@ fn runtime_http_request_view(request: &HostRuntimeHttpRequest) -> HostRuntimeHtt
         method: request.method.clone(),
         relative_path: request.relative_path.clone(),
         search: request.search.clone(),
+    }
+}
+
+fn runtime_http_server_view(server: &RuntimeHttpServerRecord) -> HostRuntimeHttpServer {
+    HostRuntimeHttpServer {
+        port: runtime_port_view(&server.port),
+        kind: server.kind.clone(),
+        cwd: server.cwd.clone(),
+        entrypoint: server.entrypoint.clone(),
     }
 }
 

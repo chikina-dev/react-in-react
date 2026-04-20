@@ -74,6 +74,15 @@ export type HostRuntimeHttpRequest = {
   search: string;
 };
 
+export type HostRuntimeHttpServerKind = "preview";
+
+export type HostRuntimeHttpServer = {
+  port: HostRuntimePort;
+  kind: HostRuntimeHttpServerKind;
+  cwd: string;
+  entrypoint: string;
+};
+
 export type HostRuntimeTimerKind = "timeout" | "interval";
 
 export type HostRuntimeTimer = {
@@ -100,6 +109,7 @@ export type HostRuntimeCommand =
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
   | { kind: "port.listen"; port?: number | null; protocol: HostRuntimePortProtocol }
   | { kind: "port.close"; port: number }
+  | { kind: "http.serve-preview"; port?: number | null }
   | { kind: "http.resolve-preview"; request: HostRuntimeHttpRequest }
   | { kind: "timers.schedule"; delayMs: number; repeat: boolean }
   | { kind: "timers.clear"; timerId: string }
@@ -124,7 +134,12 @@ export type HostRuntimeResponse =
   | { kind: "port-closed"; port: number; existed: boolean }
   | { kind: "port-list"; ports: HostRuntimePort[] }
   | {
+      kind: "http-server-listening";
+      server: HostRuntimeHttpServer;
+    }
+  | {
       kind: "preview-request-resolved";
+      server: HostRuntimeHttpServer;
       port: HostRuntimePort;
       request: HostRuntimeHttpRequest;
       requestHint: HostPreviewRequestHint;
@@ -348,6 +363,7 @@ type HostRuntimeContextRecord = {
   clockMs: number;
   nextPort: number;
   ports: Map<number, HostRuntimePort>;
+  httpServers: Map<number, HostRuntimeHttpServer>;
   timers: Map<string, HostRuntimeTimer>;
   events: HostRuntimeEvent[];
   exitCode: number | null;
@@ -467,6 +483,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       clockMs: 0,
       nextPort: 3000,
       ports: new Map<number, HostRuntimePort>(),
+      httpServers: new Map<number, HostRuntimeHttpServer>(),
       timers: new Map<string, HostRuntimeTimer>(),
       events: [] as HostRuntimeEvent[],
       exitCode: null,
@@ -854,6 +871,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       }
       case "port.close": {
         const existed = context.ports.delete(command.port);
+        context.httpServers.delete(command.port);
         if (existed) {
           context.events.push({
             kind: "port-close",
@@ -871,14 +889,42 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "port-list",
           ports: [...context.ports.values()].sort((left, right) => left.port - right.port),
         };
+      case "http.serve-preview": {
+        const port =
+          command.port && command.port > 0 ? command.port : allocateMockRuntimePort(context);
+        if (context.ports.has(port)) {
+          throw new Error(`runtime port already in use: ${port}`);
+        }
+        const runtimePort: HostRuntimePort = {
+          port,
+          protocol: "http",
+        };
+        const server: HostRuntimeHttpServer = {
+          port: runtimePort,
+          kind: "preview",
+          cwd: context.process.cwd,
+          entrypoint: context.process.entrypoint,
+        };
+        context.ports.set(port, runtimePort);
+        context.httpServers.set(port, server);
+        context.events.push({
+          kind: "port-listen",
+          port: runtimePort,
+        });
+        return {
+          kind: "http-server-listening",
+          server,
+        };
+      }
       case "http.resolve-preview": {
-        const runtimePort = context.ports.get(command.request.port);
-        if (!runtimePort) {
-          throw new Error(`runtime port not listening: ${command.request.port}`);
+        const server = context.httpServers.get(command.request.port);
+        if (!server) {
+          throw new Error(`runtime http server not found: ${command.request.port}`);
         }
         return {
           kind: "preview-request-resolved",
-          port: runtimePort,
+          server,
+          port: server.port,
           request: { ...command.request },
           requestHint: await this.resolvePreviewRequestHint(
             context.sessionId,
@@ -1545,6 +1591,12 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "port.list":
         lines.push("command=port-list");
         break;
+      case "http.serve-preview":
+        lines.push("command=http-serve-preview");
+        if (command.port) {
+          lines.push(`port=${String(command.port)}`);
+        }
+        break;
       case "http.resolve-preview":
         lines.push("command=http-resolve-preview");
         lines.push(`port=${String(command.request.port)}`);
@@ -1642,7 +1694,12 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | { kind: "port-closed"; port: number; existed: boolean }
       | { kind: "port-list"; ports: HostRuntimePort[] }
       | {
+          kind: "http-server-listening";
+          server: HostRuntimeHttpServer;
+        }
+      | {
           kind: "preview-request-resolved";
+          server: HostRuntimeHttpServer;
           port: HostRuntimePort;
           request: HostRuntimeHttpRequest;
           requestHint: HostPreviewRequestHint;

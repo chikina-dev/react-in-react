@@ -160,6 +160,19 @@ pub struct HostRuntimeHttpRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeHttpServerKind {
+    Preview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeHttpServer {
+    pub port: HostRuntimePort,
+    pub kind: HostRuntimeHttpServerKind,
+    pub cwd: String,
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeEvent {
     Stdout {
         chunk: String,
@@ -277,6 +290,9 @@ pub enum HostRuntimeCommand {
         port: u16,
     },
     PortList,
+    HttpServePreview {
+        port: Option<u16>,
+    },
     HttpResolvePreview {
         request: HostRuntimeHttpRequest,
     },
@@ -342,7 +358,11 @@ pub enum HostRuntimeResponse {
     PortList {
         ports: Vec<HostRuntimePort>,
     },
+    HttpServerListening {
+        server: HostRuntimeHttpServer,
+    },
     PreviewRequestResolved {
+        server: HostRuntimeHttpServer,
         port: HostRuntimePort,
         request: HostRuntimeHttpRequest,
         request_hint: PreviewRequestHint,

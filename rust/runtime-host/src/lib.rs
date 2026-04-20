@@ -12,10 +12,10 @@ pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeHttpRequest, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
-    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
+    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
+    SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -312,9 +312,26 @@ mod tests {
         assert!(matches!(
             host.execute_runtime_command(
                 &runtime_context.context_id,
+                HostRuntimeCommand::HttpServePreview { port: Some(4200) },
+            ),
+            Ok(HostRuntimeResponse::HttpServerListening { server })
+                if server
+                    == HostRuntimeHttpServer {
+                        port: HostRuntimePort {
+                            port: 4200,
+                            protocol: HostRuntimePortProtocol::Http,
+                        },
+                        kind: HostRuntimeHttpServerKind::Preview,
+                        cwd: String::from("/workspace/src"),
+                        entrypoint: String::from("/workspace/src/main.tsx"),
+                    }
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
                 HostRuntimeCommand::HttpResolvePreview {
                     request: crate::protocol::HostRuntimeHttpRequest {
-                        port: 3000,
+                        port: 4200,
                         method: String::from("GET"),
                         relative_path: String::from("/src/main.tsx"),
                         search: String::from("?v=1"),
@@ -322,12 +339,23 @@ mod tests {
                 },
             ),
             Ok(HostRuntimeResponse::PreviewRequestResolved {
+                server,
                 port,
                 request,
                 request_hint,
-            }) if port
+            }) if server
+                == HostRuntimeHttpServer {
+                port: HostRuntimePort {
+                    port: 4200,
+                    protocol: HostRuntimePortProtocol::Http,
+                },
+                kind: HostRuntimeHttpServerKind::Preview,
+                cwd: String::from("/workspace/src"),
+                entrypoint: String::from("/workspace/src/main.tsx"),
+            }
+                && port
                 == HostRuntimePort {
-                port: 3000,
+                port: 4200,
                 protocol: HostRuntimePortProtocol::Http,
             }
                 && request.relative_path == "/src/main.tsx"
@@ -358,6 +386,12 @@ mod tests {
                         HostRuntimeEvent::PortListen {
                             port: HostRuntimePort {
                                 port: 4100,
+                                protocol: HostRuntimePortProtocol::Http,
+                            },
+                        },
+                        HostRuntimeEvent::PortListen {
+                            port: HostRuntimePort {
+                                port: 4200,
                                 protocol: HostRuntimePortProtocol::Http,
                             },
                         },

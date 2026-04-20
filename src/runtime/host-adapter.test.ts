@@ -659,9 +659,27 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.serve-preview",
+      port: 4200,
+    }),
+  ).resolves.toEqual({
+    kind: "http-server-listening",
+    server: {
+      port: {
+        port: 4200,
+        protocol: "http",
+      },
+      kind: "preview",
+      cwd: "/workspace/src",
+      entrypoint: "/workspace/src/server.ts",
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "http.resolve-preview",
       request: {
-        port: 3000,
+        port: 4200,
         method: "GET",
         relativePath: "/src/server.ts",
         search: "?v=1",
@@ -669,12 +687,21 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     }),
   ).resolves.toEqual({
     kind: "preview-request-resolved",
+    server: {
+      port: {
+        port: 4200,
+        protocol: "http",
+      },
+      kind: "preview",
+      cwd: "/workspace/src",
+      entrypoint: "/workspace/src/server.ts",
+    },
     port: {
-      port: 3000,
+      port: 4200,
       protocol: "http",
     },
     request: {
-      port: 3000,
+      port: 4200,
       method: "GET",
       relativePath: "/src/server.ts",
       search: "?v=1",
@@ -705,6 +732,13 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         kind: "port-listen",
         port: {
           port: 4100,
+          protocol: "http",
+        },
+      },
+      {
+        kind: "port-listen",
+        port: {
+          port: 4200,
           protocol: "http",
         },
       },
