@@ -800,7 +800,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 };
                 let request_hint =
                     self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
-                let response_descriptor = describe_preview_response(&request_hint);
+                let response_descriptor =
+                    describe_preview_response(&request_hint, request.method.as_str());
 
                 Ok(HostRuntimeResponse::PreviewRequestResolved {
                     server: runtime_http_server_view(&server),
@@ -1260,7 +1261,24 @@ fn runtime_http_server_view(server: &RuntimeHttpServerRecord) -> HostRuntimeHttp
     }
 }
 
-fn describe_preview_response(request_hint: &PreviewRequestHint) -> PreviewResponseDescriptor {
+fn describe_preview_response(
+    request_hint: &PreviewRequestHint,
+    request_method: &str,
+) -> PreviewResponseDescriptor {
+    let method = request_method.to_ascii_uppercase();
+    if method != "GET" && method != "HEAD" {
+        return PreviewResponseDescriptor {
+            kind: PreviewResponseKind::MethodNotAllowed,
+            workspace_path: None,
+            document_root: None,
+            hydrate_paths: Vec::new(),
+            status_code: 405,
+            content_type: Some(String::from("application/json; charset=utf-8")),
+            allow_methods: vec![String::from("GET"), String::from("HEAD")],
+            omit_body: false,
+        };
+    }
+
     let kind = match request_hint.kind {
         PreviewRequestKind::RootDocument => PreviewResponseKind::WorkspaceDocument,
         PreviewRequestKind::RootEntry => PreviewResponseKind::AppShell,
@@ -1274,11 +1292,78 @@ fn describe_preview_response(request_hint: &PreviewRequestHint) -> PreviewRespon
         PreviewRequestKind::WorkspaceAsset => PreviewResponseKind::WorkspaceAsset,
         PreviewRequestKind::NotFound => PreviewResponseKind::NotFound,
     };
+    let status_code = if matches!(kind, PreviewResponseKind::NotFound) {
+        404
+    } else {
+        200
+    };
+    let content_type = guess_preview_content_type(&kind, request_hint.workspace_path.as_deref());
+    let omit_body = method == "HEAD";
 
     PreviewResponseDescriptor {
         kind,
         workspace_path: request_hint.workspace_path.clone(),
         document_root: request_hint.document_root.clone(),
+        hydrate_paths: if omit_body {
+            Vec::new()
+        } else {
+            request_hint.hydrate_paths.clone()
+        },
+        status_code,
+        content_type,
+        allow_methods: if omit_body || method == "GET" {
+            Vec::new()
+        } else {
+            vec![String::from("GET"), String::from("HEAD")]
+        },
+        omit_body,
+    }
+}
+
+fn guess_preview_content_type(
+    kind: &PreviewResponseKind,
+    workspace_path: Option<&str>,
+) -> Option<String> {
+    match kind {
+        PreviewResponseKind::WorkspaceDocument
+        | PreviewResponseKind::AppShell
+        | PreviewResponseKind::HostManagedFallback => {
+            Some(String::from("text/html; charset=utf-8"))
+        }
+        PreviewResponseKind::RuntimeState
+        | PreviewResponseKind::WorkspaceState
+        | PreviewResponseKind::FileIndex
+        | PreviewResponseKind::DiagnosticsState
+        | PreviewResponseKind::MethodNotAllowed
+        | PreviewResponseKind::NotFound => Some(String::from("application/json; charset=utf-8")),
+        PreviewResponseKind::RuntimeStylesheet => Some(String::from("text/css; charset=utf-8")),
+        PreviewResponseKind::WorkspaceFile | PreviewResponseKind::WorkspaceAsset => workspace_path
+            .map(|path| {
+                let extension = path
+                    .rsplit_once('.')
+                    .map(|(_, suffix)| suffix.to_ascii_lowercase());
+
+                match extension.as_deref() {
+                    Some("html") => "text/html; charset=utf-8",
+                    Some("css") => "text/css; charset=utf-8",
+                    Some("js") | Some("mjs") | Some("cjs") | Some("jsx") => {
+                        "text/javascript; charset=utf-8"
+                    }
+                    Some("ts") | Some("tsx") => "text/plain; charset=utf-8",
+                    Some("json") => "application/json; charset=utf-8",
+                    Some("svg") => "image/svg+xml",
+                    Some("png") => "image/png",
+                    Some("jpg") | Some("jpeg") => "image/jpeg",
+                    Some("gif") => "image/gif",
+                    Some("webp") => "image/webp",
+                    Some("ico") => "image/x-icon",
+                    Some("woff") => "font/woff",
+                    Some("woff2") => "font/woff2",
+                    Some("txt") => "text/plain; charset=utf-8",
+                    _ => "application/octet-stream",
+                }
+                .to_string()
+            }),
     }
 }
 

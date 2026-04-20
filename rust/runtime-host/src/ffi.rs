@@ -1544,6 +1544,7 @@ fn render_preview_response_descriptor_json(descriptor: &PreviewResponseDescripto
         PreviewResponseKind::RuntimeStylesheet => "runtime-stylesheet",
         PreviewResponseKind::WorkspaceFile => "workspace-file",
         PreviewResponseKind::WorkspaceAsset => "workspace-asset",
+        PreviewResponseKind::MethodNotAllowed => "method-not-allowed",
         PreviewResponseKind::NotFound => "not-found",
     };
 
@@ -1557,10 +1558,24 @@ fn render_preview_response_descriptor_json(descriptor: &PreviewResponseDescripto
         .as_ref()
         .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".into());
+    let hydrate_paths = render_string_array_json(&descriptor.hydrate_paths);
+    let content_type = descriptor
+        .content_type
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+    let allow_methods = render_string_array_json(&descriptor.allow_methods);
 
     format!(
-        "{{\"kind\":\"{}\",\"workspacePath\":{},\"documentRoot\":{}}}",
-        kind, workspace_path, document_root
+        "{{\"kind\":\"{}\",\"workspacePath\":{},\"documentRoot\":{},\"hydratePaths\":{},\"statusCode\":{},\"contentType\":{},\"allowMethods\":{},\"omitBody\":{}}}",
+        kind,
+        workspace_path,
+        document_root,
+        hydrate_paths,
+        descriptor.status_code,
+        content_type,
+        allow_methods,
+        descriptor.omit_body
     )
 }
 

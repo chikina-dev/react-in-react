@@ -392,6 +392,64 @@ mod tests {
                         kind: PreviewResponseKind::WorkspaceAsset,
                         workspace_path: Some(String::from("/workspace/src/main.tsx")),
                         document_root: Some(String::from("/workspace")),
+                        hydrate_paths: vec![
+                            String::from("/workspace/package.json"),
+                            String::from("/workspace/src/main.tsx"),
+                        ],
+                        status_code: 200,
+                        content_type: Some(String::from("text/plain; charset=utf-8")),
+                        allow_methods: Vec::new(),
+                        omit_body: false,
+                    }
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::HttpResolvePreview {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("HEAD"),
+                        relative_path: String::from("/src/main.tsx"),
+                        search: String::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestResolved { response_descriptor, .. })
+                if response_descriptor
+                    == PreviewResponseDescriptor {
+                        kind: PreviewResponseKind::WorkspaceAsset,
+                        workspace_path: Some(String::from("/workspace/src/main.tsx")),
+                        document_root: Some(String::from("/workspace")),
+                        hydrate_paths: Vec::new(),
+                        status_code: 200,
+                        content_type: Some(String::from("text/plain; charset=utf-8")),
+                        allow_methods: Vec::new(),
+                        omit_body: true,
+                    }
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::HttpResolvePreview {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("POST"),
+                        relative_path: String::from("/src/main.tsx"),
+                        search: String::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestResolved { response_descriptor, .. })
+                if response_descriptor
+                    == PreviewResponseDescriptor {
+                        kind: PreviewResponseKind::MethodNotAllowed,
+                        workspace_path: None,
+                        document_root: None,
+                        hydrate_paths: Vec::new(),
+                        status_code: 405,
+                        content_type: Some(String::from("application/json; charset=utf-8")),
+                        allow_methods: vec![String::from("GET"), String::from("HEAD")],
+                        omit_body: false,
                     }
         ));
         assert!(matches!(

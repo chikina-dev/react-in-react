@@ -204,6 +204,11 @@ test("buildPreviewResponse prefers host-provided response descriptors", () => {
         kind: "workspace-document",
         workspacePath: "/workspace/dist/index.html",
         documentRoot: "/workspace/dist",
+        hydratePaths: ["/workspace/dist/index.html"],
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
       },
     },
   );
@@ -211,6 +216,60 @@ test("buildPreviewResponse prefers host-provided response descriptors", () => {
   expect(response.status).toBe(200);
   expect(response.headers["content-type"]).toContain("text/html");
   expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
+});
+
+test("buildPreviewResponse respects host-provided HEAD descriptors without hydrating body", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      method: "HEAD",
+      pathname: "/preview/session-1/3000/files/src/main.tsx",
+    },
+    {
+      ...createPreviewState(),
+      responseDescriptor: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/main.tsx",
+        documentRoot: "/workspace",
+        hydratePaths: [],
+        statusCode: 200,
+        contentType: "text/javascript; charset=utf-8",
+        allowMethods: [],
+        omitBody: true,
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toContain("text/javascript");
+  expect(response.body).toBe("");
+});
+
+test("buildPreviewResponse returns 405 from host-provided method-not-allowed descriptors", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      method: "POST",
+      pathname: "/preview/session-1/3000/files/src/main.tsx",
+    },
+    {
+      ...createPreviewState(),
+      responseDescriptor: {
+        kind: "method-not-allowed",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+        statusCode: 405,
+        contentType: "application/json; charset=utf-8",
+        allowMethods: ["GET", "HEAD"],
+        omitBody: false,
+      },
+    },
+  );
+
+  expect(response.status).toBe(405);
+  expect(response.headers.allow).toBe("GET, HEAD");
+  expect(response.body).toContain('"error":"Method not allowed"');
 });
 
 test("buildPreviewResponse serves workspace files from host-provided request hints", () => {

@@ -735,6 +735,55 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       kind: "workspace-asset",
       workspacePath: "/workspace/src/server.ts",
       documentRoot: "/workspace",
+      hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+      statusCode: 200,
+      contentType: "text/plain; charset=utf-8",
+      allowMethods: [],
+      omitBody: false,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.resolve-preview",
+      request: {
+        port: 4200,
+        method: "HEAD",
+        relativePath: "/src/server.ts",
+        search: "",
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "preview-request-resolved",
+    responseDescriptor: {
+      kind: "workspace-asset",
+      hydratePaths: [],
+      statusCode: 200,
+      contentType: "text/plain; charset=utf-8",
+      allowMethods: [],
+      omitBody: true,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.resolve-preview",
+      request: {
+        port: 4200,
+        method: "POST",
+        relativePath: "/src/server.ts",
+        search: "",
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "preview-request-resolved",
+    responseDescriptor: {
+      kind: "method-not-allowed",
+      hydratePaths: [],
+      statusCode: 405,
+      contentType: "application/json; charset=utf-8",
+      allowMethods: ["GET", "HEAD"],
+      omitBody: false,
     },
   });
 

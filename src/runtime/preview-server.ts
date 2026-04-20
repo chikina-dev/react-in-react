@@ -40,6 +40,11 @@ type PreviewServerState = {
   files: Map<string, WorkspaceFileRecord>;
 };
 
+type PreviewResponseMetadata = Pick<
+  HostPreviewResponseDescriptor,
+  "statusCode" | "contentType" | "allowMethods" | "omitBody"
+>;
+
 type PackageExportValue =
   | string
   | null
@@ -258,62 +263,73 @@ function buildPreviewResponseFromDescriptor(
   relativePath: string,
   descriptor: HostPreviewResponseDescriptor,
 ): VirtualHttpResponse {
-  switch (descriptor.kind) {
-    case "workspace-document": {
-      const response = buildHintedWorkspaceFileResponse(
-        preview,
-        descriptor.workspacePath,
-        descriptor.documentRoot,
-      );
-      return response ?? buildPreviewRootResponse(preview, request);
+  const response = (() => {
+    switch (descriptor.kind) {
+      case "workspace-document": {
+        const hintedResponse = buildHintedWorkspaceFileResponse(
+          preview,
+          descriptor.workspacePath,
+          descriptor.documentRoot,
+        );
+        return hintedResponse ?? buildPreviewRootResponse(preview, request);
+      }
+      case "app-shell":
+        return htmlResponse(
+          200,
+          renderPreviewAppShell({
+            title: preview.model.title,
+            entryUrl: buildPreviewUrlForWorkspaceFile(
+              descriptor.workspacePath,
+              preview,
+              "/workspace",
+            ),
+          }),
+        );
+      case "host-managed-fallback":
+        return buildPreviewRootResponse(preview, request);
+      case "runtime-state":
+        return previewReadyResponse(preview);
+      case "workspace-state":
+        return jsonResponse(200, preview.session);
+      case "file-index":
+        return jsonResponse(200, buildPreviewFileIndex(preview));
+      case "diagnostics-state":
+        return jsonResponse(200, buildPreviewDiagnostics(preview));
+      case "runtime-stylesheet":
+        return cssResponse(200, renderRuntimeStylesheet());
+      case "workspace-file": {
+        const hintedResponse = buildHintedWorkspaceFileResponse(
+          preview,
+          descriptor.workspacePath,
+          descriptor.documentRoot,
+        );
+        return hintedResponse ?? buildPreviewFileResponse(relativePath, preview);
+      }
+      case "workspace-asset": {
+        const hintedResponse = buildHintedWorkspaceFileResponse(
+          preview,
+          descriptor.workspacePath,
+          descriptor.documentRoot,
+        );
+        return (
+          hintedResponse ??
+          buildWorkspaceAssetResponse(relativePath, preview) ??
+          unsupportedPreviewPathResponse(request.pathname)
+        );
+      }
+      case "method-not-allowed":
+        return jsonResponse(405, {
+          error: "Method not allowed",
+          pathname: request.pathname,
+          method: request.method,
+          allowMethods: descriptor.allowMethods,
+        });
+      case "not-found":
+        return unsupportedPreviewPathResponse(request.pathname);
     }
-    case "app-shell":
-      return htmlResponse(
-        200,
-        renderPreviewAppShell({
-          title: preview.model.title,
-          entryUrl: buildPreviewUrlForWorkspaceFile(
-            descriptor.workspacePath,
-            preview,
-            "/workspace",
-          ),
-        }),
-      );
-    case "host-managed-fallback":
-      return buildPreviewRootResponse(preview, request);
-    case "runtime-state":
-      return previewReadyResponse(preview);
-    case "workspace-state":
-      return jsonResponse(200, preview.session);
-    case "file-index":
-      return jsonResponse(200, buildPreviewFileIndex(preview));
-    case "diagnostics-state":
-      return jsonResponse(200, buildPreviewDiagnostics(preview));
-    case "runtime-stylesheet":
-      return cssResponse(200, renderRuntimeStylesheet());
-    case "workspace-file": {
-      const response = buildHintedWorkspaceFileResponse(
-        preview,
-        descriptor.workspacePath,
-        descriptor.documentRoot,
-      );
-      return response ?? buildPreviewFileResponse(relativePath, preview);
-    }
-    case "workspace-asset": {
-      const response = buildHintedWorkspaceFileResponse(
-        preview,
-        descriptor.workspacePath,
-        descriptor.documentRoot,
-      );
-      return (
-        response ??
-        buildWorkspaceAssetResponse(relativePath, preview) ??
-        unsupportedPreviewPathResponse(request.pathname)
-      );
-    }
-    case "not-found":
-      return unsupportedPreviewPathResponse(request.pathname);
-  }
+  })();
+
+  return applyDescriptorMetadata(response, descriptor);
 }
 
 function buildPreviewResponseFromFallback(
@@ -359,6 +375,26 @@ function buildHintedWorkspaceFileResponse(
   }
 
   return buildWorkspaceFileResponse(file, preview, documentRoot);
+}
+
+function applyDescriptorMetadata(
+  response: VirtualHttpResponse,
+  descriptor: PreviewResponseMetadata,
+): VirtualHttpResponse {
+  const headers = { ...response.headers };
+  if (descriptor.contentType) {
+    headers["content-type"] = descriptor.contentType;
+  }
+  if (descriptor.allowMethods.length > 0) {
+    headers.allow = descriptor.allowMethods.join(", ");
+  }
+
+  return {
+    ...response,
+    status: descriptor.statusCode,
+    headers,
+    body: descriptor.omitBody ? "" : response.body,
+  };
 }
 
 function previewReadyResponse(preview: PreviewServerState): VirtualHttpResponse {

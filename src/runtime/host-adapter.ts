@@ -297,11 +297,21 @@ export type HostPreviewResponseDescriptor =
       kind: "workspace-document" | "workspace-file" | "workspace-asset";
       workspacePath: string;
       documentRoot: string;
+      hydratePaths: string[];
+      statusCode: number;
+      contentType: string | null;
+      allowMethods: string[];
+      omitBody: boolean;
     }
   | {
       kind: "app-shell";
       workspacePath: string;
       documentRoot: null;
+      hydratePaths: string[];
+      statusCode: number;
+      contentType: string | null;
+      allowMethods: string[];
+      omitBody: boolean;
     }
   | {
       kind:
@@ -311,9 +321,15 @@ export type HostPreviewResponseDescriptor =
         | "file-index"
         | "diagnostics-state"
         | "runtime-stylesheet"
+        | "method-not-allowed"
         | "not-found";
       workspacePath: null;
       documentRoot: null;
+      hydratePaths: string[];
+      statusCode: number;
+      contentType: string | null;
+      allowMethods: string[];
+      omitBody: boolean;
     };
 
 export interface RuntimeHostAdapter {
@@ -407,25 +423,56 @@ type HostRuntimeContextRecord = {
 
 function describeMockPreviewResponse(
   requestHint: HostPreviewRequestHint,
+  method = "GET",
 ): HostPreviewResponseDescriptor {
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") {
+    return {
+      kind: "method-not-allowed",
+      workspacePath: null,
+      documentRoot: null,
+      hydratePaths: [],
+      statusCode: 405,
+      contentType: "application/json; charset=utf-8",
+      allowMethods: ["GET", "HEAD"],
+      omitBody: false,
+    };
+  }
+
+  const omitBody = normalizedMethod === "HEAD";
   switch (requestHint.kind) {
     case "root-document":
       return {
         kind: "workspace-document",
         workspacePath: requestHint.workspacePath,
         documentRoot: requestHint.documentRoot,
+        hydratePaths: omitBody ? [] : requestHint.hydratePaths,
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody,
       };
     case "root-entry":
       return {
         kind: "app-shell",
         workspacePath: requestHint.workspacePath,
         documentRoot: null,
+        hydratePaths: omitBody ? [] : requestHint.hydratePaths,
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody,
       };
     case "fallback-root":
       return {
         kind: "host-managed-fallback",
         workspacePath: null,
         documentRoot: null,
+        hydratePaths: omitBody ? [] : requestHint.hydratePaths,
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody,
       };
     case "runtime-state":
     case "workspace-state":
@@ -437,6 +484,14 @@ function describeMockPreviewResponse(
         kind: requestHint.kind,
         workspacePath: null,
         documentRoot: null,
+        hydratePaths: omitBody ? [] : requestHint.hydratePaths,
+        statusCode: requestHint.kind === "not-found" ? 404 : 200,
+        contentType:
+          requestHint.kind === "runtime-stylesheet"
+            ? "text/css; charset=utf-8"
+            : "application/json; charset=utf-8",
+        allowMethods: [],
+        omitBody,
       };
     case "workspace-file":
     case "workspace-asset":
@@ -444,6 +499,11 @@ function describeMockPreviewResponse(
         kind: requestHint.kind,
         workspacePath: requestHint.workspacePath,
         documentRoot: requestHint.documentRoot,
+        hydratePaths: omitBody ? [] : requestHint.hydratePaths,
+        statusCode: 200,
+        contentType: guessContentType(requestHint.workspacePath),
+        allowMethods: [],
+        omitBody,
       };
   }
 }
@@ -1032,7 +1092,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           port: server.port,
           request: { ...command.request },
           requestHint,
-          responseDescriptor: describeMockPreviewResponse(requestHint),
+          responseDescriptor: describeMockPreviewResponse(requestHint, command.request.method),
         };
       }
       case "timers.schedule": {

@@ -327,6 +327,11 @@ async function runSession(
             kind: "host-managed-fallback",
             workspacePath: null,
             documentRoot: null,
+            hydratePaths: [],
+            statusCode: 200,
+            contentType: "text/html; charset=utf-8",
+            allowMethods: [],
+            omitBody: false,
           },
     host: bootSummary,
     run: {
@@ -661,7 +666,11 @@ async function resolvePreviewHttpResponse(
         ? requestHintResponse.responseDescriptor
         : null;
     const files =
-      record && requestHint ? await ensurePreviewFiles(record, requestHint.hydratePaths) : null;
+      record && responseDescriptor
+        ? await ensurePreviewFiles(record, responseDescriptor.hydratePaths)
+        : record && requestHint
+          ? await ensurePreviewFiles(record, requestHint.hydratePaths)
+          : null;
 
     return buildPreviewResponse(
       request,

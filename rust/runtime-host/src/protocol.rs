@@ -466,6 +466,7 @@ pub enum PreviewResponseKind {
     RuntimeStylesheet,
     WorkspaceFile,
     WorkspaceAsset,
+    MethodNotAllowed,
     NotFound,
 }
 
@@ -474,4 +475,9 @@ pub struct PreviewResponseDescriptor {
     pub kind: PreviewResponseKind,
     pub workspace_path: Option<String>,
     pub document_root: Option<String>,
+    pub hydrate_paths: Vec<String>,
+    pub status_code: u16,
+    pub content_type: Option<String>,
+    pub allow_methods: Vec<String>,
+    pub omit_body: bool,
 }
