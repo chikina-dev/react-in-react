@@ -6,9 +6,10 @@ use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeHttpRequest, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
+    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -62,6 +63,8 @@ struct RuntimeContextRecord {
     session_id: String,
     process: HostProcessInfo,
     clock_ms: u64,
+    next_port: u16,
+    ports: BTreeMap<u16, RuntimePortRecord>,
     timers: BTreeMap<String, RuntimeTimerRecord>,
     events: VecDeque<HostRuntimeEvent>,
     exit_code: Option<i32>,
@@ -73,6 +76,12 @@ struct RuntimeTimerRecord {
     kind: HostRuntimeTimerKind,
     delay_ms: u64,
     due_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimePortRecord {
+    port: u16,
+    protocol: HostRuntimePortProtocol,
 }
 
 pub struct RuntimeHostCore<E: EngineAdapter> {
@@ -275,6 +284,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 session_id: session_id.to_string(),
                 process: process.clone(),
                 clock_ms: 0,
+                next_port: 3000,
+                ports: BTreeMap::new(),
                 timers: BTreeMap::new(),
                 events: VecDeque::new(),
                 exit_code: None,
@@ -660,6 +671,72 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 };
 
                 Ok(HostRuntimeResponse::RuntimeEvents { events })
+            }
+            HostRuntimeCommand::PortListen { port, protocol } => {
+                let port = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let port = allocate_runtime_port(context, port)?;
+                    let port_record = RuntimePortRecord {
+                        port,
+                        protocol: protocol.clone(),
+                    };
+                    context.ports.insert(port, port_record.clone());
+                    context.events.push_back(HostRuntimeEvent::PortListen {
+                        port: runtime_port_view(&port_record),
+                    });
+                    runtime_port_view(&port_record)
+                };
+
+                Ok(HostRuntimeResponse::PortListening { port })
+            }
+            HostRuntimeCommand::PortClose { port } => {
+                let existed = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let existed = context.ports.remove(&port).is_some();
+                    if existed {
+                        context
+                            .events
+                            .push_back(HostRuntimeEvent::PortClose { port });
+                    }
+                    existed
+                };
+
+                Ok(HostRuntimeResponse::PortClosed { port, existed })
+            }
+            HostRuntimeCommand::PortList => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::PortList {
+                    ports: context.ports.values().map(runtime_port_view).collect(),
+                })
+            }
+            HostRuntimeCommand::HttpResolvePreview { request } => {
+                let (session_id, port) = {
+                    let context = self.runtime_contexts.get(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let port = context
+                        .ports
+                        .get(&request.port)
+                        .cloned()
+                        .ok_or(RuntimeHostError::PortNotListening(request.port))?;
+                    (context.session_id.clone(), port)
+                };
+                let request_hint =
+                    self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
+
+                Ok(HostRuntimeResponse::PreviewRequestResolved {
+                    port: runtime_port_view(&port),
+                    request: runtime_http_request_view(&request),
+                    request_hint,
+                })
             }
             HostRuntimeCommand::TimerSchedule { delay_ms, repeat } => {
                 let timer = {
@@ -1084,6 +1161,41 @@ fn runtime_timer_view(timer: &RuntimeTimerRecord) -> HostRuntimeTimer {
         delay_ms: timer.delay_ms,
         due_at_ms: timer.due_at_ms,
     }
+}
+
+fn runtime_port_view(port: &RuntimePortRecord) -> HostRuntimePort {
+    HostRuntimePort {
+        port: port.port,
+        protocol: port.protocol.clone(),
+    }
+}
+
+fn runtime_http_request_view(request: &HostRuntimeHttpRequest) -> HostRuntimeHttpRequest {
+    HostRuntimeHttpRequest {
+        port: request.port,
+        method: request.method.clone(),
+        relative_path: request.relative_path.clone(),
+        search: request.search.clone(),
+    }
+}
+
+fn allocate_runtime_port(
+    context: &mut RuntimeContextRecord,
+    requested: Option<u16>,
+) -> RuntimeHostResult<u16> {
+    if let Some(port) = requested.filter(|port| *port > 0) {
+        if context.ports.contains_key(&port) {
+            return Err(RuntimeHostError::PortAlreadyInUse(port));
+        }
+        return Ok(port);
+    }
+
+    let mut candidate = context.next_port.max(3000);
+    while context.ports.contains_key(&candidate) {
+        candidate = candidate.saturating_add(1);
+    }
+    context.next_port = candidate.saturating_add(1);
+    Ok(candidate)
 }
 
 fn advance_runtime_timers(

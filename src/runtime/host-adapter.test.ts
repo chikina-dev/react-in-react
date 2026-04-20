@@ -614,6 +614,130 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "port.listen",
+      protocol: "http",
+    }),
+  ).resolves.toEqual({
+    kind: "port-listening",
+    port: {
+      port: 3000,
+      protocol: "http",
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "port.listen",
+      port: 4100,
+      protocol: "http",
+    }),
+  ).resolves.toEqual({
+    kind: "port-listening",
+    port: {
+      port: 4100,
+      protocol: "http",
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "port.list",
+    }),
+  ).resolves.toEqual({
+    kind: "port-list",
+    ports: [
+      {
+        port: 3000,
+        protocol: "http",
+      },
+      {
+        port: 4100,
+        protocol: "http",
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.resolve-preview",
+      request: {
+        port: 3000,
+        method: "GET",
+        relativePath: "/src/server.ts",
+        search: "?v=1",
+      },
+    }),
+  ).resolves.toEqual({
+    kind: "preview-request-resolved",
+    port: {
+      port: 3000,
+      protocol: "http",
+    },
+    request: {
+      port: 3000,
+      method: "GET",
+      relativePath: "/src/server.ts",
+      search: "?v=1",
+    },
+    requestHint: {
+      kind: "workspace-asset",
+      workspacePath: "/workspace/src/server.ts",
+      documentRoot: "/workspace",
+      hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-events",
+    events: [
+      {
+        kind: "port-listen",
+        port: {
+          port: 3000,
+          protocol: "http",
+        },
+      },
+      {
+        kind: "port-listen",
+        port: {
+          port: 4100,
+          protocol: "http",
+        },
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "port.close",
+      port: 3000,
+    }),
+  ).resolves.toEqual({
+    kind: "port-closed",
+    port: 3000,
+    existed: true,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-events",
+    events: [
+      {
+        kind: "port-close",
+        port: 3000,
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "timers.schedule",
       delayMs: 50,
       repeat: false,

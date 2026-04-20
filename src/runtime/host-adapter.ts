@@ -56,7 +56,23 @@ export type HostRuntimeEvent =
   | { kind: "stdout"; chunk: string }
   | { kind: "stderr"; chunk: string }
   | { kind: "console"; level: HostRuntimeConsoleLevel; line: string }
-  | { kind: "process-exit"; code: number };
+  | { kind: "process-exit"; code: number }
+  | { kind: "port-listen"; port: HostRuntimePort }
+  | { kind: "port-close"; port: number };
+
+export type HostRuntimePortProtocol = "http";
+
+export type HostRuntimePort = {
+  port: number;
+  protocol: HostRuntimePortProtocol;
+};
+
+export type HostRuntimeHttpRequest = {
+  port: number;
+  method: string;
+  relativePath: string;
+  search: string;
+};
 
 export type HostRuntimeTimerKind = "timeout" | "interval";
 
@@ -72,6 +88,7 @@ export type HostRuntimeCommand =
       kind:
         | "runtime.describe"
         | "runtime.drain-events"
+        | "port.list"
         | "timers.list"
         | "process.info"
         | "process.status"
@@ -81,6 +98,9 @@ export type HostRuntimeCommand =
     }
   | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
+  | { kind: "port.listen"; port?: number | null; protocol: HostRuntimePortProtocol }
+  | { kind: "port.close"; port: number }
+  | { kind: "http.resolve-preview"; request: HostRuntimeHttpRequest }
   | { kind: "timers.schedule"; delayMs: number; repeat: boolean }
   | { kind: "timers.clear"; timerId: string }
   | { kind: "timers.advance"; elapsedMs: number }
@@ -100,6 +120,15 @@ export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "event-queued"; queueLen: number }
   | { kind: "runtime-events"; events: HostRuntimeEvent[] }
+  | { kind: "port-listening"; port: HostRuntimePort }
+  | { kind: "port-closed"; port: number; existed: boolean }
+  | { kind: "port-list"; ports: HostRuntimePort[] }
+  | {
+      kind: "preview-request-resolved";
+      port: HostRuntimePort;
+      request: HostRuntimeHttpRequest;
+      requestHint: HostPreviewRequestHint;
+    }
   | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
   | { kind: "timer-cleared"; timerId: string; existed: boolean }
   | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
@@ -317,6 +346,8 @@ type HostRuntimeContextRecord = {
   sessionId: string;
   process: HostProcessInfo;
   clockMs: number;
+  nextPort: number;
+  ports: Map<number, HostRuntimePort>;
   timers: Map<string, HostRuntimeTimer>;
   events: HostRuntimeEvent[];
   exitCode: number | null;
@@ -434,6 +465,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       sessionId,
       process,
       clockMs: 0,
+      nextPort: 3000,
+      ports: new Map<number, HostRuntimePort>(),
       timers: new Map<string, HostRuntimeTimer>(),
       events: [] as HostRuntimeEvent[],
       exitCode: null,
@@ -797,6 +830,60 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         return {
           kind: "runtime-events",
           events,
+        };
+      }
+      case "port.listen": {
+        const port =
+          command.port && command.port > 0 ? command.port : allocateMockRuntimePort(context);
+        if (context.ports.has(port)) {
+          throw new Error(`runtime port already in use: ${port}`);
+        }
+        const runtimePort: HostRuntimePort = {
+          port,
+          protocol: command.protocol,
+        };
+        context.ports.set(port, runtimePort);
+        context.events.push({
+          kind: "port-listen",
+          port: runtimePort,
+        });
+        return {
+          kind: "port-listening",
+          port: runtimePort,
+        };
+      }
+      case "port.close": {
+        const existed = context.ports.delete(command.port);
+        if (existed) {
+          context.events.push({
+            kind: "port-close",
+            port: command.port,
+          });
+        }
+        return {
+          kind: "port-closed",
+          port: command.port,
+          existed,
+        };
+      }
+      case "port.list":
+        return {
+          kind: "port-list",
+          ports: [...context.ports.values()].sort((left, right) => left.port - right.port),
+        };
+      case "http.resolve-preview": {
+        const runtimePort = context.ports.get(command.request.port);
+        if (!runtimePort) {
+          throw new Error(`runtime port not listening: ${command.request.port}`);
+        }
+        return {
+          kind: "preview-request-resolved",
+          port: runtimePort,
+          request: { ...command.request },
+          requestHint: await this.resolvePreviewRequestHint(
+            context.sessionId,
+            command.request.relativePath,
+          ),
         };
       }
       case "timers.schedule": {
@@ -1444,6 +1531,27 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.drain-events":
         lines.push("command=runtime-drain-events");
         break;
+      case "port.listen":
+        lines.push("command=port-listen");
+        lines.push(`protocol=${command.protocol}`);
+        if (command.port) {
+          lines.push(`port=${String(command.port)}`);
+        }
+        break;
+      case "port.close":
+        lines.push("command=port-close");
+        lines.push(`port=${String(command.port)}`);
+        break;
+      case "port.list":
+        lines.push("command=port-list");
+        break;
+      case "http.resolve-preview":
+        lines.push("command=http-resolve-preview");
+        lines.push(`port=${String(command.request.port)}`);
+        lines.push(`method=${command.request.method}`);
+        lines.push(`relative_path=${encodeHex(command.request.relativePath)}`);
+        lines.push(`search=${encodeHex(command.request.search)}`);
+        break;
       case "timers.schedule":
         lines.push("command=timers-schedule");
         lines.push(`delay_ms=${String(command.delayMs)}`);
@@ -1530,6 +1638,15 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "event-queued"; queueLen: number }
       | { kind: "runtime-events"; events: HostRuntimeEvent[] }
+      | { kind: "port-listening"; port: HostRuntimePort }
+      | { kind: "port-closed"; port: number; existed: boolean }
+      | { kind: "port-list"; ports: HostRuntimePort[] }
+      | {
+          kind: "preview-request-resolved";
+          port: HostRuntimePort;
+          request: HostRuntimeHttpRequest;
+          requestHint: HostPreviewRequestHint;
+        }
       | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
       | { kind: "timer-cleared"; timerId: string; existed: boolean }
       | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
@@ -1734,6 +1851,15 @@ function advanceMockRuntimeTimers(context: HostRuntimeContextRecord): HostRuntim
   }
 
   return fired;
+}
+
+function allocateMockRuntimePort(context: HostRuntimeContextRecord): number {
+  let candidate = Math.max(context.nextPort, 3000);
+  while (context.ports.has(candidate)) {
+    candidate += 1;
+  }
+  context.nextPort = candidate + 1;
+  return candidate;
 }
 
 function collectMockPreviewHydrationPaths(files: Map<string, WorkspaceFileRecord>): string[] {

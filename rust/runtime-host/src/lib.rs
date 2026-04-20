@@ -12,9 +12,10 @@ pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeHttpRequest, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
+    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -267,6 +268,116 @@ mod tests {
                             chunk: String::from("watch out"),
                         },
                     ]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PortListen {
+                    port: None,
+                    protocol: HostRuntimePortProtocol::Http,
+                },
+            ),
+            Ok(HostRuntimeResponse::PortListening { port })
+                if port.port == 3000 && port.protocol == HostRuntimePortProtocol::Http
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PortListen {
+                    port: Some(4100),
+                    protocol: HostRuntimePortProtocol::Http,
+                },
+            ),
+            Ok(HostRuntimeResponse::PortListening { port })
+                if port.port == 4100 && port.protocol == HostRuntimePortProtocol::Http
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PortList,
+            ),
+            Ok(HostRuntimeResponse::PortList { ports })
+                if ports
+                    == vec![
+                        HostRuntimePort {
+                            port: 3000,
+                            protocol: HostRuntimePortProtocol::Http,
+                        },
+                        HostRuntimePort {
+                            port: 4100,
+                            protocol: HostRuntimePortProtocol::Http,
+                        },
+                    ]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::HttpResolvePreview {
+                    request: crate::protocol::HostRuntimeHttpRequest {
+                        port: 3000,
+                        method: String::from("GET"),
+                        relative_path: String::from("/src/main.tsx"),
+                        search: String::from("?v=1"),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestResolved {
+                port,
+                request,
+                request_hint,
+            }) if port
+                == HostRuntimePort {
+                port: 3000,
+                protocol: HostRuntimePortProtocol::Http,
+            }
+                && request.relative_path == "/src/main.tsx"
+                && request.search == "?v=1"
+                && request_hint.kind == crate::protocol::PreviewRequestKind::WorkspaceAsset
+                && request_hint.workspace_path == Some(String::from("/workspace/src/main.tsx"))
+                && request_hint.document_root == Some(String::from("/workspace"))
+                && request_hint.hydrate_paths
+                    == vec![
+                        String::from("/workspace/package.json"),
+                        String::from("/workspace/src/main.tsx"),
+                    ]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DrainEvents,
+            ),
+            Ok(HostRuntimeResponse::RuntimeEvents { events })
+                if events
+                    == vec![
+                        HostRuntimeEvent::PortListen {
+                            port: HostRuntimePort {
+                                port: 3000,
+                                protocol: HostRuntimePortProtocol::Http,
+                            },
+                        },
+                        HostRuntimeEvent::PortListen {
+                            port: HostRuntimePort {
+                                port: 4100,
+                                protocol: HostRuntimePortProtocol::Http,
+                            },
+                        },
+                    ]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PortClose { port: 3000 },
+            ),
+            Ok(HostRuntimeResponse::PortClosed { port, existed })
+                if port == 3000 && existed
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DrainEvents,
+            ),
+            Ok(HostRuntimeResponse::RuntimeEvents { events })
+                if events == vec![HostRuntimeEvent::PortClose { port: 3000 }]
         ));
         assert!(matches!(
             host.execute_runtime_command(

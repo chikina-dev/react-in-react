@@ -11,6 +11,8 @@ pub enum RuntimeHostError {
     SessionNotFound(String),
     RuntimeContextNotFound(String),
     FileNotFound(String),
+    PortAlreadyInUse(u16),
+    PortNotListening(u16),
     ScriptNotFound(String),
     NodeEntrypointRequired,
     EntrypointNotFound(String),
@@ -35,6 +37,8 @@ impl Display for RuntimeHostError {
                 write!(f, "runtime context not found: {context_id}")
             }
             Self::FileNotFound(path) => write!(f, "workspace file not found: {path}"),
+            Self::PortAlreadyInUse(port) => write!(f, "runtime port already in use: {port}"),
+            Self::PortNotListening(port) => write!(f, "runtime port not listening: {port}"),
             Self::ScriptNotFound(script) => write!(f, "script not found: {script}"),
             Self::NodeEntrypointRequired => write!(f, "node entrypoint is required"),
             Self::EntrypointNotFound(path) => write!(f, "entrypoint not found: {path}"),

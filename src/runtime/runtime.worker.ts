@@ -284,16 +284,41 @@ async function runSession(
     return;
   }
 
-  const port = 3000;
+  const portResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
+    kind: "port.listen",
+    protocol: "http",
+  });
+  const port = portResponse.kind === "port-listening" ? portResponse.port.port : 3000;
+  await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
   const url = `/preview/${sessionId}/${port}/`;
   const model = buildPreviewModel(record.session, runPlan);
+  const rootRequestHintResponse = await hostAdapter.executeRuntimeCommand(
+    runtimeContext.contextId,
+    {
+      kind: "http.resolve-preview",
+      request: {
+        port,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+      },
+    },
+  );
 
   record.preview = {
     pid,
     port,
     url,
     model,
-    rootRequestHint: await hostAdapter.resolvePreviewRequestHint(sessionId, "/"),
+    rootRequestHint:
+      rootRequestHintResponse.kind === "preview-request-resolved"
+        ? rootRequestHintResponse.requestHint
+        : {
+            kind: "fallback-root",
+            workspacePath: null,
+            documentRoot: null,
+            hydratePaths: [],
+          },
     host: bootSummary,
     run: {
       cwd: runPlan.cwd,
@@ -356,6 +381,22 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
 
   if (contextId) {
     const hostAdapter = await hostAdapterPromise;
+    const portsResponse = await hostAdapter
+      .executeRuntimeCommand(contextId, {
+        kind: "port.list",
+      })
+      .catch(() => null);
+    if (portsResponse?.kind === "port-list") {
+      for (const port of portsResponse.ports) {
+        await hostAdapter
+          .executeRuntimeCommand(contextId, {
+            kind: "port.close",
+            port: port.port,
+          })
+          .catch(() => undefined);
+      }
+    }
+    await flushRuntimeEvents(hostAdapter, sessionId, process.pid, contextId).catch(() => undefined);
     await hostAdapter
       .executeRuntimeCommand(contextId, {
         kind: "process.exit",
@@ -460,6 +501,16 @@ async function flushRuntimeEvents(
         break;
       case "console":
         break;
+      case "port-listen":
+        await emitStdout(
+          sessionId,
+          pid,
+          `[port] ${event.port.protocol} ${event.port.port} listening`,
+        );
+        break;
+      case "port-close":
+        await emitStdout(sessionId, pid, `[port] ${event.port} closed`);
+        break;
     }
   }
 }
@@ -562,12 +613,24 @@ async function resolvePreviewHttpResponse(
 ): Promise<VirtualHttpResponse> {
   if (isPreviewPath(request.pathname)) {
     const hostAdapter = await hostAdapterPromise;
-    const requestHint = record
-      ? await hostAdapter.resolvePreviewRequestHint(
-          record.session.sessionId,
-          getPreviewRelativePath(request),
-        )
-      : null;
+    const requestHintResponse =
+      record?.preview && record.runtimeContext
+        ? await hostAdapter
+            .executeRuntimeCommand(record.runtimeContext.contextId, {
+              kind: "http.resolve-preview",
+              request: {
+                port: request.port,
+                method: request.method,
+                relativePath: getPreviewRelativePath(request),
+                search: request.search,
+              },
+            })
+            .catch(() => null)
+        : null;
+    const requestHint =
+      requestHintResponse?.kind === "preview-request-resolved"
+        ? requestHintResponse.requestHint
+        : null;
     const files =
       record && requestHint ? await ensurePreviewFiles(record, requestHint.hydratePaths) : null;
 

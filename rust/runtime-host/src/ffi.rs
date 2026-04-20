@@ -6,8 +6,9 @@ use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
     HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
-    HostRuntimeContext, HostRuntimeEvent, HostRuntimeResponse, HostRuntimeStdioStream,
-    HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
+    HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimePort,
+    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -791,6 +792,37 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
             values: parse_hex_path_list(fields.get("values").map(String::as_str).unwrap_or(""))?,
         }),
         "runtime-drain-events" => Ok(HostRuntimeCommand::DrainEvents),
+        "port-listen" => Ok(HostRuntimeCommand::PortListen {
+            port: fields
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port > 0),
+            protocol: HostRuntimePortProtocol::Http,
+        }),
+        "port-close" => Ok(HostRuntimeCommand::PortClose {
+            port: fields
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(0),
+        }),
+        "port-list" => Ok(HostRuntimeCommand::PortList),
+        "http-resolve-preview" => Ok(HostRuntimeCommand::HttpResolvePreview {
+            request: HostRuntimeHttpRequest {
+                port: fields
+                    .get("port")
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .unwrap_or(0),
+                method: required_field(fields, "method").unwrap_or_else(|| "GET".into()),
+                relative_path: match required_field(fields, "relative_path") {
+                    Some(encoded) => decode_hex(&encoded)?,
+                    None => "/".into(),
+                },
+                search: match required_field(fields, "search") {
+                    Some(encoded) => decode_hex(&encoded)?,
+                    None => String::new(),
+                },
+            },
+        }),
         "timers-schedule" => Ok(HostRuntimeCommand::TimerSchedule {
             delay_ms: parse_u64_field(fields, "delay_ms"),
             repeat: fields
@@ -1085,6 +1117,28 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-events\",\"events\":{}}}",
             render_runtime_events_json(events)
         ),
+        HostRuntimeResponse::PortListening { port } => format!(
+            "{{\"kind\":\"port-listening\",\"port\":{}}}",
+            render_runtime_port_json(port)
+        ),
+        HostRuntimeResponse::PortClosed { port, existed } => format!(
+            "{{\"kind\":\"port-closed\",\"port\":{},\"existed\":{}}}",
+            port, existed
+        ),
+        HostRuntimeResponse::PortList { ports } => format!(
+            "{{\"kind\":\"port-list\",\"ports\":{}}}",
+            render_runtime_ports_json(ports)
+        ),
+        HostRuntimeResponse::PreviewRequestResolved {
+            port,
+            request,
+            request_hint,
+        } => format!(
+            "{{\"kind\":\"preview-request-resolved\",\"port\":{},\"request\":{},\"requestHint\":{}}}",
+            render_runtime_port_json(port),
+            render_runtime_http_request_json(request),
+            render_preview_request_hint_json(request_hint)
+        ),
         HostRuntimeResponse::TimerScheduled { timer } => format!(
             "{{\"kind\":\"timer-scheduled\",\"timer\":{}}}",
             render_runtime_timer_json(timer)
@@ -1233,7 +1287,42 @@ fn render_runtime_event_json(event: &HostRuntimeEvent) -> String {
         HostRuntimeEvent::ProcessExit { code } => {
             format!("{{\"kind\":\"process-exit\",\"code\":{code}}}")
         }
+        HostRuntimeEvent::PortListen { port } => format!(
+            "{{\"kind\":\"port-listen\",\"port\":{}}}",
+            render_runtime_port_json(port)
+        ),
+        HostRuntimeEvent::PortClose { port } => {
+            format!("{{\"kind\":\"port-close\",\"port\":{port}}}")
+        }
     }
+}
+
+fn render_runtime_port_json(port: &HostRuntimePort) -> String {
+    let protocol = match port.protocol {
+        HostRuntimePortProtocol::Http => "http",
+    };
+
+    format!("{{\"port\":{},\"protocol\":\"{}\"}}", port.port, protocol,)
+}
+
+fn render_runtime_http_request_json(request: &HostRuntimeHttpRequest) -> String {
+    format!(
+        "{{\"port\":{},\"method\":\"{}\",\"relativePath\":\"{}\",\"search\":\"{}\"}}",
+        request.port,
+        escape_json(&request.method),
+        escape_json(&request.relative_path),
+        escape_json(&request.search),
+    )
+}
+
+fn render_runtime_ports_json(ports: &[HostRuntimePort]) -> String {
+    let items = ports
+        .iter()
+        .map(render_runtime_port_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
 }
 
 fn render_error_json(message: &str) -> String {

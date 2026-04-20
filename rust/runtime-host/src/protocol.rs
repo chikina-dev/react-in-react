@@ -127,6 +127,11 @@ pub enum HostRuntimeConsoleLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimePortProtocol {
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeTimerKind {
     Timeout,
     Interval,
@@ -138,6 +143,20 @@ pub struct HostRuntimeTimer {
     pub kind: HostRuntimeTimerKind,
     pub delay_ms: u64,
     pub due_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePort {
+    pub port: u16,
+    pub protocol: HostRuntimePortProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeHttpRequest {
+    pub port: u16,
+    pub method: String,
+    pub relative_path: String,
+    pub search: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +173,12 @@ pub enum HostRuntimeEvent {
     },
     ProcessExit {
         code: i32,
+    },
+    PortListen {
+        port: HostRuntimePort,
+    },
+    PortClose {
+        port: u16,
     },
 }
 
@@ -244,6 +269,17 @@ pub enum HostRuntimeCommand {
         values: Vec<String>,
     },
     DrainEvents,
+    PortListen {
+        port: Option<u16>,
+        protocol: HostRuntimePortProtocol,
+    },
+    PortClose {
+        port: u16,
+    },
+    PortList,
+    HttpResolvePreview {
+        request: HostRuntimeHttpRequest,
+    },
     TimerSchedule {
         delay_ms: u64,
         repeat: bool,
@@ -295,6 +331,21 @@ pub enum HostRuntimeResponse {
     },
     RuntimeEvents {
         events: Vec<HostRuntimeEvent>,
+    },
+    PortListening {
+        port: HostRuntimePort,
+    },
+    PortClosed {
+        port: u16,
+        existed: bool,
+    },
+    PortList {
+        ports: Vec<HostRuntimePort>,
+    },
+    PreviewRequestResolved {
+        port: HostRuntimePort,
+        request: HostRuntimeHttpRequest,
+        request_hint: PreviewRequestHint,
     },
     TimerScheduled {
         timer: HostRuntimeTimer,
