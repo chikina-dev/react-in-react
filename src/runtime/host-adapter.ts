@@ -49,8 +49,28 @@ export type HostRuntimeBindings = {
   builtins: HostRuntimeBuiltinSpec[];
 };
 
+export type HostRuntimeTimerKind = "timeout" | "interval";
+
+export type HostRuntimeTimer = {
+  timerId: string;
+  kind: HostRuntimeTimerKind;
+  delayMs: number;
+  dueAtMs: number;
+};
+
 export type HostRuntimeCommand =
-  | { kind: "runtime.describe" | "process.info" | "process.cwd" | "process.argv" | "process.env" }
+  | {
+      kind:
+        | "runtime.describe"
+        | "timers.list"
+        | "process.info"
+        | "process.cwd"
+        | "process.argv"
+        | "process.env";
+    }
+  | { kind: "timers.schedule"; delayMs: number; repeat: boolean }
+  | { kind: "timers.clear"; timerId: string }
+  | { kind: "timers.advance"; elapsedMs: number }
   | { kind: "process.chdir"; path: string }
   | { kind: "path.resolve" | "path.join"; segments: string[] }
   | { kind: "path.dirname" | "path.basename" | "path.extname" | "path.normalize"; path: string }
@@ -64,6 +84,10 @@ export type HostRuntimeCommand =
 
 export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+  | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
+  | { kind: "timer-cleared"; timerId: string; existed: boolean }
+  | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
+  | { kind: "timer-fired"; nowMs: number; timers: HostRuntimeTimer[] }
   | { kind: "process-info"; process: HostProcessInfo }
   | { kind: "process-cwd"; cwd: string }
   | { kind: "process-argv"; argv: string[] }
@@ -275,12 +299,15 @@ type HostRuntimeContextRecord = {
   contextId: string;
   sessionId: string;
   process: HostProcessInfo;
+  clockMs: number;
+  timers: Map<string, HostRuntimeTimer>;
 };
 
 export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   private readonly sessions = new Map<string, HostSessionRecord>();
   private readonly runtimeContexts = new Map<string, HostRuntimeContextRecord>();
   private nextRuntimeContextId = 1;
+  private nextRuntimeTimerId = 1;
 
   async bootSummary(): Promise<HostBootstrapSummary> {
     return {
@@ -387,6 +414,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       contextId,
       sessionId,
       process,
+      clockMs: 0,
+      timers: new Map<string, HostRuntimeTimer>(),
     };
     this.runtimeContexts.set(contextId, context);
     return context;
@@ -705,7 +734,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
                 name: "timers",
                 globals: ["setTimeout", "clearTimeout"],
                 modules: ["timers", "node:timers"],
-                commandPrefixes: [],
+                commandPrefixes: ["timers"],
               },
               {
                 name: "console",
@@ -716,6 +745,44 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
             ],
           },
         };
+      case "timers.schedule": {
+        const timer: HostRuntimeTimer = {
+          timerId: `runtime-timer-${this.nextRuntimeTimerId++}`,
+          kind: command.repeat ? "interval" : "timeout",
+          delayMs: command.delayMs,
+          dueAtMs: context.clockMs + command.delayMs,
+        };
+        context.timers.set(timer.timerId, timer);
+        return {
+          kind: "timer-scheduled",
+          timer: { ...timer },
+        };
+      }
+      case "timers.clear": {
+        const existed = context.timers.delete(command.timerId);
+        return {
+          kind: "timer-cleared",
+          timerId: command.timerId,
+          existed,
+        };
+      }
+      case "timers.list":
+        return {
+          kind: "timer-list",
+          nowMs: context.clockMs,
+          timers: [...context.timers.values()]
+            .sort((left, right) => left.dueAtMs - right.dueAtMs)
+            .map((timer) => ({ ...timer })),
+        };
+      case "timers.advance": {
+        context.clockMs += command.elapsedMs;
+        const fired = advanceMockRuntimeTimers(context);
+        return {
+          kind: "timer-fired",
+          nowMs: context.clockMs,
+          timers: fired,
+        };
+      }
       case "process.info":
         return {
           kind: "process-info",
@@ -1293,6 +1360,22 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.describe":
         lines.push("command=runtime-describe");
         break;
+      case "timers.schedule":
+        lines.push("command=timers-schedule");
+        lines.push(`delay_ms=${String(command.delayMs)}`);
+        lines.push(`repeat=${String(command.repeat)}`);
+        break;
+      case "timers.clear":
+        lines.push("command=timers-clear");
+        lines.push(`timer_id=${command.timerId}`);
+        break;
+      case "timers.list":
+        lines.push("command=timers-list");
+        break;
+      case "timers.advance":
+        lines.push("command=timers-advance");
+        lines.push(`elapsed_ms=${String(command.elapsedMs)}`);
+        break;
       case "process.info":
         lines.push("command=process-info");
         break;
@@ -1354,6 +1437,10 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
 
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+      | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
+      | { kind: "timer-cleared"; timerId: string; existed: boolean }
+      | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
+      | { kind: "timer-fired"; nowMs: number; timers: HostRuntimeTimer[] }
       | { kind: "process-info"; process: HostProcessInfo }
       | { kind: "process-cwd"; cwd: string }
       | { kind: "process-argv"; argv: string[] }
@@ -1524,6 +1611,35 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
 
     return parsed;
   }
+}
+
+function advanceMockRuntimeTimers(context: HostRuntimeContextRecord): HostRuntimeTimer[] {
+  const dueTimers = [...context.timers.values()]
+    .filter((timer) => timer.dueAtMs <= context.clockMs)
+    .sort((left, right) => left.dueAtMs - right.dueAtMs);
+  const fired: HostRuntimeTimer[] = [];
+
+  for (const timer of dueTimers) {
+    fired.push({ ...timer });
+
+    if (timer.kind === "timeout") {
+      context.timers.delete(timer.timerId);
+      continue;
+    }
+
+    const step = Math.max(timer.delayMs, 1);
+    let nextDueAtMs = timer.dueAtMs;
+    while (nextDueAtMs <= context.clockMs) {
+      nextDueAtMs += step;
+    }
+
+    context.timers.set(timer.timerId, {
+      ...timer,
+      dueAtMs: nextDueAtMs,
+    });
+  }
+
+  return fired;
 }
 
 function collectMockPreviewHydrationPaths(files: Map<string, WorkspaceFileRecord>): string[] {

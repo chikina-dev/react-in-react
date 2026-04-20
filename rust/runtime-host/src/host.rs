@@ -5,9 +5,9 @@ use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, PreviewRequestHint,
-    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, HostRuntimeTimer,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
+    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -60,6 +60,16 @@ struct SessionRecord {
 struct RuntimeContextRecord {
     session_id: String,
     process: HostProcessInfo,
+    clock_ms: u64,
+    timers: BTreeMap<String, RuntimeTimerRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeTimerRecord {
+    timer_id: String,
+    kind: HostRuntimeTimerKind,
+    delay_ms: u64,
+    due_at_ms: u64,
 }
 
 pub struct RuntimeHostCore<E: EngineAdapter> {
@@ -68,6 +78,7 @@ pub struct RuntimeHostCore<E: EngineAdapter> {
     next_session_id: u64,
     runtime_contexts: BTreeMap<String, RuntimeContextRecord>,
     next_runtime_context_id: u64,
+    next_runtime_timer_id: u64,
 }
 
 impl<E: EngineAdapter> RuntimeHostCore<E> {
@@ -78,6 +89,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             next_session_id: 1,
             runtime_contexts: BTreeMap::new(),
             next_runtime_context_id: 1,
+            next_runtime_timer_id: 1,
         }
     }
 
@@ -259,6 +271,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             RuntimeContextRecord {
                 session_id: session_id.to_string(),
                 process: process.clone(),
+                clock_ms: 0,
+                timers: BTreeMap::new(),
             },
         );
 
@@ -583,7 +597,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                             name: "timers".into(),
                             globals: vec!["setTimeout".into(), "clearTimeout".into()],
                             modules: vec!["timers".into(), "node:timers".into()],
-                            command_prefixes: Vec::new(),
+                            command_prefixes: vec!["timers".into()],
                         },
                         HostRuntimeBuiltinSpec {
                             name: "console".into(),
@@ -593,6 +607,63 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                         },
                     ],
                 }))
+            }
+            HostRuntimeCommand::TimerSchedule { delay_ms, repeat } => {
+                let timer = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let timer_id = format!("runtime-timer-{}", self.next_runtime_timer_id);
+                    self.next_runtime_timer_id += 1;
+                    let timer = RuntimeTimerRecord {
+                        timer_id: timer_id.clone(),
+                        kind: if repeat {
+                            HostRuntimeTimerKind::Interval
+                        } else {
+                            HostRuntimeTimerKind::Timeout
+                        },
+                        delay_ms,
+                        due_at_ms: context.clock_ms.saturating_add(delay_ms),
+                    };
+                    context.timers.insert(timer_id, timer.clone());
+                    runtime_timer_view(&timer)
+                };
+
+                Ok(HostRuntimeResponse::TimerScheduled { timer })
+            }
+            HostRuntimeCommand::TimerClear { timer_id } => {
+                let existed = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    context.timers.remove(&timer_id).is_some()
+                };
+
+                Ok(HostRuntimeResponse::TimerCleared { timer_id, existed })
+            }
+            HostRuntimeCommand::TimerList => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::TimerList {
+                    now_ms: context.clock_ms,
+                    timers: context.timers.values().map(runtime_timer_view).collect(),
+                })
+            }
+            HostRuntimeCommand::TimerAdvance { elapsed_ms } => {
+                let (now_ms, timers) = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    context.clock_ms = context.clock_ms.saturating_add(elapsed_ms);
+                    let now_ms = context.clock_ms;
+                    let timers = advance_runtime_timers(context, now_ms);
+                    (now_ms, timers)
+                };
+
+                Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
             }
             HostRuntimeCommand::ProcessInfo => {
                 let context = self
@@ -923,6 +994,56 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map(|_| ())
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))
     }
+}
+
+fn runtime_timer_view(timer: &RuntimeTimerRecord) -> HostRuntimeTimer {
+    HostRuntimeTimer {
+        timer_id: timer.timer_id.clone(),
+        kind: timer.kind.clone(),
+        delay_ms: timer.delay_ms,
+        due_at_ms: timer.due_at_ms,
+    }
+}
+
+fn advance_runtime_timers(
+    context: &mut RuntimeContextRecord,
+    now_ms: u64,
+) -> Vec<HostRuntimeTimer> {
+    let due_timer_ids = context
+        .timers
+        .iter()
+        .filter(|(_, timer)| timer.due_at_ms <= now_ms)
+        .map(|(timer_id, _)| timer_id.clone())
+        .collect::<Vec<_>>();
+
+    let mut fired = Vec::new();
+
+    for timer_id in due_timer_ids {
+        let Some(timer) = context.timers.get(&timer_id).cloned() else {
+            continue;
+        };
+
+        fired.push(runtime_timer_view(&timer));
+
+        match timer.kind {
+            HostRuntimeTimerKind::Timeout => {
+                context.timers.remove(&timer_id);
+            }
+            HostRuntimeTimerKind::Interval => {
+                let mut next_due_at = timer.due_at_ms;
+                let step = timer.delay_ms.max(1);
+                while next_due_at <= now_ms {
+                    next_due_at = next_due_at.saturating_add(step);
+                }
+
+                if let Some(existing) = context.timers.get_mut(&timer_id) {
+                    existing.due_at_ms = next_due_at;
+                }
+            }
+        }
+    }
+
+    fired
 }
 
 fn resolve_run_cwd(record: &SessionRecord, cwd: &str) -> RuntimeHostResult<String> {

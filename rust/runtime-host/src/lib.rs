@@ -11,9 +11,9 @@ pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, PreviewRequestHint,
-    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, HostRuntimeTimer,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
+    SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -216,6 +216,92 @@ mod tests {
                         .iter()
                         .any(|builtin| builtin.name == "fs"
                             && builtin.modules.contains(&"node:fs".to_string()))
+                    && bindings
+                        .builtins
+                        .iter()
+                        .any(|builtin| builtin.name == "timers"
+                            && builtin.command_prefixes == vec!["timers".to_string()])
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerSchedule {
+                    delay_ms: 50,
+                    repeat: false,
+                },
+            ),
+            Ok(HostRuntimeResponse::TimerScheduled { timer })
+                if timer.timer_id == "runtime-timer-1"
+                    && timer.kind == HostRuntimeTimerKind::Timeout
+                    && timer.delay_ms == 50
+                    && timer.due_at_ms == 50
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::TimerList,),
+            Ok(HostRuntimeResponse::TimerList { now_ms, timers })
+                if now_ms == 0 && timers.len() == 1 && timers[0].timer_id == "runtime-timer-1"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerAdvance { elapsed_ms: 25 },
+            ),
+            Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
+                if now_ms == 25 && timers.is_empty()
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerAdvance { elapsed_ms: 25 },
+            ),
+            Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
+                if now_ms == 50
+                    && timers.len() == 1
+                    && timers[0].timer_id == "runtime-timer-1"
+                    && timers[0].kind == HostRuntimeTimerKind::Timeout
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerSchedule {
+                    delay_ms: 10,
+                    repeat: true,
+                },
+            ),
+            Ok(HostRuntimeResponse::TimerScheduled { timer })
+                if timer.timer_id == "runtime-timer-2"
+                    && timer.kind == HostRuntimeTimerKind::Interval
+                    && timer.delay_ms == 10
+                    && timer.due_at_ms == 60
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerAdvance { elapsed_ms: 35 },
+            ),
+            Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
+                if now_ms == 85
+                    && timers.len() == 1
+                    && timers[0].timer_id == "runtime-timer-2"
+                    && timers[0].kind == HostRuntimeTimerKind::Interval
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::TimerList,),
+            Ok(HostRuntimeResponse::TimerList { now_ms, timers })
+                if now_ms == 85
+                    && timers.len() == 1
+                    && timers[0].timer_id == "runtime-timer-2"
+                    && timers[0].due_at_ms == 90
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::TimerClear {
+                    timer_id: String::from("runtime-timer-2"),
+                },
+            ),
+            Ok(HostRuntimeResponse::TimerCleared { timer_id, existed })
+                if timer_id == "runtime-timer-2" && existed
         ));
         assert!(matches!(
             host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::ProcessInfo),

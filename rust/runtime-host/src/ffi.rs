@@ -6,7 +6,7 @@ use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
     HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeContext,
-    HostRuntimeResponse, RunRequest,
+    HostRuntimeResponse, HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -655,6 +655,13 @@ fn parse_usize_field(fields: &BTreeMap<String, String>, key: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn parse_u64_field(fields: &BTreeMap<String, String>, key: &str) -> u64 {
+    fields
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 fn parse_virtual_files(fields: &BTreeMap<String, String>) -> Result<Vec<VirtualFile>, String> {
     let Some(encoded) = fields.get("files") else {
         return Ok(Vec::new());
@@ -763,6 +770,20 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
 
     match kind.as_str() {
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
+        "timers-schedule" => Ok(HostRuntimeCommand::TimerSchedule {
+            delay_ms: parse_u64_field(fields, "delay_ms"),
+            repeat: fields
+                .get("repeat")
+                .map(|value| value == "true" || value == "1")
+                .unwrap_or(false),
+        }),
+        "timers-clear" => Ok(HostRuntimeCommand::TimerClear {
+            timer_id: required_field(fields, "timer_id").unwrap_or_default(),
+        }),
+        "timers-list" => Ok(HostRuntimeCommand::TimerList),
+        "timers-advance" => Ok(HostRuntimeCommand::TimerAdvance {
+            elapsed_ms: parse_u64_field(fields, "elapsed_ms"),
+        }),
         "process-info" => Ok(HostRuntimeCommand::ProcessInfo),
         "process-cwd" => Ok(HostRuntimeCommand::ProcessCwd),
         "process-argv" => Ok(HostRuntimeCommand::ProcessArgv),
@@ -1029,6 +1050,25 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-bindings\",\"bindings\":{}}}",
             render_runtime_bindings_json(bindings)
         ),
+        HostRuntimeResponse::TimerScheduled { timer } => format!(
+            "{{\"kind\":\"timer-scheduled\",\"timer\":{}}}",
+            render_runtime_timer_json(timer)
+        ),
+        HostRuntimeResponse::TimerCleared { timer_id, existed } => format!(
+            "{{\"kind\":\"timer-cleared\",\"timerId\":\"{}\",\"existed\":{}}}",
+            escape_json(timer_id),
+            existed
+        ),
+        HostRuntimeResponse::TimerList { now_ms, timers } => format!(
+            "{{\"kind\":\"timer-list\",\"nowMs\":{},\"timers\":{}}}",
+            now_ms,
+            render_runtime_timer_array_json(timers)
+        ),
+        HostRuntimeResponse::TimerFired { now_ms, timers } => format!(
+            "{{\"kind\":\"timer-fired\",\"nowMs\":{},\"timers\":{}}}",
+            now_ms,
+            render_runtime_timer_array_json(timers)
+        ),
         HostRuntimeResponse::ProcessInfo(process) => format!(
             "{{\"kind\":\"process-info\",\"process\":{}}}",
             render_process_info_json(process)
@@ -1087,6 +1127,31 @@ fn render_runtime_builtin_json(builtin: &HostRuntimeBuiltinSpec) -> String {
         render_string_array_json(&builtin.modules),
         render_string_array_json(&builtin.command_prefixes),
     )
+}
+
+fn render_runtime_timer_json(timer: &HostRuntimeTimer) -> String {
+    let kind = match timer.kind {
+        HostRuntimeTimerKind::Timeout => "timeout",
+        HostRuntimeTimerKind::Interval => "interval",
+    };
+
+    format!(
+        "{{\"timerId\":\"{}\",\"kind\":\"{}\",\"delayMs\":{},\"dueAtMs\":{}}}",
+        escape_json(&timer.timer_id),
+        kind,
+        timer.delay_ms,
+        timer.due_at_ms,
+    )
+}
+
+fn render_runtime_timer_array_json(timers: &[HostRuntimeTimer]) -> String {
+    let items = timers
+        .iter()
+        .map(render_runtime_timer_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
 }
 
 fn render_error_json(message: &str) -> String {

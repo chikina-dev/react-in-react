@@ -555,7 +555,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           name: "timers",
           globals: ["setTimeout", "clearTimeout"],
           modules: ["timers", "node:timers"],
-          commandPrefixes: [],
+          commandPrefixes: ["timers"],
         },
         {
           name: "console",
@@ -565,6 +565,130 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         },
       ],
     },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.schedule",
+      delayMs: 50,
+      repeat: false,
+    }),
+  ).resolves.toEqual({
+    kind: "timer-scheduled",
+    timer: {
+      timerId: "runtime-timer-1",
+      kind: "timeout",
+      delayMs: 50,
+      dueAtMs: 50,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.list",
+    }),
+  ).resolves.toEqual({
+    kind: "timer-list",
+    nowMs: 0,
+    timers: [
+      {
+        timerId: "runtime-timer-1",
+        kind: "timeout",
+        delayMs: 50,
+        dueAtMs: 50,
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.advance",
+      elapsedMs: 25,
+    }),
+  ).resolves.toEqual({
+    kind: "timer-fired",
+    nowMs: 25,
+    timers: [],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.advance",
+      elapsedMs: 25,
+    }),
+  ).resolves.toEqual({
+    kind: "timer-fired",
+    nowMs: 50,
+    timers: [
+      {
+        timerId: "runtime-timer-1",
+        kind: "timeout",
+        delayMs: 50,
+        dueAtMs: 50,
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.schedule",
+      delayMs: 10,
+      repeat: true,
+    }),
+  ).resolves.toEqual({
+    kind: "timer-scheduled",
+    timer: {
+      timerId: "runtime-timer-2",
+      kind: "interval",
+      delayMs: 10,
+      dueAtMs: 60,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.advance",
+      elapsedMs: 35,
+    }),
+  ).resolves.toEqual({
+    kind: "timer-fired",
+    nowMs: 85,
+    timers: [
+      {
+        timerId: "runtime-timer-2",
+        kind: "interval",
+        delayMs: 10,
+        dueAtMs: 60,
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.list",
+    }),
+  ).resolves.toEqual({
+    kind: "timer-list",
+    nowMs: 85,
+    timers: [
+      {
+        timerId: "runtime-timer-2",
+        kind: "interval",
+        delayMs: 10,
+        dueAtMs: 90,
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "timers.clear",
+      timerId: "runtime-timer-2",
+    }),
+  ).resolves.toEqual({
+    kind: "timer-cleared",
+    timerId: "runtime-timer-2",
+    existed: true,
   });
 
   await expect(

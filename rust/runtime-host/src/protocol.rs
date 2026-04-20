@@ -113,6 +113,20 @@ pub struct HostRuntimeBindings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeTimerKind {
+    Timeout,
+    Interval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeTimer {
+    pub timer_id: String,
+    pub kind: HostRuntimeTimerKind,
+    pub delay_ms: u64,
+    pub due_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileSummary {
     pub path: String,
     pub size: usize,
@@ -190,6 +204,10 @@ pub enum HostContextFsCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeCommand {
     DescribeBindings,
+    TimerSchedule { delay_ms: u64, repeat: bool },
+    TimerClear { timer_id: String },
+    TimerList,
+    TimerAdvance { elapsed_ms: u64 },
     ProcessInfo,
     ProcessCwd,
     ProcessArgv,
@@ -207,11 +225,34 @@ pub enum HostRuntimeCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
+    TimerScheduled {
+        timer: HostRuntimeTimer,
+    },
+    TimerCleared {
+        timer_id: String,
+        existed: bool,
+    },
+    TimerList {
+        now_ms: u64,
+        timers: Vec<HostRuntimeTimer>,
+    },
+    TimerFired {
+        now_ms: u64,
+        timers: Vec<HostRuntimeTimer>,
+    },
     ProcessInfo(HostProcessInfo),
-    ProcessCwd { cwd: String },
-    ProcessArgv { argv: Vec<String> },
-    ProcessEnv { env: BTreeMap<String, String> },
-    PathValue { value: String },
+    ProcessCwd {
+        cwd: String,
+    },
+    ProcessArgv {
+        argv: Vec<String>,
+    },
+    ProcessEnv {
+        env: BTreeMap<String, String>,
+    },
+    PathValue {
+        value: String,
+    },
     Fs(HostFsResponse),
 }
 
