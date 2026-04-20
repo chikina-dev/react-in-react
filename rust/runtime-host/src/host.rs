@@ -989,9 +989,28 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             HostRuntimeCommand::PathNormalize { path } => Ok(HostRuntimeResponse::PathValue {
                 value: normalize_runtime_path(&path),
             }),
-            HostRuntimeCommand::Fs(command) => self
-                .execute_context_fs_command(context_id, command)
-                .map(HostRuntimeResponse::Fs),
+            HostRuntimeCommand::Fs(command) => {
+                let emit_workspace_change = matches!(
+                    command,
+                    HostContextFsCommand::CreateDirAll { .. }
+                        | HostContextFsCommand::WriteFile { .. }
+                );
+                let response = self.execute_context_fs_command(context_id, command)?;
+
+                if emit_workspace_change {
+                    if let HostFsResponse::Entry(entry) = &response {
+                        let context =
+                            self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                                RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                            })?;
+                        context.events.push_back(HostRuntimeEvent::WorkspaceChange {
+                            entry: entry.clone(),
+                        });
+                    }
+                }
+
+                Ok(HostRuntimeResponse::Fs(response))
+            }
         }
     }
 

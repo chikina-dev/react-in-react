@@ -508,6 +508,40 @@ mod tests {
         assert!(matches!(
             host.execute_runtime_command(
                 &runtime_context.context_id,
+                HostRuntimeCommand::Fs(crate::protocol::HostContextFsCommand::WriteFile {
+                    path: String::from("generated/output.json"),
+                    bytes: br#"{"ok":true}"#.to_vec(),
+                    is_text: true,
+                }),
+            ),
+            Ok(HostRuntimeResponse::Fs(HostFsResponse::Entry(entry)))
+                if entry
+                    == WorkspaceEntrySummary {
+                        path: String::from("/workspace/src/generated/output.json"),
+                        kind: WorkspaceEntryKind::File,
+                        size: 11,
+                        is_text: true,
+                    }
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DrainEvents,
+            ),
+            Ok(HostRuntimeResponse::RuntimeEvents { events })
+                if events
+                    == vec![HostRuntimeEvent::WorkspaceChange {
+                        entry: WorkspaceEntrySummary {
+                            path: String::from("/workspace/src/generated/output.json"),
+                            kind: WorkspaceEntryKind::File,
+                            size: 11,
+                            is_text: true,
+                        },
+                    }]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
                 HostRuntimeCommand::TimerSchedule {
                     delay_ms: 50,
                     repeat: false,
@@ -655,7 +689,18 @@ mod tests {
                 HostRuntimeCommand::DrainEvents,
             ),
             Ok(HostRuntimeResponse::RuntimeEvents { events })
-                if events == vec![HostRuntimeEvent::ProcessExit { code: 0 }]
+                if events
+                    == vec![
+                        HostRuntimeEvent::WorkspaceChange {
+                            entry: WorkspaceEntrySummary {
+                                path: String::from("/workspace/src/generated/runtime.log"),
+                                kind: WorkspaceEntryKind::File,
+                                size: 13,
+                                is_text: true,
+                            },
+                        },
+                        HostRuntimeEvent::ProcessExit { code: 0 },
+                    ]
         ));
         assert_eq!(
             host.plan_run(

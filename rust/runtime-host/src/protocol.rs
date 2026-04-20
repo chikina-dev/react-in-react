@@ -193,6 +193,9 @@ pub enum HostRuntimeEvent {
     PortClose {
         port: u16,
     },
+    WorkspaceChange {
+        entry: WorkspaceEntrySummary,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -860,6 +860,45 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "fs.write-file",
+      path: "generated/output.json",
+      bytes: new TextEncoder().encode('{"ok":true}'),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    kind: "fs",
+    response: {
+      kind: "entry",
+      entry: {
+        path: "/workspace/src/generated/output.json",
+        kind: "file",
+        size: 11,
+        isText: true,
+      },
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-events",
+    events: [
+      {
+        kind: "workspace-change",
+        entry: {
+          path: "/workspace/src/generated/output.json",
+          kind: "file",
+          size: 11,
+          isText: true,
+        },
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "timers.schedule",
       delayMs: 50,
       repeat: false,
@@ -1088,6 +1127,15 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   ).resolves.toEqual({
     kind: "runtime-events",
     events: [
+      {
+        kind: "workspace-change",
+        entry: {
+          path: "/workspace/src/generated/nested/context.log",
+          kind: "file",
+          size: 13,
+          isText: true,
+        },
+      },
       {
         kind: "process-exit",
         code: 0,

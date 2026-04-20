@@ -5,6 +5,7 @@ import {
   type HostPreviewRequestHint,
   type HostPreviewResponseDescriptor,
   type HostRunPlan,
+  type HostWorkspaceEntrySummary,
 } from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
@@ -541,7 +542,43 @@ async function flushRuntimeEvents(
       case "port-close":
         await emitStdout(sessionId, pid, `[port] ${event.port} closed`);
         break;
+      case "workspace-change": {
+        const record = sessions.get(sessionId);
+        if (record) {
+          applyWorkspaceEntryChange(record, event.entry);
+        }
+        await emitStdout(sessionId, pid, `[vfs] ${event.entry.kind} ${event.entry.path} updated`);
+        break;
+      }
     }
+  }
+}
+
+function applyWorkspaceEntryChange(record: SessionRecord, entry: HostWorkspaceEntrySummary): void {
+  if (entry.kind === "file") {
+    const nextIndex = record.hostFiles.index.filter((file) => file.path !== entry.path);
+    nextIndex.push({
+      path: entry.path,
+      size: entry.size,
+      isText: entry.isText,
+    });
+    nextIndex.sort((left, right) => left.path.localeCompare(right.path));
+    record.hostFiles.index = nextIndex;
+    record.hostFiles.count = nextIndex.length;
+  }
+
+  record.hostFileCache.delete(entry.path);
+
+  const sample = record.hostFiles.index[0] ?? null;
+  record.hostFiles.samplePath = sample?.path ?? null;
+  record.hostFiles.sampleSize = sample?.size ?? null;
+
+  if (record.preview) {
+    record.preview.hostFiles = {
+      count: record.hostFiles.count,
+      samplePath: record.hostFiles.samplePath,
+      sampleSize: record.hostFiles.sampleSize,
+    };
   }
 }
 

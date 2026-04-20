@@ -58,7 +58,8 @@ export type HostRuntimeEvent =
   | { kind: "console"; level: HostRuntimeConsoleLevel; line: string }
   | { kind: "process-exit"; code: number }
   | { kind: "port-listen"; port: HostRuntimePort }
-  | { kind: "port-close"; port: number };
+  | { kind: "port-close"; port: number }
+  | { kind: "workspace-change"; entry: HostWorkspaceEntrySummary };
 
 export type HostRuntimePortProtocol = "http";
 
@@ -1229,6 +1230,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       case "fs.read-file":
       case "fs.mkdir":
       case "fs.write-file": {
+        const shouldEmitWorkspaceChange =
+          command.kind === "fs.mkdir" || command.kind === "fs.write-file";
         const fsCommand: HostContextFsCommand =
           command.kind === "fs.write-file"
             ? {
@@ -1250,10 +1253,18 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
                           : "mkdir",
                 path: command.path,
               };
+        const response = await this.executeContextFsCommand(contextId, fsCommand);
+
+        if (shouldEmitWorkspaceChange && response.kind === "entry") {
+          context.events.push({
+            kind: "workspace-change",
+            entry: response.entry,
+          });
+        }
 
         return {
           kind: "fs",
-          response: await this.executeContextFsCommand(contextId, fsCommand),
+          response,
         };
       }
     }
