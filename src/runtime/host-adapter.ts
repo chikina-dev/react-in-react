@@ -50,6 +50,19 @@ export type HostRuntimeBindings = {
   builtins: HostRuntimeBuiltinSpec[];
 };
 
+export type HostRuntimeBootstrapModule = {
+  specifier: string;
+  source: string;
+};
+
+export type HostRuntimeBootstrapPlan = {
+  contextId: string;
+  engineName: string;
+  entrypoint: string;
+  bootstrapSpecifier: string;
+  modules: HostRuntimeBootstrapModule[];
+};
+
 export type HostRuntimeStdioStream = "stdout" | "stderr";
 export type HostRuntimeConsoleLevel = "log" | "info" | "warn" | "error";
 
@@ -98,6 +111,7 @@ export type HostRuntimeCommand =
   | {
       kind:
         | "runtime.describe"
+        | "runtime.describe-bootstrap"
         | "runtime.drain-events"
         | "port.list"
         | "timers.list"
@@ -132,6 +146,7 @@ export type HostRuntimeCommand =
 
 export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+  | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
   | { kind: "event-queued"; queueLen: number }
   | { kind: "runtime-events"; events: HostRuntimeEvent[] }
   | { kind: "port-listening"; port: HostRuntimePort }
@@ -243,6 +258,195 @@ export type HostFsResponse =
       textContent: string | null;
       bytes: Uint8Array;
     };
+
+function buildMockRuntimeBindings(contextId: string, entrypoint: string): HostRuntimeBindings {
+  return {
+    contextId,
+    engineName: "null-engine",
+    entrypoint,
+    globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
+    builtins: [
+      {
+        name: "process",
+        globals: ["process"],
+        modules: ["process", "node:process"],
+        commandPrefixes: ["process"],
+      },
+      {
+        name: "fs",
+        globals: [],
+        modules: ["fs", "node:fs"],
+        commandPrefixes: ["fs"],
+      },
+      {
+        name: "path",
+        globals: [],
+        modules: ["path", "node:path"],
+        commandPrefixes: ["path"],
+      },
+      {
+        name: "buffer",
+        globals: ["Buffer"],
+        modules: ["buffer", "node:buffer"],
+        commandPrefixes: [],
+      },
+      {
+        name: "timers",
+        globals: ["setTimeout", "clearTimeout"],
+        modules: ["timers", "node:timers"],
+        commandPrefixes: ["timers"],
+      },
+      {
+        name: "console",
+        globals: ["console"],
+        modules: ["console", "node:console"],
+        commandPrefixes: ["console"],
+      },
+    ],
+  };
+}
+
+function buildMockRuntimeBootstrapPlan(
+  contextId: string,
+  entrypoint: string,
+): HostRuntimeBootstrapPlan {
+  const bootstrapSpecifier = "runtime:bootstrap";
+  const entrypointLiteral = JSON.stringify(entrypoint);
+
+  return {
+    contextId,
+    engineName: "null-engine",
+    entrypoint,
+    bootstrapSpecifier,
+    modules: [
+      {
+        specifier: "node:process",
+        source: `const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+const process = {
+  cwd() { return invoke("process.cwd"); },
+  chdir(path) { return invoke("process.chdir", { path }); },
+  exit(code = 0) { return invoke("process.exit", { code }); },
+  get argv() { return invoke("process.argv"); },
+  get env() { return invoke("process.env"); },
+  platform: "browser",
+};
+export default process;
+export const cwd = () => process.cwd();
+export const chdir = (path) => process.chdir(path);
+export const exit = (code = 0) => process.exit(code);
+`,
+      },
+      {
+        specifier: "node:fs",
+        source: `const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const existsSync = (path) => invoke("fs.exists", { path }).exists;
+export const statSync = (path) => invoke("fs.stat", { path }).entry;
+export const readdirSync = (path) => invoke("fs.read-dir", { path }).entries.map((entry) => entry.path);
+export const readFileSync = (path) => invoke("fs.read-file", { path });
+export const mkdirSync = (path) => invoke("fs.mkdir", { path });
+export const writeFileSync = (path, bytes, isText = false) =>
+  invoke("fs.write-file", { path, bytes, isText });
+export default {
+  existsSync,
+  statSync,
+  readdirSync,
+  readFileSync,
+  mkdirSync,
+  writeFileSync,
+};
+`,
+      },
+      {
+        specifier: "node:path",
+        source: `const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload).value;
+}
+export const resolve = (...segments) => invoke("path.resolve", { segments });
+export const join = (...segments) => invoke("path.join", { segments });
+export const dirname = (path) => invoke("path.dirname", { path });
+export const basename = (path) => invoke("path.basename", { path });
+export const extname = (path) => invoke("path.extname", { path });
+export const normalize = (path) => invoke("path.normalize", { path });
+export default { resolve, join, dirname, basename, extname, normalize };
+`,
+      },
+      {
+        specifier: "node:buffer",
+        source: `export const Buffer = Uint8Array;
+export default { Buffer };
+`,
+      },
+      {
+        specifier: "node:timers",
+        source: `const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const setTimeout = (callback, delay = 0) =>
+  invoke("timers.schedule", { delayMs: delay, repeat: false, callback });
+export const clearTimeout = (timerId) => invoke("timers.clear", { timerId });
+export default { setTimeout, clearTimeout };
+`,
+      },
+      {
+        specifier: "node:console",
+        source: `const runtime = globalThis.__runtime;
+function emit(level, values) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke("console.emit", { level, values });
+}
+const consoleValue = {
+  log: (...values) => emit("log", values),
+  info: (...values) => emit("info", values),
+  warn: (...values) => emit("warn", values),
+  error: (...values) => emit("error", values),
+};
+export { consoleValue as console };
+export default consoleValue;
+`,
+      },
+      {
+        specifier: bootstrapSpecifier,
+        source: `import process from "node:process";
+import { Buffer } from "node:buffer";
+import consoleValue from "node:console";
+import { setTimeout, clearTimeout } from "node:timers";
+
+globalThis.process = process;
+globalThis.Buffer = Buffer;
+globalThis.console = consoleValue;
+globalThis.setTimeout = setTimeout;
+globalThis.clearTimeout = clearTimeout;
+
+export async function boot() {
+  return import(${entrypointLiteral});
+}
+`,
+      },
+    ],
+  };
+}
 
 type MockPreviewRootHint =
   | {
@@ -917,50 +1121,12 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.describe":
         return {
           kind: "runtime-bindings",
-          bindings: {
-            contextId,
-            engineName: "null-engine",
-            entrypoint: context.process.entrypoint,
-            globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
-            builtins: [
-              {
-                name: "process",
-                globals: ["process"],
-                modules: ["process", "node:process"],
-                commandPrefixes: ["process"],
-              },
-              {
-                name: "fs",
-                globals: [],
-                modules: ["fs", "node:fs"],
-                commandPrefixes: ["fs"],
-              },
-              {
-                name: "path",
-                globals: [],
-                modules: ["path", "node:path"],
-                commandPrefixes: ["path"],
-              },
-              {
-                name: "buffer",
-                globals: ["Buffer"],
-                modules: ["buffer", "node:buffer"],
-                commandPrefixes: [],
-              },
-              {
-                name: "timers",
-                globals: ["setTimeout", "clearTimeout"],
-                modules: ["timers", "node:timers"],
-                commandPrefixes: ["timers"],
-              },
-              {
-                name: "console",
-                globals: ["console"],
-                modules: ["console", "node:console"],
-                commandPrefixes: ["console"],
-              },
-            ],
-          },
+          bindings: buildMockRuntimeBindings(contextId, context.process.entrypoint),
+        };
+      case "runtime.describe-bootstrap":
+        return {
+          kind: "runtime-bootstrap",
+          plan: buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint),
         };
       case "stdio.write":
         context.events.push({
@@ -1768,6 +1934,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.describe":
         lines.push("command=runtime-describe");
         break;
+      case "runtime.describe-bootstrap":
+        lines.push("command=runtime-describe-bootstrap");
+        break;
       case "stdio.write":
         lines.push("command=stdio-write");
         lines.push(`stream=${command.stream}`);
@@ -1899,6 +2068,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
 
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+      | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
       | { kind: "event-queued"; queueLen: number }
       | { kind: "runtime-events"; events: HostRuntimeEvent[] }
       | { kind: "port-listening"; port: HostRuntimePort }

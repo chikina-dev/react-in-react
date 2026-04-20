@@ -14,13 +14,14 @@ pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
-    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
-    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
+    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand,
+    HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -332,6 +333,25 @@ mod tests {
                         .iter()
                         .any(|builtin| builtin.name == "timers"
                             && builtin.command_prefixes == vec!["timers".to_string()])
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DescribeBootstrap,
+            ),
+            Ok(HostRuntimeResponse::BootstrapPlan(plan))
+                if plan.bootstrap_specifier == "runtime:bootstrap"
+                    && plan.entrypoint == "/workspace/src/main.tsx"
+                    && plan
+                        .modules
+                        .iter()
+                        .any(|module| module.specifier == "node:process"
+                            && module.source.contains("process.cwd"))
+                    && plan
+                        .modules
+                        .iter()
+                        .any(|module| module.specifier == "runtime:bootstrap"
+                            && module.source.contains("import(\"/workspace/src/main.tsx\")"))
         ));
         assert!(matches!(
             host.execute_runtime_command(

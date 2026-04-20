@@ -9,13 +9,13 @@ use crate::engine::{
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
-    HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
-    HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
-    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
+    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand,
+    HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -717,59 +717,21 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .get(context_id)
                     .cloned()
                     .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-                let engine = self.engine.descriptor();
+                let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
 
-                Ok(HostRuntimeResponse::Bindings(HostRuntimeBindings {
-                    context_id: context_id.to_string(),
-                    engine_name: engine.name.to_string(),
-                    entrypoint: context.process.entrypoint.clone(),
-                    globals: vec![
-                        "console".into(),
-                        "process".into(),
-                        "Buffer".into(),
-                        "setTimeout".into(),
-                        "clearTimeout".into(),
-                        "__runtime".into(),
-                    ],
-                    builtins: vec![
-                        HostRuntimeBuiltinSpec {
-                            name: "process".into(),
-                            globals: vec!["process".into()],
-                            modules: vec!["process".into(), "node:process".into()],
-                            command_prefixes: vec!["process".into()],
-                        },
-                        HostRuntimeBuiltinSpec {
-                            name: "fs".into(),
-                            globals: Vec::new(),
-                            modules: vec!["fs".into(), "node:fs".into()],
-                            command_prefixes: vec!["fs".into()],
-                        },
-                        HostRuntimeBuiltinSpec {
-                            name: "path".into(),
-                            globals: Vec::new(),
-                            modules: vec!["path".into(), "node:path".into()],
-                            command_prefixes: vec!["path".into()],
-                        },
-                        HostRuntimeBuiltinSpec {
-                            name: "buffer".into(),
-                            globals: vec!["Buffer".into()],
-                            modules: vec!["buffer".into(), "node:buffer".into()],
-                            command_prefixes: Vec::new(),
-                        },
-                        HostRuntimeBuiltinSpec {
-                            name: "timers".into(),
-                            globals: vec!["setTimeout".into(), "clearTimeout".into()],
-                            modules: vec!["timers".into(), "node:timers".into()],
-                            command_prefixes: vec!["timers".into()],
-                        },
-                        HostRuntimeBuiltinSpec {
-                            name: "console".into(),
-                            globals: vec!["console".into()],
-                            modules: vec!["console".into(), "node:console".into()],
-                            command_prefixes: vec!["console".into()],
-                        },
-                    ],
-                }))
+                Ok(HostRuntimeResponse::Bindings(bindings))
+            }
+            HostRuntimeCommand::DescribeBootstrap => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .cloned()
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+                let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
+
+                Ok(HostRuntimeResponse::BootstrapPlan(build_runtime_bootstrap_plan(
+                    &bindings,
+                )))
             }
             HostRuntimeCommand::StdioWrite { stream, chunk } => {
                 let queue_len = {
@@ -1417,6 +1379,211 @@ fn runtime_timer_view(timer: &RuntimeTimerRecord) -> HostRuntimeTimer {
         kind: timer.kind.clone(),
         delay_ms: timer.delay_ms,
         due_at_ms: timer.due_at_ms,
+    }
+}
+
+fn build_runtime_bindings(
+    context_id: &str,
+    context: &RuntimeContextRecord,
+    engine: crate::engine::EngineDescriptor,
+) -> HostRuntimeBindings {
+    HostRuntimeBindings {
+        context_id: context_id.to_string(),
+        engine_name: engine.name.to_string(),
+        entrypoint: context.process.entrypoint.clone(),
+        globals: vec![
+            "console".into(),
+            "process".into(),
+            "Buffer".into(),
+            "setTimeout".into(),
+            "clearTimeout".into(),
+            "__runtime".into(),
+        ],
+        builtins: vec![
+            HostRuntimeBuiltinSpec {
+                name: "process".into(),
+                globals: vec!["process".into()],
+                modules: vec!["process".into(), "node:process".into()],
+                command_prefixes: vec!["process".into()],
+            },
+            HostRuntimeBuiltinSpec {
+                name: "fs".into(),
+                globals: Vec::new(),
+                modules: vec!["fs".into(), "node:fs".into()],
+                command_prefixes: vec!["fs".into()],
+            },
+            HostRuntimeBuiltinSpec {
+                name: "path".into(),
+                globals: Vec::new(),
+                modules: vec!["path".into(), "node:path".into()],
+                command_prefixes: vec!["path".into()],
+            },
+            HostRuntimeBuiltinSpec {
+                name: "buffer".into(),
+                globals: vec!["Buffer".into()],
+                modules: vec!["buffer".into(), "node:buffer".into()],
+                command_prefixes: Vec::new(),
+            },
+            HostRuntimeBuiltinSpec {
+                name: "timers".into(),
+                globals: vec!["setTimeout".into(), "clearTimeout".into()],
+                modules: vec!["timers".into(), "node:timers".into()],
+                command_prefixes: vec!["timers".into()],
+            },
+            HostRuntimeBuiltinSpec {
+                name: "console".into(),
+                globals: vec!["console".into()],
+                modules: vec!["console".into(), "node:console".into()],
+                command_prefixes: vec!["console".into()],
+            },
+        ],
+    }
+}
+
+fn build_runtime_bootstrap_plan(bindings: &HostRuntimeBindings) -> HostRuntimeBootstrapPlan {
+    let bootstrap_specifier = "runtime:bootstrap".to_string();
+    let entrypoint_literal = serde_json::to_string(&bindings.entrypoint)
+        .expect("entrypoint should serialize as json string");
+
+    HostRuntimeBootstrapPlan {
+        context_id: bindings.context_id.clone(),
+        engine_name: bindings.engine_name.clone(),
+        entrypoint: bindings.entrypoint.clone(),
+        bootstrap_specifier: bootstrap_specifier.clone(),
+        modules: vec![
+            HostRuntimeBootstrapModule {
+                specifier: "node:process".into(),
+                source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+const process = {
+  cwd() { return invoke("process.cwd"); },
+  chdir(path) { return invoke("process.chdir", { path }); },
+  exit(code = 0) { return invoke("process.exit", { code }); },
+  get argv() { return invoke("process.argv"); },
+  get env() { return invoke("process.env"); },
+  platform: "browser",
+};
+export default process;
+export const cwd = () => process.cwd();
+export const chdir = (path) => process.chdir(path);
+export const exit = (code = 0) => process.exit(code);
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: "node:fs".into(),
+                source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const existsSync = (path) => invoke("fs.exists", { path }).exists;
+export const statSync = (path) => invoke("fs.stat", { path }).entry;
+export const readdirSync = (path) => invoke("fs.read-dir", { path }).entries.map((entry) => entry.path);
+export const readFileSync = (path) => invoke("fs.read-file", { path });
+export const mkdirSync = (path) => invoke("fs.mkdir", { path });
+export const writeFileSync = (path, bytes, isText = false) =>
+  invoke("fs.write-file", { path, bytes, isText });
+export default {
+  existsSync,
+  statSync,
+  readdirSync,
+  readFileSync,
+  mkdirSync,
+  writeFileSync,
+};
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: "node:path".into(),
+                source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload).value;
+}
+export const resolve = (...segments) => invoke("path.resolve", { segments });
+export const join = (...segments) => invoke("path.join", { segments });
+export const dirname = (path) => invoke("path.dirname", { path });
+export const basename = (path) => invoke("path.basename", { path });
+export const extname = (path) => invoke("path.extname", { path });
+export const normalize = (path) => invoke("path.normalize", { path });
+export default { resolve, join, dirname, basename, extname, normalize };
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: "node:buffer".into(),
+                source: r#"export const Buffer = Uint8Array;
+export default { Buffer };
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: "node:timers".into(),
+                source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const setTimeout = (callback, delay = 0) => invoke("timers.schedule", { delayMs: delay, repeat: false, callback });
+export const clearTimeout = (timerId) => invoke("timers.clear", { timerId });
+export default { setTimeout, clearTimeout };
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: "node:console".into(),
+                source: r#"const runtime = globalThis.__runtime;
+function emit(level, values) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke("console.emit", { level, values });
+}
+const consoleValue = {
+  log: (...values) => emit("log", values),
+  info: (...values) => emit("info", values),
+  warn: (...values) => emit("warn", values),
+  error: (...values) => emit("error", values),
+};
+export { consoleValue as console };
+export default consoleValue;
+"#
+                .into(),
+            },
+            HostRuntimeBootstrapModule {
+                specifier: bootstrap_specifier,
+                source: format!(
+                    r#"import process from "node:process";
+import {{ Buffer }} from "node:buffer";
+import consoleValue from "node:console";
+import {{ setTimeout, clearTimeout }} from "node:timers";
+
+globalThis.process = process;
+globalThis.Buffer = Buffer;
+globalThis.console = consoleValue;
+globalThis.setTimeout = setTimeout;
+globalThis.clearTimeout = clearTimeout;
+
+export async function boot() {{
+  return import({entrypoint_literal});
+}}
+"#
+                ),
+            },
+        ],
     }
 }
 

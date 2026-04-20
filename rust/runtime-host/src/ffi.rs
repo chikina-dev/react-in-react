@@ -5,11 +5,12 @@ use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
-    HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
-    HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer,
-    HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewResponseDescriptor,
-    PreviewResponseKind, RunRequest,
+    HostRuntimeBindings, HostRuntimeBootstrapModule, HostRuntimeBootstrapPlan,
+    HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext,
+    HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind,
+    HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream,
+    HostRuntimeTimer, HostRuntimeTimerKind, PreviewResponseDescriptor, PreviewResponseKind,
+    RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -773,6 +774,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
 
     match kind.as_str() {
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
+        "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
         "stdio-write" => Ok(HostRuntimeCommand::StdioWrite {
             stream: match required_field(fields, "stream").as_deref() {
                 Some("stderr") => HostRuntimeStdioStream::Stderr,
@@ -1124,6 +1126,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-bindings\",\"bindings\":{}}}",
             render_runtime_bindings_json(bindings)
         ),
+        HostRuntimeResponse::BootstrapPlan(plan) => format!(
+            "{{\"kind\":\"runtime-bootstrap\",\"plan\":{}}}",
+            render_runtime_bootstrap_plan_json(plan)
+        ),
         HostRuntimeResponse::EventQueued { queue_len } => {
             format!("{{\"kind\":\"event-queued\",\"queueLen\":{queue_len}}}")
         }
@@ -1224,6 +1230,29 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             render_fs_response_json(response)
         ),
     }
+}
+
+fn render_runtime_bootstrap_plan_json(plan: &HostRuntimeBootstrapPlan) -> String {
+    format!(
+        "{{\"contextId\":{},\"engineName\":{},\"entrypoint\":{},\"bootstrapSpecifier\":{},\"modules\":[{}]}}",
+        format!("\"{}\"", escape_json(&plan.context_id)),
+        format!("\"{}\"", escape_json(&plan.engine_name)),
+        format!("\"{}\"", escape_json(&plan.entrypoint)),
+        format!("\"{}\"", escape_json(&plan.bootstrap_specifier)),
+        plan.modules
+            .iter()
+            .map(render_runtime_bootstrap_module_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_runtime_bootstrap_module_json(module: &HostRuntimeBootstrapModule) -> String {
+    format!(
+        "{{\"specifier\":{},\"source\":{}}}",
+        format!("\"{}\"", escape_json(&module.specifier)),
+        format!("\"{}\"", escape_json(&module.source))
+    )
 }
 
 fn render_runtime_bindings_json(bindings: &HostRuntimeBindings) -> String {
