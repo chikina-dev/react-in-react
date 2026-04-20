@@ -1,0 +1,18 @@
+[package]
+name = "quickjs-ng-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+name = "quickjs_ng_sys"
+path = "src/lib.rs"
+
+[features]
+default = []
+disable-assertions = []
+
+[build-dependencies]
+cc = "1"

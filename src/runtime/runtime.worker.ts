@@ -316,11 +316,25 @@ async function runSession(
     });
 
     if (bootResponse.kind === "runtime-engine-boot") {
+      const entryImportPlanResponse = await hostAdapter.executeRuntimeCommand(
+        runtimeContext.contextId,
+        {
+          kind: "runtime.prepare-module-import",
+          specifier: bootResponse.report.loaderPlan.entryModule.requestedSpecifier,
+        },
+      );
       await enqueueRuntimeStdout(
         hostAdapter,
         runtimeContext.contextId,
         `[engine-boot] pending-jobs=${bootResponse.report.pendingJobs} drained=${bootResponse.report.drainedJobs} entry=${bootResponse.report.loaderPlan.entryModule.resolvedSpecifier} loader-roots=${bootResponse.report.loaderPlan.nodeModuleSearchRoots.join(",") || "<none>"} result=${bootResponse.report.resultSummary || "<none>"}`,
       );
+      if (entryImportPlanResponse.kind === "runtime-module-import-plan") {
+        await enqueueRuntimeStdout(
+          hostAdapter,
+          runtimeContext.contextId,
+          `[engine-import] request=${entryImportPlanResponse.plan.requestSpecifier} resolved=${entryImportPlanResponse.plan.resolvedModule.resolvedSpecifier} format=${entryImportPlanResponse.plan.loadedModule.format} bytes=${entryImportPlanResponse.plan.loadedModule.source.length}`,
+        );
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown engine boot failure";

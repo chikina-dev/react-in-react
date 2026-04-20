@@ -13,7 +13,7 @@ use crate::protocol::{
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
     HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeLoadedModule,
-    HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord, HostRuntimeModuleSource,
+    HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord, HostRuntimeModuleSource,
     HostRuntimePort, HostRuntimePortProtocol,
     HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
     HostRuntimeTimerKind,
@@ -662,6 +662,24 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         self.runtime_module_loader(context_id)?.describe(context_id)
     }
 
+    pub fn prepare_runtime_module_import(
+        &self,
+        context_id: &str,
+        specifier: &str,
+        importer: Option<&str>,
+    ) -> RuntimeHostResult<HostRuntimeModuleImportPlan> {
+        let resolved_module = self.resolve_runtime_module(context_id, importer, specifier)?;
+        let loaded_module =
+            self.load_runtime_module(context_id, &resolved_module.resolved_specifier)?;
+
+        Ok(HostRuntimeModuleImportPlan {
+            request_specifier: specifier.to_string(),
+            importer: importer.map(ToOwned::to_owned),
+            resolved_module,
+            loaded_module,
+        })
+    }
+
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
         self.sessions.get(session_id).map(|record| &record.vfs)
     }
@@ -989,6 +1007,11 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             HostRuntimeCommand::ReadModule { specifier } => {
                 let module = self.read_engine_module(context_id, &specifier)?;
                 Ok(HostRuntimeResponse::ModuleSource(module))
+            }
+            HostRuntimeCommand::PrepareModuleImport { specifier, importer } => {
+                let plan =
+                    self.prepare_runtime_module_import(context_id, &specifier, importer.as_deref())?;
+                Ok(HostRuntimeResponse::ModuleImportPlan { plan })
             }
             HostRuntimeCommand::ResolveModule { specifier, importer } => {
                 let module = self.resolve_runtime_module(context_id, importer.as_deref(), &specifier)?;

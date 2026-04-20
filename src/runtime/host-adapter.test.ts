@@ -819,6 +819,32 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.prepare-module-import",
+      importer: "/workspace/src/server.ts",
+      specifier: "./boot",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-import-plan",
+    plan: {
+      requestSpecifier: "./boot",
+      importer: "/workspace/src/server.ts",
+      resolvedModule: {
+        requestedSpecifier: "./boot",
+        resolvedSpecifier: "/workspace/src/boot.ts",
+        kind: "workspace",
+        format: "module",
+      },
+      loadedModule: {
+        resolvedSpecifier: "/workspace/src/boot.ts",
+        kind: "workspace",
+        format: "module",
+        source: "export const boot = true;",
+      },
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "runtime.load-module",
       resolvedSpecifier: "/workspace/src/boot.ts",
     }),

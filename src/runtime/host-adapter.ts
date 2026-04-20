@@ -126,6 +126,13 @@ export type HostRuntimeLoadedModule = {
   source: string;
 };
 
+export type HostRuntimeModuleImportPlan = {
+  requestSpecifier: string;
+  importer: string | null;
+  resolvedModule: HostRuntimeResolvedModule;
+  loadedModule: HostRuntimeLoadedModule;
+};
+
 export type HostRuntimeModuleLoaderPlan = {
   contextId: string;
   engineName: string;
@@ -200,6 +207,7 @@ export type HostRuntimeCommand =
     }
   | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
   | { kind: "runtime.read-module"; specifier: string }
+  | { kind: "runtime.prepare-module-import"; specifier: string; importer?: string | null }
   | { kind: "runtime.resolve-module"; specifier: string; importer?: string | null }
   | { kind: "runtime.load-module"; resolvedSpecifier: string }
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
@@ -231,6 +239,7 @@ export type HostRuntimeResponse =
   | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
   | { kind: "runtime-module-list"; modules: HostRuntimeModuleRecord[] }
   | { kind: "runtime-module-source"; module: HostRuntimeModuleSource }
+  | { kind: "runtime-module-import-plan"; plan: HostRuntimeModuleImportPlan }
   | { kind: "runtime-module-resolved"; module: HostRuntimeResolvedModule }
   | { kind: "runtime-module-loaded"; module: HostRuntimeLoadedModule }
   | { kind: "event-queued"; queueLen: number }
@@ -1386,6 +1395,32 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           module,
         };
       }
+      case "runtime.prepare-module-import": {
+        const resolved = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.resolve-module",
+          specifier: command.specifier,
+          importer: command.importer ?? null,
+        });
+        if (resolved.kind !== "runtime-module-resolved") {
+          throw new Error(`runtime module resolve failed: ${command.specifier}`);
+        }
+        const loaded = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.load-module",
+          resolvedSpecifier: resolved.module.resolvedSpecifier,
+        });
+        if (loaded.kind !== "runtime-module-loaded") {
+          throw new Error(`runtime module load failed: ${resolved.module.resolvedSpecifier}`);
+        }
+        return {
+          kind: "runtime-module-import-plan",
+          plan: {
+            requestSpecifier: command.specifier,
+            importer: command.importer ?? null,
+            resolvedModule: resolved.module,
+            loadedModule: loaded.module,
+          },
+        };
+      }
       case "runtime.resolve-module": {
         const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
         const builtin = plan.modules.find((entry) => entry.specifier === command.specifier);
@@ -2307,6 +2342,13 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         lines.push("command=runtime-read-module");
         lines.push(`specifier=${encodeHex(command.specifier)}`);
         break;
+      case "runtime.prepare-module-import":
+        lines.push("command=runtime-prepare-module-import");
+        lines.push(`specifier=${encodeHex(command.specifier)}`);
+        if (command.importer) {
+          lines.push(`importer=${encodeHex(command.importer)}`);
+        }
+        break;
       case "runtime.resolve-module":
         lines.push("command=runtime-resolve-module");
         lines.push(`specifier=${encodeHex(command.specifier)}`);
@@ -2451,6 +2493,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
       | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
+      | { kind: "runtime-module-import-plan"; plan: HostRuntimeModuleImportPlan }
       | { kind: "event-queued"; queueLen: number }
       | { kind: "runtime-events"; events: HostRuntimeEvent[] }
       | { kind: "port-listening"; port: HostRuntimePort }

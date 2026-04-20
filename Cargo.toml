@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/runtime-host"]
+members = ["rust/runtime-host", "rust/quickjs-ng-sys"]
 resolver = "2"
 
 [workspace.package]

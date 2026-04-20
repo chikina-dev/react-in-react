@@ -179,6 +179,14 @@ pub struct HostRuntimeLoadedModule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeModuleImportPlan {
+    pub request_specifier: String,
+    pub importer: Option<String>,
+    pub resolved_module: HostRuntimeResolvedModule,
+    pub loaded_module: HostRuntimeLoadedModule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimeModuleLoaderPlan {
     pub context_id: String,
     pub engine_name: String,
@@ -362,6 +370,10 @@ pub enum HostRuntimeCommand {
     ReadModule {
         specifier: String,
     },
+    PrepareModuleImport {
+        specifier: String,
+        importer: Option<String>,
+    },
     ResolveModule {
         specifier: String,
         importer: Option<String>,
@@ -449,6 +461,9 @@ pub enum HostRuntimeResponse {
         modules: Vec<HostRuntimeModuleRecord>,
     },
     ModuleSource(HostRuntimeModuleSource),
+    ModuleImportPlan {
+        plan: HostRuntimeModuleImportPlan,
+    },
     ModuleResolved {
         module: HostRuntimeResolvedModule,
     },

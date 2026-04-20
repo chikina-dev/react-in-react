@@ -905,6 +905,15 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 None => String::new(),
             },
         }),
+        "runtime-prepare-module-import" => Ok(HostRuntimeCommand::PrepareModuleImport {
+            specifier: match required_field(fields, "specifier") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => String::new(),
+            },
+            importer: required_field(fields, "importer")
+                .map(|encoded| decode_hex(&encoded))
+                .transpose()?,
+        }),
         "runtime-resolve-module" => Ok(HostRuntimeCommand::ResolveModule {
             specifier: match required_field(fields, "specifier") {
                 Some(encoded) => decode_hex(&encoded)?,
@@ -1337,6 +1346,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-module-source\",\"module\":{}}}",
             render_runtime_module_source_json(module)
         ),
+        HostRuntimeResponse::ModuleImportPlan { plan } => format!(
+            "{{\"kind\":\"runtime-module-import-plan\",\"plan\":{}}}",
+            render_runtime_module_import_plan_json(plan)
+        ),
         HostRuntimeResponse::ModuleResolved { module } => format!(
             "{{\"kind\":\"runtime-module-resolved\",\"module\":{}}}",
             render_runtime_resolved_module_json(module)
@@ -1521,6 +1534,21 @@ fn render_runtime_module_source_json(module: &crate::protocol::HostRuntimeModule
         "{{\"specifier\":{},\"source\":{}}}",
         format!("\"{}\"", escape_json(&module.specifier)),
         format!("\"{}\"", escape_json(&module.source)),
+    )
+}
+
+fn render_runtime_module_import_plan_json(
+    plan: &crate::protocol::HostRuntimeModuleImportPlan,
+) -> String {
+    format!(
+        "{{\"requestSpecifier\":{},\"importer\":{},\"resolvedModule\":{},\"loadedModule\":{}}}",
+        format!("\"{}\"", escape_json(&plan.request_specifier)),
+        plan.importer
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+        render_runtime_resolved_module_json(&plan.resolved_module),
+        render_runtime_loaded_module_json(&plan.loaded_module),
     )
 }
 

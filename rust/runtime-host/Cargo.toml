@@ -10,6 +10,11 @@ name = "runtime_host"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+quickjs-ng-engine = ["dep:quickjs-ng-sys"]
+
 [dependencies]
+quickjs-ng-sys = { path = "../quickjs-ng-sys", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

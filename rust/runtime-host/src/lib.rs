@@ -31,6 +31,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    #[cfg(not(feature = "quickjs-ng-engine"))]
     use crate::protocol::HostRuntimeModuleFormat;
 
     #[test]
@@ -117,6 +118,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "quickjs-ng-engine"))]
     #[test]
     fn quickjs_ng_engine_scaffold_reports_unlinked_vm() {
         let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
@@ -201,6 +203,73 @@ mod tests {
             .contains(&String::from("runtime:bootstrap")));
         assert_eq!(
             loader_plan.node_module_search_roots,
+            vec![
+                String::from("/workspace/node_modules"),
+                String::from("/workspace/src/node_modules"),
+            ]
+        );
+    }
+
+    #[cfg(feature = "quickjs-ng-engine")]
+    #[test]
+    fn quickjs_ng_engine_evaluates_scripts_but_loader_boot_is_still_stubbed() {
+        let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "quickjs.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("quickjs-app".into()),
+                BTreeMap::new(),
+                vec![VirtualFile::text(
+                    "/workspace/src/main.js",
+                    "globalThis.answer = 40 + 2; globalThis.answer;",
+                )],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should be created");
+
+        assert_eq!(host.boot_summary().engine_name, "quickjs-ng-native-loader-stub");
+
+        let eval = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/src/main.js",
+                "globalThis.answer = 40 + 2; globalThis.answer;",
+                false,
+            )
+            .expect("quickjs-ng should evaluate a simple script");
+        assert_eq!(eval.state, EngineContextState::Ready);
+        assert!(eval.result_summary.contains("42"));
+
+        let snapshot = host
+            .describe_engine_context(&runtime_context.context_id)
+            .expect("engine context should exist");
+        assert_eq!(snapshot.state, EngineContextState::Ready);
+
+        assert!(matches!(
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine),
+            Err(RuntimeHostError::EngineFailure(message))
+                if message.contains("module loader callback is not wired yet")
+        ));
+        let snapshot = host
+            .describe_engine_context(&runtime_context.context_id)
+            .expect("engine context should exist");
+        assert_eq!(snapshot.registered_modules, 7);
+        assert_eq!(
+            snapshot.bootstrap_specifier.as_deref(),
+            Some("runtime:bootstrap")
+        );
+        assert_eq!(
+            snapshot.module_loader_roots,
             vec![
                 String::from("/workspace/node_modules"),
                 String::from("/workspace/src/node_modules"),
@@ -340,6 +409,18 @@ mod tests {
             .load_runtime_module(&runtime_context.context_id, &relative_module.resolved_specifier)
             .expect("relative module should load");
         assert!(relative_source.source.contains("generated"));
+        let import_plan = host
+            .prepare_runtime_module_import(
+                &runtime_context.context_id,
+                "./generated/app",
+                Some("/workspace/src/main.tsx"),
+            )
+            .expect("runtime module import plan should resolve");
+        assert_eq!(
+            import_plan.resolved_module.resolved_specifier,
+            "/workspace/src/generated/app.ts"
+        );
+        assert!(import_plan.loaded_module.source.contains("generated"));
         let loader_plan = host
             .describe_runtime_module_loader(&runtime_context.context_id)
             .expect("module loader plan should resolve");
