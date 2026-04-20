@@ -1,13 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
-    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -62,6 +63,8 @@ struct RuntimeContextRecord {
     process: HostProcessInfo,
     clock_ms: u64,
     timers: BTreeMap<String, RuntimeTimerRecord>,
+    events: VecDeque<HostRuntimeEvent>,
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +276,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 process: process.clone(),
                 clock_ms: 0,
                 timers: BTreeMap::new(),
+                events: VecDeque::new(),
+                exit_code: None,
             },
         );
 
@@ -603,10 +608,58 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                             name: "console".into(),
                             globals: vec!["console".into()],
                             modules: vec!["console".into(), "node:console".into()],
-                            command_prefixes: Vec::new(),
+                            command_prefixes: vec!["console".into()],
                         },
                     ],
                 }))
+            }
+            HostRuntimeCommand::StdioWrite { stream, chunk } => {
+                let queue_len = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let event = match stream {
+                        HostRuntimeStdioStream::Stdout => HostRuntimeEvent::Stdout { chunk },
+                        HostRuntimeStdioStream::Stderr => HostRuntimeEvent::Stderr { chunk },
+                    };
+                    context.events.push_back(event);
+                    context.events.len()
+                };
+
+                Ok(HostRuntimeResponse::EventQueued { queue_len })
+            }
+            HostRuntimeCommand::ConsoleEmit { level, values } => {
+                let queue_len = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let line = values.join(" ");
+                    context.events.push_back(HostRuntimeEvent::Console {
+                        level: level.clone(),
+                        line: line.clone(),
+                    });
+                    context.events.push_back(match level {
+                        HostRuntimeConsoleLevel::Warn | HostRuntimeConsoleLevel::Error => {
+                            HostRuntimeEvent::Stderr { chunk: line }
+                        }
+                        HostRuntimeConsoleLevel::Log | HostRuntimeConsoleLevel::Info => {
+                            HostRuntimeEvent::Stdout { chunk: line }
+                        }
+                    });
+                    context.events.len()
+                };
+
+                Ok(HostRuntimeResponse::EventQueued { queue_len })
+            }
+            HostRuntimeCommand::DrainEvents => {
+                let events = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    context.events.drain(..).collect::<Vec<_>>()
+                };
+
+                Ok(HostRuntimeResponse::RuntimeEvents { events })
             }
             HostRuntimeCommand::TimerSchedule { delay_ms, repeat } => {
                 let timer = {
@@ -674,6 +727,17 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
                 Ok(HostRuntimeResponse::ProcessInfo(context.process))
             }
+            HostRuntimeCommand::ProcessStatus => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::ProcessStatus {
+                    exited: context.exit_code.is_some(),
+                    exit_code: context.exit_code,
+                })
+            }
             HostRuntimeCommand::ProcessCwd => {
                 let context = self
                     .runtime_contexts
@@ -703,6 +767,23 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 Ok(HostRuntimeResponse::ProcessEnv {
                     env: context.process.env.clone(),
                 })
+            }
+            HostRuntimeCommand::ProcessExit { code } => {
+                let response = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    context.exit_code = Some(code);
+                    context
+                        .events
+                        .push_back(HostRuntimeEvent::ProcessExit { code });
+                    HostRuntimeResponse::ProcessStatus {
+                        exited: true,
+                        exit_code: Some(code),
+                    }
+                };
+
+                Ok(response)
             }
             HostRuntimeCommand::ProcessChdir { path } => {
                 let (session_id, cwd) = {

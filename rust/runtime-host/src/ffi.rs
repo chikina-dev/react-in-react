@@ -5,8 +5,9 @@ use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
-    HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeContext,
-    HostRuntimeResponse, HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
+    HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
+    HostRuntimeContext, HostRuntimeEvent, HostRuntimeResponse, HostRuntimeStdioStream,
+    HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -770,6 +771,26 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
 
     match kind.as_str() {
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
+        "stdio-write" => Ok(HostRuntimeCommand::StdioWrite {
+            stream: match required_field(fields, "stream").as_deref() {
+                Some("stderr") => HostRuntimeStdioStream::Stderr,
+                _ => HostRuntimeStdioStream::Stdout,
+            },
+            chunk: match required_field(fields, "chunk") {
+                Some(encoded) => decode_hex(&encoded)?,
+                None => String::new(),
+            },
+        }),
+        "console-emit" => Ok(HostRuntimeCommand::ConsoleEmit {
+            level: match required_field(fields, "level").as_deref() {
+                Some("info") => HostRuntimeConsoleLevel::Info,
+                Some("warn") => HostRuntimeConsoleLevel::Warn,
+                Some("error") => HostRuntimeConsoleLevel::Error,
+                _ => HostRuntimeConsoleLevel::Log,
+            },
+            values: parse_hex_path_list(fields.get("values").map(String::as_str).unwrap_or(""))?,
+        }),
+        "runtime-drain-events" => Ok(HostRuntimeCommand::DrainEvents),
         "timers-schedule" => Ok(HostRuntimeCommand::TimerSchedule {
             delay_ms: parse_u64_field(fields, "delay_ms"),
             repeat: fields
@@ -785,9 +806,16 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
             elapsed_ms: parse_u64_field(fields, "elapsed_ms"),
         }),
         "process-info" => Ok(HostRuntimeCommand::ProcessInfo),
+        "process-status" => Ok(HostRuntimeCommand::ProcessStatus),
         "process-cwd" => Ok(HostRuntimeCommand::ProcessCwd),
         "process-argv" => Ok(HostRuntimeCommand::ProcessArgv),
         "process-env" => Ok(HostRuntimeCommand::ProcessEnv),
+        "process-exit" => Ok(HostRuntimeCommand::ProcessExit {
+            code: fields
+                .get("code")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0),
+        }),
         "process-chdir" => Ok(HostRuntimeCommand::ProcessChdir {
             path: match required_field(fields, "path") {
                 Some(encoded) => decode_hex(&encoded)?,
@@ -1050,6 +1078,13 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-bindings\",\"bindings\":{}}}",
             render_runtime_bindings_json(bindings)
         ),
+        HostRuntimeResponse::EventQueued { queue_len } => {
+            format!("{{\"kind\":\"event-queued\",\"queueLen\":{queue_len}}}")
+        }
+        HostRuntimeResponse::RuntimeEvents { events } => format!(
+            "{{\"kind\":\"runtime-events\",\"events\":{}}}",
+            render_runtime_events_json(events)
+        ),
         HostRuntimeResponse::TimerScheduled { timer } => format!(
             "{{\"kind\":\"timer-scheduled\",\"timer\":{}}}",
             render_runtime_timer_json(timer)
@@ -1072,6 +1107,13 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
         HostRuntimeResponse::ProcessInfo(process) => format!(
             "{{\"kind\":\"process-info\",\"process\":{}}}",
             render_process_info_json(process)
+        ),
+        HostRuntimeResponse::ProcessStatus { exited, exit_code } => format!(
+            "{{\"kind\":\"process-status\",\"exited\":{},\"exitCode\":{}}}",
+            exited,
+            exit_code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string())
         ),
         HostRuntimeResponse::ProcessCwd { cwd } => format!(
             "{{\"kind\":\"process-cwd\",\"cwd\":\"{}\"}}",
@@ -1152,6 +1194,46 @@ fn render_runtime_timer_array_json(timers: &[HostRuntimeTimer]) -> String {
         .join(",");
 
     format!("[{items}]")
+}
+
+fn render_runtime_events_json(events: &[HostRuntimeEvent]) -> String {
+    let items = events
+        .iter()
+        .map(render_runtime_event_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
+}
+
+fn render_runtime_event_json(event: &HostRuntimeEvent) -> String {
+    match event {
+        HostRuntimeEvent::Stdout { chunk } => format!(
+            "{{\"kind\":\"stdout\",\"chunk\":\"{}\"}}",
+            escape_json(chunk)
+        ),
+        HostRuntimeEvent::Stderr { chunk } => format!(
+            "{{\"kind\":\"stderr\",\"chunk\":\"{}\"}}",
+            escape_json(chunk)
+        ),
+        HostRuntimeEvent::Console { level, line } => {
+            let level = match level {
+                HostRuntimeConsoleLevel::Log => "log",
+                HostRuntimeConsoleLevel::Info => "info",
+                HostRuntimeConsoleLevel::Warn => "warn",
+                HostRuntimeConsoleLevel::Error => "error",
+            };
+
+            format!(
+                "{{\"kind\":\"console\",\"level\":\"{}\",\"line\":\"{}\"}}",
+                level,
+                escape_json(line)
+            )
+        }
+        HostRuntimeEvent::ProcessExit { code } => {
+            format!("{{\"kind\":\"process-exit\",\"code\":{code}}}")
+        }
+    }
 }
 
 fn render_error_json(message: &str) -> String {

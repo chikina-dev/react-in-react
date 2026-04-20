@@ -11,9 +11,10 @@ pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
-    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
-    SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
+    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -219,8 +220,53 @@ mod tests {
                     && bindings
                         .builtins
                         .iter()
+                        .any(|builtin| builtin.name == "console"
+                            && builtin.command_prefixes == vec!["console".to_string()])
+                    && bindings
+                        .builtins
+                        .iter()
                         .any(|builtin| builtin.name == "timers"
                             && builtin.command_prefixes == vec!["timers".to_string()])
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::StdioWrite {
+                    stream: HostRuntimeStdioStream::Stdout,
+                    chunk: String::from("hello stdout"),
+                },
+            ),
+            Ok(HostRuntimeResponse::EventQueued { queue_len }) if queue_len == 1
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::ConsoleEmit {
+                    level: HostRuntimeConsoleLevel::Warn,
+                    values: vec![String::from("watch"), String::from("out")],
+                },
+            ),
+            Ok(HostRuntimeResponse::EventQueued { queue_len }) if queue_len == 3
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DrainEvents,
+            ),
+            Ok(HostRuntimeResponse::RuntimeEvents { events })
+                if events
+                    == vec![
+                        HostRuntimeEvent::Stdout {
+                            chunk: String::from("hello stdout"),
+                        },
+                        HostRuntimeEvent::Console {
+                            level: HostRuntimeConsoleLevel::Warn,
+                            line: String::from("watch out"),
+                        },
+                        HostRuntimeEvent::Stderr {
+                            chunk: String::from("watch out"),
+                        },
+                    ]
         ));
         assert!(matches!(
             host.execute_runtime_command(
@@ -310,6 +356,16 @@ mod tests {
         assert!(matches!(
             host.execute_runtime_command(
                 &runtime_context.context_id,
+                HostRuntimeCommand::ProcessStatus,
+            ),
+            Ok(HostRuntimeResponse::ProcessStatus {
+                exited: false,
+                exit_code: None,
+            })
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
                 HostRuntimeCommand::ProcessChdir {
                     path: String::from("generated"),
                 },
@@ -345,6 +401,24 @@ mod tests {
                 },
             ),
             Ok(HostRuntimeResponse::PathValue { value }) if value == ".log"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::ProcessExit { code: 0 },
+            ),
+            Ok(HostRuntimeResponse::ProcessStatus {
+                exited: true,
+                exit_code: Some(0),
+            })
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DrainEvents,
+            ),
+            Ok(HostRuntimeResponse::RuntimeEvents { events })
+                if events == vec![HostRuntimeEvent::ProcessExit { code: 0 }]
         ));
         assert_eq!(
             host.plan_run(

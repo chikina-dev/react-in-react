@@ -226,40 +226,59 @@ async function runSession(
     pid,
     `[mount] ${record.session.archive.fileCount} files available at /workspace`,
   );
-  await emitStdout(sessionId, pid, `[exec] ${request.command} ${request.args.join(" ")}`.trim());
+
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
+    `[exec] ${request.command} ${request.args.join(" ")}`.trim(),
+  );
 
   if (runPlan.resolvedScript) {
-    await emitStdout(sessionId, pid, `[script] ${runPlan.resolvedScript}`);
+    await enqueueRuntimeStdout(
+      hostAdapter,
+      runtimeContext.contextId,
+      `[script] ${runPlan.resolvedScript}`,
+    );
   }
 
-  await emitStdout(
-    sessionId,
-    pid,
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
     `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
   );
-  await emitStdout(
-    sessionId,
-    pid,
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
     `[host-vfs] files=${record.hostFiles.count} sample=${record.hostFiles.samplePath ?? "<none>"} size=${record.hostFiles.sampleSize ?? 0}`,
   );
-  await emitStdout(
-    sessionId,
-    pid,
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
     `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
   );
-  await emitStdout(
-    sessionId,
-    pid,
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
     `[process] exec=${processInfo.execPath} cwd=${processCwd} argv=${processInfo.argv.join(" ")}`,
   );
-  await emitStdout(sessionId, pid, `[bindings] ${runtimeBindingsSummary}`);
-  await emitStdout(sessionId, pid, `[context] id=${runtimeContext.contextId}`);
-
-  await emitStdout(
-    sessionId,
-    pid,
-    `[detect] react=${record.session.capabilities.detectedReact} vite=${record.session.capabilities.detectedVite}`,
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
+    `[bindings] ${runtimeBindingsSummary}`,
   );
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
+    `[context] id=${runtimeContext.contextId}`,
+  );
+  await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
+    kind: "console.emit",
+    level: "info",
+    values: [
+      `[detect] react=${record.session.capabilities.detectedReact} vite=${record.session.capabilities.detectedVite}`,
+    ],
+  });
+  await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
 
   if (activeProcess.cancelled) {
     return;
@@ -317,14 +336,13 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
     return;
   }
 
-  if (record.runtimeContext) {
-    const contextId = record.runtimeContext.contextId;
-    record.runtimeContext = null;
-    const hostAdapter = await hostAdapterPromise;
-    await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
-  }
-
   if (!record.process) {
+    if (record.runtimeContext) {
+      const contextId = record.runtimeContext.contextId;
+      record.runtimeContext = null;
+      const hostAdapter = await hostAdapterPromise;
+      await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
+    }
     record.preview = null;
     record.session.state = "stopped";
     emitState(sessionId, "stopped");
@@ -332,19 +350,34 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
   }
 
   const { process } = record;
+  const contextId = record.runtimeContext?.contextId ?? null;
   process.cancelled = true;
   process.exitCode = 130;
+
+  if (contextId) {
+    const hostAdapter = await hostAdapterPromise;
+    await hostAdapter
+      .executeRuntimeCommand(contextId, {
+        kind: "process.exit",
+        code: 130,
+      })
+      .catch(() => undefined);
+    await flushRuntimeEvents(hostAdapter, sessionId, process.pid, contextId).catch(() => undefined);
+    await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
+  } else {
+    postMessage({
+      type: "process.exit",
+      sessionId,
+      pid: process.pid,
+      code: 130,
+    } satisfies WorkerToUiMessage);
+  }
+
   record.process = null;
+  record.runtimeContext = null;
   record.preview = null;
   record.session.state = "stopped";
   emitState(sessionId, "stopped");
-
-  postMessage({
-    type: "process.exit",
-    sessionId,
-    pid: process.pid,
-    code: 130,
-  } satisfies WorkerToUiMessage);
 }
 
 function buildPreviewModel(session: SessionSnapshot, runPlan: HostRunPlan): PreviewModel {
@@ -376,6 +409,59 @@ async function emitStdout(sessionId: string, pid: number, chunk: string): Promis
     pid,
     chunk,
   } satisfies WorkerToUiMessage);
+}
+
+async function enqueueRuntimeStdout(
+  hostAdapter: Awaited<typeof hostAdapterPromise>,
+  contextId: string,
+  chunk: string,
+): Promise<void> {
+  await hostAdapter.executeRuntimeCommand(contextId, {
+    kind: "stdio.write",
+    stream: "stdout",
+    chunk,
+  });
+}
+
+async function flushRuntimeEvents(
+  hostAdapter: Awaited<typeof hostAdapterPromise>,
+  sessionId: string,
+  pid: number,
+  contextId: string,
+): Promise<void> {
+  const drained = await hostAdapter.executeRuntimeCommand(contextId, {
+    kind: "runtime.drain-events",
+  });
+
+  if (drained.kind !== "runtime-events") {
+    return;
+  }
+
+  for (const event of drained.events) {
+    switch (event.kind) {
+      case "stdout":
+        await emitStdout(sessionId, pid, event.chunk);
+        break;
+      case "stderr":
+        postMessage({
+          type: "process.stderr",
+          sessionId,
+          pid,
+          chunk: event.chunk,
+        } satisfies WorkerToUiMessage);
+        break;
+      case "process-exit":
+        postMessage({
+          type: "process.exit",
+          sessionId,
+          pid,
+          code: event.code,
+        } satisfies WorkerToUiMessage);
+        break;
+      case "console":
+        break;
+    }
+  }
 }
 
 function emitState(sessionId: string, state: SessionSnapshot["state"]): void {

@@ -49,6 +49,15 @@ export type HostRuntimeBindings = {
   builtins: HostRuntimeBuiltinSpec[];
 };
 
+export type HostRuntimeStdioStream = "stdout" | "stderr";
+export type HostRuntimeConsoleLevel = "log" | "info" | "warn" | "error";
+
+export type HostRuntimeEvent =
+  | { kind: "stdout"; chunk: string }
+  | { kind: "stderr"; chunk: string }
+  | { kind: "console"; level: HostRuntimeConsoleLevel; line: string }
+  | { kind: "process-exit"; code: number };
+
 export type HostRuntimeTimerKind = "timeout" | "interval";
 
 export type HostRuntimeTimer = {
@@ -62,15 +71,20 @@ export type HostRuntimeCommand =
   | {
       kind:
         | "runtime.describe"
+        | "runtime.drain-events"
         | "timers.list"
         | "process.info"
+        | "process.status"
         | "process.cwd"
         | "process.argv"
         | "process.env";
     }
+  | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
+  | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
   | { kind: "timers.schedule"; delayMs: number; repeat: boolean }
   | { kind: "timers.clear"; timerId: string }
   | { kind: "timers.advance"; elapsedMs: number }
+  | { kind: "process.exit"; code: number }
   | { kind: "process.chdir"; path: string }
   | { kind: "path.resolve" | "path.join"; segments: string[] }
   | { kind: "path.dirname" | "path.basename" | "path.extname" | "path.normalize"; path: string }
@@ -84,11 +98,14 @@ export type HostRuntimeCommand =
 
 export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+  | { kind: "event-queued"; queueLen: number }
+  | { kind: "runtime-events"; events: HostRuntimeEvent[] }
   | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
   | { kind: "timer-cleared"; timerId: string; existed: boolean }
   | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
   | { kind: "timer-fired"; nowMs: number; timers: HostRuntimeTimer[] }
   | { kind: "process-info"; process: HostProcessInfo }
+  | { kind: "process-status"; exited: boolean; exitCode: number | null }
   | { kind: "process-cwd"; cwd: string }
   | { kind: "process-argv"; argv: string[] }
   | { kind: "process-env"; env: Record<string, string> }
@@ -301,6 +318,8 @@ type HostRuntimeContextRecord = {
   process: HostProcessInfo;
   clockMs: number;
   timers: Map<string, HostRuntimeTimer>;
+  events: HostRuntimeEvent[];
+  exitCode: number | null;
 };
 
 export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
@@ -416,6 +435,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       process,
       clockMs: 0,
       timers: new Map<string, HostRuntimeTimer>(),
+      events: [] as HostRuntimeEvent[],
+      exitCode: null,
     };
     this.runtimeContexts.set(contextId, context);
     return context;
@@ -740,11 +761,44 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
                 name: "console",
                 globals: ["console"],
                 modules: ["console", "node:console"],
-                commandPrefixes: [],
+                commandPrefixes: ["console"],
               },
             ],
           },
         };
+      case "stdio.write":
+        context.events.push({
+          kind: command.stream,
+          chunk: command.chunk,
+        });
+        return {
+          kind: "event-queued",
+          queueLen: context.events.length,
+        };
+      case "console.emit": {
+        const line = command.values.join(" ");
+        context.events.push({
+          kind: "console",
+          level: command.level,
+          line,
+        });
+        context.events.push({
+          kind: command.level === "warn" || command.level === "error" ? "stderr" : "stdout",
+          chunk: line,
+        });
+        return {
+          kind: "event-queued",
+          queueLen: context.events.length,
+        };
+      }
+      case "runtime.drain-events": {
+        const events = [...context.events];
+        context.events = [];
+        return {
+          kind: "runtime-events",
+          events,
+        };
+      }
       case "timers.schedule": {
         const timer: HostRuntimeTimer = {
           timerId: `runtime-timer-${this.nextRuntimeTimerId++}`,
@@ -806,6 +860,23 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         return {
           kind: "process-env",
           env: { ...context.process.env },
+        };
+      case "process.status":
+        return {
+          kind: "process-status",
+          exited: context.exitCode !== null,
+          exitCode: context.exitCode,
+        };
+      case "process.exit":
+        context.exitCode = command.code;
+        context.events.push({
+          kind: "process-exit",
+          code: command.code,
+        });
+        return {
+          kind: "process-status",
+          exited: true,
+          exitCode: command.code,
         };
       case "process.chdir": {
         const record = this.sessions.get(context.sessionId);
@@ -1360,6 +1431,19 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.describe":
         lines.push("command=runtime-describe");
         break;
+      case "stdio.write":
+        lines.push("command=stdio-write");
+        lines.push(`stream=${command.stream}`);
+        lines.push(`chunk=${encodeHex(command.chunk)}`);
+        break;
+      case "console.emit":
+        lines.push("command=console-emit");
+        lines.push(`level=${command.level}`);
+        lines.push(`values=${command.values.map((value) => encodeHex(value)).join("\u001f")}`);
+        break;
+      case "runtime.drain-events":
+        lines.push("command=runtime-drain-events");
+        break;
       case "timers.schedule":
         lines.push("command=timers-schedule");
         lines.push(`delay_ms=${String(command.delayMs)}`);
@@ -1379,6 +1463,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "process.info":
         lines.push("command=process-info");
         break;
+      case "process.status":
+        lines.push("command=process-status");
+        break;
       case "process.cwd":
         lines.push("command=process-cwd");
         break;
@@ -1387,6 +1474,10 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         break;
       case "process.env":
         lines.push("command=process-env");
+        break;
+      case "process.exit":
+        lines.push("command=process-exit");
+        lines.push(`code=${String(command.code)}`);
         break;
       case "process.chdir":
         lines.push("command=process-chdir");
@@ -1437,11 +1528,14 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
 
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
+      | { kind: "event-queued"; queueLen: number }
+      | { kind: "runtime-events"; events: HostRuntimeEvent[] }
       | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
       | { kind: "timer-cleared"; timerId: string; existed: boolean }
       | { kind: "timer-list"; nowMs: number; timers: HostRuntimeTimer[] }
       | { kind: "timer-fired"; nowMs: number; timers: HostRuntimeTimer[] }
       | { kind: "process-info"; process: HostProcessInfo }
+      | { kind: "process-status"; exited: boolean; exitCode: number | null }
       | { kind: "process-cwd"; cwd: string }
       | { kind: "process-argv"; argv: string[] }
       | { kind: "process-env"; env: Record<string, string> }

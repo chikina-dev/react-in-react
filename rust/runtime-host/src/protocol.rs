@@ -113,6 +113,20 @@ pub struct HostRuntimeBindings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeStdioStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeConsoleLevel {
+    Log,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeTimerKind {
     Timeout,
     Interval,
@@ -124,6 +138,23 @@ pub struct HostRuntimeTimer {
     pub kind: HostRuntimeTimerKind,
     pub delay_ms: u64,
     pub due_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimeEvent {
+    Stdout {
+        chunk: String,
+    },
+    Stderr {
+        chunk: String,
+    },
+    Console {
+        level: HostRuntimeConsoleLevel,
+        line: String,
+    },
+    ProcessExit {
+        code: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,27 +235,67 @@ pub enum HostContextFsCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeCommand {
     DescribeBindings,
-    TimerSchedule { delay_ms: u64, repeat: bool },
-    TimerClear { timer_id: String },
+    StdioWrite {
+        stream: HostRuntimeStdioStream,
+        chunk: String,
+    },
+    ConsoleEmit {
+        level: HostRuntimeConsoleLevel,
+        values: Vec<String>,
+    },
+    DrainEvents,
+    TimerSchedule {
+        delay_ms: u64,
+        repeat: bool,
+    },
+    TimerClear {
+        timer_id: String,
+    },
     TimerList,
-    TimerAdvance { elapsed_ms: u64 },
+    TimerAdvance {
+        elapsed_ms: u64,
+    },
     ProcessInfo,
+    ProcessStatus,
     ProcessCwd,
     ProcessArgv,
     ProcessEnv,
-    ProcessChdir { path: String },
-    PathResolve { segments: Vec<String> },
-    PathJoin { segments: Vec<String> },
-    PathDirname { path: String },
-    PathBasename { path: String },
-    PathExtname { path: String },
-    PathNormalize { path: String },
+    ProcessExit {
+        code: i32,
+    },
+    ProcessChdir {
+        path: String,
+    },
+    PathResolve {
+        segments: Vec<String>,
+    },
+    PathJoin {
+        segments: Vec<String>,
+    },
+    PathDirname {
+        path: String,
+    },
+    PathBasename {
+        path: String,
+    },
+    PathExtname {
+        path: String,
+    },
+    PathNormalize {
+        path: String,
+    },
     Fs(HostContextFsCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
+    EventQueued {
+        queue_len: usize,
+    },
+    RuntimeEvents {
+        events: Vec<HostRuntimeEvent>,
+    },
     TimerScheduled {
         timer: HostRuntimeTimer,
     },
@@ -241,6 +312,10 @@ pub enum HostRuntimeResponse {
         timers: Vec<HostRuntimeTimer>,
     },
     ProcessInfo(HostProcessInfo),
+    ProcessStatus {
+        exited: bool,
+        exit_code: Option<i32>,
+    },
     ProcessCwd {
         cwd: String,
     },

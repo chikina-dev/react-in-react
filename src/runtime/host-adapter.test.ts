@@ -561,10 +561,55 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           name: "console",
           globals: ["console"],
           modules: ["console", "node:console"],
-          commandPrefixes: [],
+          commandPrefixes: ["console"],
         },
       ],
     },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "stdio.write",
+      stream: "stdout",
+      chunk: "hello stdout",
+    }),
+  ).resolves.toEqual({
+    kind: "event-queued",
+    queueLen: 1,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "console.emit",
+      level: "warn",
+      values: ["watch", "out"],
+    }),
+  ).resolves.toEqual({
+    kind: "event-queued",
+    queueLen: 3,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-events",
+    events: [
+      {
+        kind: "stdout",
+        chunk: "hello stdout",
+      },
+      {
+        kind: "console",
+        level: "warn",
+        line: "watch out",
+      },
+      {
+        kind: "stderr",
+        chunk: "watch out",
+      },
+    ],
   });
 
   await expect(
@@ -711,6 +756,16 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.status",
+    }),
+  ).resolves.toEqual({
+    kind: "process-status",
+    exited: false,
+    exitCode: null,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "process.chdir",
       path: "../src/generated/nested",
     }),
@@ -767,6 +822,31 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   ).resolves.toEqual({
     kind: "path-value",
     value: ".log",
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "process.exit",
+      code: 0,
+    }),
+  ).resolves.toEqual({
+    kind: "process-status",
+    exited: true,
+    exitCode: 0,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-events",
+    events: [
+      {
+        kind: "process-exit",
+        code: 0,
+      },
+    ],
   });
 
   await expect(adapter.dropRuntimeContext(runtimeContext.contextId)).resolves.toBeUndefined();
