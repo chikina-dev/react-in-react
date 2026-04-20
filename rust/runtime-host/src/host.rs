@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Deserialize;
 
-use crate::engine::EngineAdapter;
+use crate::engine::{
+    EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextSpec, EngineEvalMode,
+    EngineEvalOutcome, EngineEvalRequest, EngineJobDrain, EngineSessionHandle, EngineSessionSpec,
+};
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
@@ -58,6 +61,7 @@ struct PreviewAssetHint {
 struct SessionRecord {
     snapshot: SessionSnapshot,
     package_scripts: BTreeMap<String, String>,
+    engine_session: EngineSessionHandle,
     vfs: VirtualFileSystem,
 }
 
@@ -74,6 +78,7 @@ struct PackageManifest {
 struct RuntimeContextRecord {
     session_id: String,
     process: HostProcessInfo,
+    engine_context: EngineContextHandle,
     clock_ms: u64,
     next_port: u16,
     ports: BTreeMap<u16, RuntimePortRecord>,
@@ -187,8 +192,16 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 detected_vite: package_manifest
                     .as_ref()
                     .is_some_and(detect_vite_dependency),
-            },
+                },
         };
+
+        let engine_session = self
+            .engine
+            .boot_session(&EngineSessionSpec {
+                session_id: session_id.clone(),
+                workspace_root: snapshot.workspace_root.clone(),
+            })
+            .map_err(RuntimeHostError::EngineFailure)?;
 
         self.sessions.insert(
             session_id,
@@ -198,6 +211,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .as_ref()
                     .and_then(|manifest| manifest.scripts.clone())
                     .unwrap_or(package_scripts),
+                engine_session,
                 vfs,
             },
         );
@@ -308,14 +322,33 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         request: &RunRequest,
     ) -> RuntimeHostResult<HostRuntimeContext> {
         let process = self.build_process_info(session_id, request)?;
+        let engine_session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?
+            .engine_session
+            .clone();
         let context_id = format!("runtime-context-{}", self.next_runtime_context_id);
         self.next_runtime_context_id += 1;
+        let engine_context = self
+            .engine
+            .create_context(&EngineContextSpec {
+                context_id: context_id.clone(),
+                session_id: session_id.to_string(),
+                engine_session_id: engine_session.engine_session_id,
+                cwd: process.cwd.clone(),
+                entrypoint: process.entrypoint.clone(),
+                argv_len: process.argv.len(),
+                env_count: process.env.len(),
+            })
+            .map_err(RuntimeHostError::EngineFailure)?;
 
         self.runtime_contexts.insert(
             context_id.clone(),
             RuntimeContextRecord {
                 session_id: session_id.to_string(),
                 process: process.clone(),
+                engine_context,
                 clock_ms: 0,
                 next_port: 3000,
                 ports: BTreeMap::new(),
@@ -331,6 +364,85 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             session_id: session_id.to_string(),
             process,
         })
+    }
+
+    pub fn describe_engine_context(
+        &self,
+        context_id: &str,
+    ) -> RuntimeHostResult<EngineContextSnapshot> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .describe_context(&engine_context)
+            .ok_or_else(|| RuntimeHostError::EngineFailure(format!(
+                "engine context not found: {}",
+                engine_context.engine_context_id
+            )))
+    }
+
+    pub fn eval_engine_context(
+        &mut self,
+        context_id: &str,
+        filename: impl Into<String>,
+        source: impl Into<String>,
+        as_module: bool,
+    ) -> RuntimeHostResult<EngineEvalOutcome> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .eval(
+                &engine_context,
+                &EngineEvalRequest {
+                    filename: filename.into(),
+                    source: source.into(),
+                    mode: if as_module {
+                        EngineEvalMode::Module
+                    } else {
+                        EngineEvalMode::Script
+                    },
+                },
+            )
+            .map_err(RuntimeHostError::EngineFailure)
+    }
+
+    pub fn drain_engine_jobs(&mut self, context_id: &str) -> RuntimeHostResult<EngineJobDrain> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .drain_jobs(&engine_context)
+            .map_err(RuntimeHostError::EngineFailure)
+    }
+
+    pub fn interrupt_engine_context(
+        &mut self,
+        context_id: &str,
+        reason: &str,
+    ) -> RuntimeHostResult<()> {
+        let engine_context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+            .engine_context
+            .clone();
+
+        self.engine
+            .interrupt(&engine_context, reason)
+            .map_err(RuntimeHostError::EngineFailure)
     }
 
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
@@ -1268,19 +1380,33 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
     }
 
     pub fn stop_session(&mut self, session_id: &str) -> RuntimeHostResult<()> {
-        self.sessions
+        let session = self
+            .sessions
             .remove(session_id)
-            .map(|_| {
-                self.runtime_contexts
-                    .retain(|_, context| context.session_id != session_id);
-            })
-            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let context_handles = self
+            .runtime_contexts
+            .iter()
+            .filter(|(_, context)| context.session_id == session_id)
+            .map(|(_, context)| context.engine_context.clone())
+            .collect::<Vec<_>>();
+
+        for handle in &context_handles {
+            self.engine.dispose_context(handle);
+        }
+        self.runtime_contexts
+            .retain(|_, context| context.session_id != session_id);
+        self.engine.dispose_session(&session.engine_session);
+
+        Ok(())
     }
 
     pub fn drop_runtime_context(&mut self, context_id: &str) -> RuntimeHostResult<()> {
         self.runtime_contexts
             .remove(context_id)
-            .map(|_| ())
+            .map(|context| {
+                self.engine.dispose_context(&context.engine_context);
+            })
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))
     }
 }

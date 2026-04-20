@@ -15,7 +15,7 @@ use crate::vfs::VirtualFile;
 
 thread_local! {
     static HOST: RefCell<RuntimeHostCore<NullEngineAdapter>> =
-        RefCell::new(RuntimeHostCore::new(NullEngineAdapter));
+        RefCell::new(RuntimeHostCore::new(NullEngineAdapter::default()));
     static LAST_RESULT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 

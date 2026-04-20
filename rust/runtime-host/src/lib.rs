@@ -5,7 +5,11 @@ pub mod host;
 pub mod protocol;
 pub mod vfs;
 
-pub use engine::{EngineAdapter, EngineDescriptor, NullEngineAdapter};
+pub use engine::{
+    EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextState,
+    EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain, EngineSessionHandle,
+    NullEngineAdapter,
+};
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
@@ -34,6 +38,74 @@ mod tests {
         assert_eq!(summary.engine_name, "null-engine");
         assert!(summary.supports_interrupts);
         assert!(summary.supports_module_loader);
+    }
+
+    #[test]
+    fn runtime_context_boots_engine_context_lifecycle() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "engine.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("engine-app".into()),
+                BTreeMap::new(),
+                vec![VirtualFile::text(
+                    "/workspace/src/main.js",
+                    "console.log('hello from engine');",
+                )],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should be created");
+
+        assert_eq!(
+            host.describe_engine_context(&runtime_context.context_id)
+                .expect("engine context should be described")
+                .state,
+            EngineContextState::Booted
+        );
+        assert_eq!(
+            host.describe_engine_context(&runtime_context.context_id)
+                .expect("engine context should be described")
+                .entrypoint,
+            "/workspace/src/main.js"
+        );
+
+        let eval = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/src/main.js",
+                "console.log('hello from engine');",
+                false,
+            )
+            .expect("null engine eval should succeed");
+        assert_eq!(eval.state, EngineContextState::Ready);
+        assert!(eval.result_summary.contains("null-engine skipped"));
+
+        assert_eq!(
+            host.drain_engine_jobs(&runtime_context.context_id)
+                .expect("engine jobs should drain"),
+            EngineJobDrain {
+                drained_jobs: 0,
+                pending_jobs: 0,
+            }
+        );
+        host.interrupt_engine_context(&runtime_context.context_id, "test interrupt")
+            .expect("engine interrupt should succeed");
+        host.drop_runtime_context(&runtime_context.context_id)
+            .expect("runtime context should be dropped");
+        assert!(matches!(
+            host.describe_engine_context(&runtime_context.context_id),
+            Err(RuntimeHostError::RuntimeContextNotFound(_))
+        ));
     }
 
     #[test]
