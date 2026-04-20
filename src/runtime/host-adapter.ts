@@ -34,8 +34,23 @@ export type HostRuntimeContext = {
   process: HostProcessInfo;
 };
 
+export type HostRuntimeBuiltinSpec = {
+  name: string;
+  globals: string[];
+  modules: string[];
+  commandPrefixes: string[];
+};
+
+export type HostRuntimeBindings = {
+  contextId: string;
+  engineName: string;
+  entrypoint: string;
+  globals: string[];
+  builtins: HostRuntimeBuiltinSpec[];
+};
+
 export type HostRuntimeCommand =
-  | { kind: "process.info" | "process.cwd" | "process.argv" | "process.env" }
+  | { kind: "runtime.describe" | "process.info" | "process.cwd" | "process.argv" | "process.env" }
   | { kind: "process.chdir"; path: string }
   | { kind: "path.resolve" | "path.join"; segments: string[] }
   | { kind: "path.dirname" | "path.basename" | "path.extname" | "path.normalize"; path: string }
@@ -48,6 +63,7 @@ export type HostRuntimeCommand =
     );
 
 export type HostRuntimeResponse =
+  | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "process-info"; process: HostProcessInfo }
   | { kind: "process-cwd"; cwd: string }
   | { kind: "process-argv"; argv: string[] }
@@ -652,6 +668,54 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     switch (command.kind) {
+      case "runtime.describe":
+        return {
+          kind: "runtime-bindings",
+          bindings: {
+            contextId,
+            engineName: "null-engine",
+            entrypoint: context.process.entrypoint,
+            globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
+            builtins: [
+              {
+                name: "process",
+                globals: ["process"],
+                modules: ["process", "node:process"],
+                commandPrefixes: ["process"],
+              },
+              {
+                name: "fs",
+                globals: [],
+                modules: ["fs", "node:fs"],
+                commandPrefixes: ["fs"],
+              },
+              {
+                name: "path",
+                globals: [],
+                modules: ["path", "node:path"],
+                commandPrefixes: ["path"],
+              },
+              {
+                name: "buffer",
+                globals: ["Buffer"],
+                modules: ["buffer", "node:buffer"],
+                commandPrefixes: [],
+              },
+              {
+                name: "timers",
+                globals: ["setTimeout", "clearTimeout"],
+                modules: ["timers", "node:timers"],
+                commandPrefixes: [],
+              },
+              {
+                name: "console",
+                globals: ["console"],
+                modules: ["console", "node:console"],
+                commandPrefixes: [],
+              },
+            ],
+          },
+        };
       case "process.info":
         return {
           kind: "process-info",
@@ -1226,6 +1290,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     const lines = [`context_id=${contextId}`];
 
     switch (command.kind) {
+      case "runtime.describe":
+        lines.push("command=runtime-describe");
+        break;
       case "process.info":
         lines.push("command=process-info");
         break;
@@ -1286,6 +1353,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     const response = await this.invokeWithInput<
+      | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "process-info"; process: HostProcessInfo }
       | { kind: "process-cwd"; cwd: string }
       | { kind: "process-argv"; argv: string[] }

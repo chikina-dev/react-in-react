@@ -186,8 +186,15 @@ async function runSession(
 
   let processInfo = runtimeContext.process;
   let processCwd = runtimeContext.process.cwd;
+  let runtimeBindingsSummary = "globals=<unknown> builtins=<unknown>";
 
   try {
+    const runtimeBindingsResponse = await hostAdapter.executeRuntimeCommand(
+      runtimeContext.contextId,
+      {
+        kind: "runtime.describe",
+      },
+    );
     const processInfoResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "process.info",
     });
@@ -199,6 +206,10 @@ async function runSession(
         ? processInfoResponse.process
         : runtimeContext.process;
     processCwd = cwdResponse.kind === "process-cwd" ? cwdResponse.cwd : processInfo.cwd;
+    runtimeBindingsSummary =
+      runtimeBindingsResponse.kind === "runtime-bindings"
+        ? `globals=${runtimeBindingsResponse.bindings.globals.join(",")} builtins=${runtimeBindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`
+        : runtimeBindingsSummary;
   } catch (error) {
     await disposeActiveRun(sessionId);
     record.session.state = "errored";
@@ -241,6 +252,7 @@ async function runSession(
     pid,
     `[process] exec=${processInfo.execPath} cwd=${processCwd} argv=${processInfo.argv.join(" ")}`,
   );
+  await emitStdout(sessionId, pid, `[bindings] ${runtimeBindingsSummary}`);
   await emitStdout(sessionId, pid, `[context] id=${runtimeContext.contextId}`);
 
   await emitStdout(

@@ -4,9 +4,10 @@ use crate::engine::EngineAdapter;
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
+    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, PreviewRequestHint,
+    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -533,6 +534,66 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         command: HostRuntimeCommand,
     ) -> RuntimeHostResult<HostRuntimeResponse> {
         match command {
+            HostRuntimeCommand::DescribeBindings => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .cloned()
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+                let engine = self.engine.descriptor();
+
+                Ok(HostRuntimeResponse::Bindings(HostRuntimeBindings {
+                    context_id: context_id.to_string(),
+                    engine_name: engine.name.to_string(),
+                    entrypoint: context.process.entrypoint.clone(),
+                    globals: vec![
+                        "console".into(),
+                        "process".into(),
+                        "Buffer".into(),
+                        "setTimeout".into(),
+                        "clearTimeout".into(),
+                        "__runtime".into(),
+                    ],
+                    builtins: vec![
+                        HostRuntimeBuiltinSpec {
+                            name: "process".into(),
+                            globals: vec!["process".into()],
+                            modules: vec!["process".into(), "node:process".into()],
+                            command_prefixes: vec!["process".into()],
+                        },
+                        HostRuntimeBuiltinSpec {
+                            name: "fs".into(),
+                            globals: Vec::new(),
+                            modules: vec!["fs".into(), "node:fs".into()],
+                            command_prefixes: vec!["fs".into()],
+                        },
+                        HostRuntimeBuiltinSpec {
+                            name: "path".into(),
+                            globals: Vec::new(),
+                            modules: vec!["path".into(), "node:path".into()],
+                            command_prefixes: vec!["path".into()],
+                        },
+                        HostRuntimeBuiltinSpec {
+                            name: "buffer".into(),
+                            globals: vec!["Buffer".into()],
+                            modules: vec!["buffer".into(), "node:buffer".into()],
+                            command_prefixes: Vec::new(),
+                        },
+                        HostRuntimeBuiltinSpec {
+                            name: "timers".into(),
+                            globals: vec!["setTimeout".into(), "clearTimeout".into()],
+                            modules: vec!["timers".into(), "node:timers".into()],
+                            command_prefixes: Vec::new(),
+                        },
+                        HostRuntimeBuiltinSpec {
+                            name: "console".into(),
+                            globals: vec!["console".into()],
+                            modules: vec!["console".into(), "node:console".into()],
+                            command_prefixes: Vec::new(),
+                        },
+                    ],
+                }))
+            }
             HostRuntimeCommand::ProcessInfo => {
                 let context = self
                     .runtime_contexts

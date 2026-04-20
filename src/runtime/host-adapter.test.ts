@@ -517,6 +517,58 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-bindings",
+    bindings: {
+      contextId: runtimeContext.contextId,
+      engineName: "null-engine",
+      entrypoint: "/workspace/src/server.ts",
+      globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
+      builtins: [
+        {
+          name: "process",
+          globals: ["process"],
+          modules: ["process", "node:process"],
+          commandPrefixes: ["process"],
+        },
+        {
+          name: "fs",
+          globals: [],
+          modules: ["fs", "node:fs"],
+          commandPrefixes: ["fs"],
+        },
+        {
+          name: "path",
+          globals: [],
+          modules: ["path", "node:path"],
+          commandPrefixes: ["path"],
+        },
+        {
+          name: "buffer",
+          globals: ["Buffer"],
+          modules: ["buffer", "node:buffer"],
+          commandPrefixes: [],
+        },
+        {
+          name: "timers",
+          globals: ["setTimeout", "clearTimeout"],
+          modules: ["timers", "node:timers"],
+          commandPrefixes: [],
+        },
+        {
+          name: "console",
+          globals: ["console"],
+          modules: ["console", "node:console"],
+          commandPrefixes: [],
+        },
+      ],
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "process.info",
     }),
   ).resolves.toEqual({

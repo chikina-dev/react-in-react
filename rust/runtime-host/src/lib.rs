@@ -10,9 +10,10 @@ pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse,
-    PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState,
-    WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBuiltinSpec,
+    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, PreviewRequestHint,
+    PreviewRequestKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -202,6 +203,19 @@ mod tests {
                 },
             ),
             Ok(HostFsResponse::File { path, .. }) if path == "/workspace/src/main.tsx"
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::DescribeBindings,
+            ),
+            Ok(HostRuntimeResponse::Bindings(bindings))
+                if bindings.globals.contains(&"process".to_string())
+                    && bindings
+                        .builtins
+                        .iter()
+                        .any(|builtin| builtin.name == "fs"
+                            && builtin.modules.contains(&"node:fs".to_string()))
         ));
         assert!(matches!(
             host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::ProcessInfo),

@@ -5,7 +5,8 @@ use crate::engine::NullEngineAdapter;
 use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
-    HostRuntimeCommand, HostRuntimeContext, HostRuntimeResponse, RunRequest,
+    HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeContext,
+    HostRuntimeResponse, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -761,6 +762,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
         required_field(fields, "command").ok_or_else(|| "missing runtime command".to_string())?;
 
     match kind.as_str() {
+        "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "process-info" => Ok(HostRuntimeCommand::ProcessInfo),
         "process-cwd" => Ok(HostRuntimeCommand::ProcessCwd),
         "process-argv" => Ok(HostRuntimeCommand::ProcessArgv),
@@ -1023,6 +1025,10 @@ fn render_runtime_context_json(context: &HostRuntimeContext) -> String {
 
 fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
     match response {
+        HostRuntimeResponse::Bindings(bindings) => format!(
+            "{{\"kind\":\"runtime-bindings\",\"bindings\":{}}}",
+            render_runtime_bindings_json(bindings)
+        ),
         HostRuntimeResponse::ProcessInfo(process) => format!(
             "{{\"kind\":\"process-info\",\"process\":{}}}",
             render_process_info_json(process)
@@ -1052,6 +1058,35 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             render_fs_response_json(response)
         ),
     }
+}
+
+fn render_runtime_bindings_json(bindings: &HostRuntimeBindings) -> String {
+    let globals = render_string_array_json(&bindings.globals);
+    let builtins = bindings
+        .builtins
+        .iter()
+        .map(render_runtime_builtin_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"contextId\":\"{}\",\"engineName\":\"{}\",\"entrypoint\":\"{}\",\"globals\":{},\"builtins\":[{}]}}",
+        escape_json(&bindings.context_id),
+        escape_json(&bindings.engine_name),
+        escape_json(&bindings.entrypoint),
+        globals,
+        builtins,
+    )
+}
+
+fn render_runtime_builtin_json(builtin: &HostRuntimeBuiltinSpec) -> String {
+    format!(
+        "{{\"name\":\"{}\",\"globals\":{},\"modules\":{},\"commandPrefixes\":{}}}",
+        escape_json(&builtin.name),
+        render_string_array_json(&builtin.globals),
+        render_string_array_json(&builtin.modules),
+        render_string_array_json(&builtin.command_prefixes),
+    )
 }
 
 fn render_error_json(message: &str) -> String {

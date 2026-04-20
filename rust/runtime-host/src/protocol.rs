@@ -96,6 +96,23 @@ pub struct HostRuntimeContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeBuiltinSpec {
+    pub name: String,
+    pub globals: Vec<String>,
+    pub modules: Vec<String>,
+    pub command_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeBindings {
+    pub context_id: String,
+    pub engine_name: String,
+    pub entrypoint: String,
+    pub globals: Vec<String>,
+    pub builtins: Vec<HostRuntimeBuiltinSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceFileSummary {
     pub path: String,
     pub size: usize,
@@ -172,6 +189,7 @@ pub enum HostContextFsCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeCommand {
+    DescribeBindings,
     ProcessInfo,
     ProcessCwd,
     ProcessArgv,
@@ -188,6 +206,7 @@ pub enum HostRuntimeCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeResponse {
+    Bindings(HostRuntimeBindings),
     ProcessInfo(HostProcessInfo),
     ProcessCwd { cwd: String },
     ProcessArgv { argv: Vec<String> },
