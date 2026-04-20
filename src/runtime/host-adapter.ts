@@ -63,6 +63,31 @@ export type HostRuntimeBootstrapPlan = {
   modules: HostRuntimeBootstrapModule[];
 };
 
+export type HostEngineContextState = "booted" | "ready" | "disposed";
+
+export type HostEngineContextSnapshot = {
+  engineSessionId: string;
+  engineContextId: string;
+  sessionId: string;
+  cwd: string;
+  entrypoint: string;
+  argvLen: number;
+  envCount: number;
+  pendingJobs: number;
+  state: HostEngineContextState;
+};
+
+export type HostEngineEvalOutcome = {
+  resultSummary: string;
+  pendingJobs: number;
+  state: HostEngineContextState;
+};
+
+export type HostEngineJobDrain = {
+  drainedJobs: number;
+  pendingJobs: number;
+};
+
 export type HostRuntimeStdioStream = "stdout" | "stderr";
 export type HostRuntimeConsoleLevel = "log" | "info" | "warn" | "error";
 
@@ -548,6 +573,17 @@ export interface RuntimeHostAdapter {
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo>;
   createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext>;
+  describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot>;
+  evalEngineContext(
+    contextId: string,
+    input: {
+      filename: string;
+      source: string;
+      asModule: boolean;
+    },
+  ): Promise<HostEngineEvalOutcome>;
+  drainEngineJobs(contextId: string): Promise<HostEngineJobDrain>;
+  interruptEngineContext(contextId: string, reason: string): Promise<void>;
   listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]>;
   statWorkspacePath(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary>;
   readWorkspaceDirectory(sessionId: string, path: string): Promise<HostWorkspaceEntrySummary[]>;
@@ -590,6 +626,10 @@ type WasmRuntimeHostExports = {
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_build_process_info_json(ptr: number, len: number): number;
   runtime_host_create_runtime_context_json(ptr: number, len: number): number;
+  runtime_host_describe_engine_context_json(ptr: number, len: number): number;
+  runtime_host_eval_engine_context_json(ptr: number, len: number): number;
+  runtime_host_drain_engine_jobs_json(ptr: number, len: number): number;
+  runtime_host_interrupt_engine_context_json(ptr: number, len: number): number;
   runtime_host_list_workspace_files_json(ptr: number, len: number): number;
   runtime_host_stat_workspace_path_json(ptr: number, len: number): number;
   runtime_host_read_workspace_directory_json(ptr: number, len: number): number;
@@ -619,6 +659,7 @@ type HostRuntimeContextRecord = {
   contextId: string;
   sessionId: string;
   process: HostProcessInfo;
+  engineState: HostEngineContextState;
   clockMs: number;
   nextPort: number;
   ports: Map<number, HostRuntimePort>;
@@ -829,6 +870,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       contextId,
       sessionId,
       process,
+      engineState: "booted" as HostEngineContextState,
       clockMs: 0,
       nextPort: 3000,
       ports: new Map<number, HostRuntimePort>(),
@@ -839,6 +881,70 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     };
     this.runtimeContexts.set(contextId, context);
     return context;
+  }
+
+  async describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+
+    return {
+      engineSessionId: `null-engine-session:${context.sessionId}`,
+      engineContextId: `null-engine-context:${contextId}`,
+      sessionId: context.sessionId,
+      cwd: context.process.cwd,
+      entrypoint: context.process.entrypoint,
+      argvLen: context.process.argv.length,
+      envCount: Object.keys(context.process.env).length,
+      pendingJobs: 0,
+      state: context.engineState,
+    };
+  }
+
+  async evalEngineContext(
+    contextId: string,
+    input: {
+      filename: string;
+      source: string;
+      asModule: boolean;
+    },
+  ): Promise<HostEngineEvalOutcome> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+
+    context.engineState = "ready";
+
+    return {
+      resultSummary: `null-engine skipped ${input.asModule ? "module" : "script"} eval for ${input.filename} (${input.source.length} bytes)`,
+      pendingJobs: 0,
+      state: context.engineState,
+    };
+  }
+
+  async drainEngineJobs(contextId: string): Promise<HostEngineJobDrain> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
+
+    return {
+      drainedJobs: 0,
+      pendingJobs: 0,
+    };
+  }
+
+  async interruptEngineContext(contextId: string, _reason: string): Promise<void> {
+    const context = this.runtimeContexts.get(contextId);
+
+    if (!context) {
+      throw new Error(`runtime context not found: ${contextId}`);
+    }
   }
 
   async listWorkspaceFiles(sessionId: string): Promise<HostWorkspaceFileSummary[]> {
@@ -1756,6 +1862,42 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       `args=${args}`,
       `env=${env}`,
     ]);
+  }
+
+  async describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot> {
+    return this.invokeWithInput<HostEngineContextSnapshot>(
+      "runtime_host_describe_engine_context_json",
+      [`context_id=${contextId}`],
+    );
+  }
+
+  async evalEngineContext(
+    contextId: string,
+    input: {
+      filename: string;
+      source: string;
+      asModule: boolean;
+    },
+  ): Promise<HostEngineEvalOutcome> {
+    return this.invokeWithInput<HostEngineEvalOutcome>("runtime_host_eval_engine_context_json", [
+      `context_id=${contextId}`,
+      `filename=${encodeHex(input.filename)}`,
+      `source=${encodeHex(input.source)}`,
+      `as_module=${String(input.asModule)}`,
+    ]);
+  }
+
+  async drainEngineJobs(contextId: string): Promise<HostEngineJobDrain> {
+    return this.invokeWithInput<HostEngineJobDrain>("runtime_host_drain_engine_jobs_json", [
+      `context_id=${contextId}`,
+    ]);
+  }
+
+  async interruptEngineContext(contextId: string, reason: string): Promise<void> {
+    await this.invokeWithInput<{ contextId: string }>(
+      "runtime_host_interrupt_engine_context_json",
+      [`context_id=${contextId}`, `reason=${encodeHex(reason)}`],
+    );
   }
 
   async stopSession(sessionId: string): Promise<void> {

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use crate::engine::NullEngineAdapter;
+use crate::engine::QuickJsNgEngineAdapter;
 use crate::host::RuntimeHostCore;
 use crate::protocol::{
     ArchiveStats, HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo,
@@ -13,10 +13,11 @@ use crate::protocol::{
     RunRequest,
 };
 use crate::vfs::VirtualFile;
+use crate::{EngineContextSnapshot, EngineContextState, EngineEvalOutcome, EngineJobDrain};
 
 thread_local! {
-    static HOST: RefCell<RuntimeHostCore<NullEngineAdapter>> =
-        RefCell::new(RuntimeHostCore::new(NullEngineAdapter::default()));
+    static HOST: RefCell<RuntimeHostCore<QuickJsNgEngineAdapter>> =
+        RefCell::new(RuntimeHostCore::new(QuickJsNgEngineAdapter::default()));
     static LAST_RESULT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -257,6 +258,123 @@ pub extern "C" fn runtime_host_create_runtime_context_json(ptr: *const u8, len: 
 
         match result {
             Ok(context) => set_last_result(render_runtime_context_json(&context)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_describe_engine_context_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow().describe_engine_context(&context_id);
+
+        match result {
+            Ok(snapshot) => set_last_result(render_engine_context_snapshot_json(&snapshot)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_eval_engine_context_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+    let filename = match required_field(&fields, "filename") {
+        Some(encoded) => match decode_hex(&encoded) {
+            Ok(value) => value,
+            Err(error) => return write_error(error),
+        },
+        None => String::new(),
+    };
+    let source = match required_field(&fields, "source") {
+        Some(encoded) => match decode_hex(&encoded) {
+            Ok(value) => value,
+            Err(error) => return write_error(error),
+        },
+        None => String::new(),
+    };
+    let as_module = fields
+        .get("as_module")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false);
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .eval_engine_context(&context_id, filename, source, as_module);
+
+        match result {
+            Ok(outcome) => set_last_result(render_engine_eval_outcome_json(&outcome)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_drain_engine_jobs_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+
+    HOST.with(|host| {
+        let result = host.borrow_mut().drain_engine_jobs(&context_id);
+
+        match result {
+            Ok(outcome) => set_last_result(render_engine_job_drain_json(&outcome)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_interrupt_engine_context_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let context_id = required_field(&fields, "context_id").unwrap_or_default();
+    let reason = match required_field(&fields, "reason") {
+        Some(encoded) => match decode_hex(&encoded) {
+            Ok(value) => value,
+            Err(error) => return write_error(error),
+        },
+        None => String::new(),
+    };
+
+    HOST.with(|host| {
+        let result = host
+            .borrow_mut()
+            .interrupt_engine_context(&context_id, &reason);
+
+        match result {
+            Ok(()) => set_last_result(format!("{{\"contextId\":\"{}\"}}", escape_json(&context_id))),
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -1109,6 +1227,45 @@ fn render_process_info_json(process_info: &HostProcessInfo) -> String {
         escape_json(&process_info.command_line),
         command_kind,
     )
+}
+
+fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> String {
+    format!(
+        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"state\":\"{}\"}}",
+        escape_json(&snapshot.engine_session_id),
+        escape_json(&snapshot.engine_context_id),
+        escape_json(&snapshot.session_id),
+        escape_json(&snapshot.cwd),
+        escape_json(&snapshot.entrypoint),
+        snapshot.argv_len,
+        snapshot.env_count,
+        snapshot.pending_jobs,
+        render_engine_context_state(snapshot.state.clone())
+    )
+}
+
+fn render_engine_eval_outcome_json(outcome: &EngineEvalOutcome) -> String {
+    format!(
+        "{{\"resultSummary\":\"{}\",\"pendingJobs\":{},\"state\":\"{}\"}}",
+        escape_json(&outcome.result_summary),
+        outcome.pending_jobs,
+        render_engine_context_state(outcome.state.clone())
+    )
+}
+
+fn render_engine_job_drain_json(drain: &EngineJobDrain) -> String {
+    format!(
+        "{{\"drainedJobs\":{},\"pendingJobs\":{}}}",
+        drain.drained_jobs, drain.pending_jobs
+    )
+}
+
+fn render_engine_context_state(state: EngineContextState) -> &'static str {
+    match state {
+        EngineContextState::Booted => "booted",
+        EngineContextState::Ready => "ready",
+        EngineContextState::Disposed => "disposed",
+    }
 }
 
 fn render_runtime_context_json(context: &HostRuntimeContext) -> String {

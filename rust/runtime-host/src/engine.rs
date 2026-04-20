@@ -113,7 +113,7 @@ pub trait EngineAdapter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NullEngineContextRecord {
+struct EngineContextRecord {
     session_id: String,
     engine_session_id: String,
     cwd: String,
@@ -125,9 +125,149 @@ struct NullEngineContextRecord {
 }
 
 #[derive(Debug, Default)]
-pub struct NullEngineAdapter {
+struct EngineStateStore {
     sessions: BTreeMap<String, EngineSessionHandle>,
-    contexts: BTreeMap<String, NullEngineContextRecord>,
+    contexts: BTreeMap<String, EngineContextRecord>,
+}
+
+impl EngineStateStore {
+    fn boot_session(
+        &mut self,
+        spec: &EngineSessionSpec,
+        session_prefix: &str,
+    ) -> EngineSessionHandle {
+        let handle = EngineSessionHandle {
+            engine_session_id: format!("{session_prefix}:{}", spec.session_id),
+            workspace_root: spec.workspace_root.clone(),
+        };
+        self.sessions
+            .insert(handle.engine_session_id.clone(), handle.clone());
+        handle
+    }
+
+    fn dispose_session(&mut self, handle: &EngineSessionHandle) {
+        self.sessions.remove(&handle.engine_session_id);
+        self.contexts
+            .retain(|_, context| context.engine_session_id != handle.engine_session_id);
+    }
+
+    fn create_context(
+        &mut self,
+        spec: &EngineContextSpec,
+        context_prefix: &str,
+        engine_label: &str,
+    ) -> Result<EngineContextHandle, String> {
+        if !self.sessions.contains_key(&spec.engine_session_id) {
+            return Err(format!(
+                "{engine_label} session not booted: {}",
+                spec.engine_session_id
+            ));
+        }
+
+        let handle = EngineContextHandle {
+            engine_session_id: spec.engine_session_id.clone(),
+            engine_context_id: format!("{context_prefix}:{}", spec.context_id),
+        };
+        self.contexts.insert(
+            handle.engine_context_id.clone(),
+            EngineContextRecord {
+                session_id: spec.session_id.clone(),
+                engine_session_id: spec.engine_session_id.clone(),
+                cwd: spec.cwd.clone(),
+                entrypoint: spec.entrypoint.clone(),
+                argv_len: spec.argv_len,
+                env_count: spec.env_count,
+                pending_jobs: 0,
+                state: EngineContextState::Booted,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn describe_context(&self, handle: &EngineContextHandle) -> Option<EngineContextSnapshot> {
+        let context = self.contexts.get(&handle.engine_context_id)?;
+
+        Some(EngineContextSnapshot {
+            engine_session_id: handle.engine_session_id.clone(),
+            engine_context_id: handle.engine_context_id.clone(),
+            session_id: context.session_id.clone(),
+            cwd: context.cwd.clone(),
+            entrypoint: context.entrypoint.clone(),
+            argv_len: context.argv_len,
+            env_count: context.env_count,
+            pending_jobs: context.pending_jobs,
+            state: context.state.clone(),
+        })
+    }
+
+    fn mark_ready(
+        &mut self,
+        handle: &EngineContextHandle,
+        engine_label: &str,
+    ) -> Result<EngineEvalOutcome, String> {
+        let context = self
+            .contexts
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+
+        context.state = EngineContextState::Ready;
+
+        Ok(EngineEvalOutcome {
+            result_summary: String::new(),
+            pending_jobs: context.pending_jobs,
+            state: context.state.clone(),
+        })
+    }
+
+    fn drain_jobs(
+        &mut self,
+        handle: &EngineContextHandle,
+        engine_label: &str,
+    ) -> Result<EngineJobDrain, String> {
+        let context = self
+            .contexts
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+        let drained_jobs = context.pending_jobs;
+        context.pending_jobs = 0;
+
+        Ok(EngineJobDrain {
+            drained_jobs,
+            pending_jobs: context.pending_jobs,
+        })
+    }
+
+    fn interrupt(
+        &mut self,
+        handle: &EngineContextHandle,
+        engine_label: &str,
+    ) -> Result<(), String> {
+        if self.contexts.contains_key(&handle.engine_context_id) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{engine_label} context not found: {}",
+                handle.engine_context_id
+            ))
+        }
+    }
+
+    fn dispose_context(&mut self, handle: &EngineContextHandle) {
+        if let Some(context) = self.contexts.get_mut(&handle.engine_context_id) {
+            context.state = EngineContextState::Disposed;
+        }
+        self.contexts.remove(&handle.engine_context_id);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NullEngineAdapter {
+    state: EngineStateStore,
+}
+
+#[derive(Debug, Default)]
+pub struct QuickJsNgEngineAdapter {
+    state: EngineStateStore,
 }
 
 impl EngineAdapter for NullEngineAdapter {
@@ -158,63 +298,20 @@ impl EngineAdapter for NullEngineAdapter {
     }
 
     fn boot_session(&mut self, spec: &EngineSessionSpec) -> Result<EngineSessionHandle, String> {
-        let handle = EngineSessionHandle {
-            engine_session_id: format!("null-engine-session:{}", spec.session_id),
-            workspace_root: spec.workspace_root.clone(),
-        };
-        self.sessions
-            .insert(handle.engine_session_id.clone(), handle.clone());
-        Ok(handle)
+        Ok(self.state.boot_session(spec, "null-engine-session"))
     }
 
     fn dispose_session(&mut self, handle: &EngineSessionHandle) {
-        self.sessions.remove(&handle.engine_session_id);
-        self.contexts
-            .retain(|_, context| context.engine_session_id != handle.engine_session_id);
+        self.state.dispose_session(handle);
     }
 
     fn create_context(&mut self, spec: &EngineContextSpec) -> Result<EngineContextHandle, String> {
-        if !self.sessions.contains_key(&spec.engine_session_id) {
-            return Err(format!(
-                "null engine session not booted: {}",
-                spec.engine_session_id
-            ));
-        }
-
-        let handle = EngineContextHandle {
-            engine_session_id: spec.engine_session_id.clone(),
-            engine_context_id: format!("null-engine-context:{}", spec.context_id),
-        };
-        self.contexts.insert(
-            handle.engine_context_id.clone(),
-            NullEngineContextRecord {
-                session_id: spec.session_id.clone(),
-                engine_session_id: spec.engine_session_id.clone(),
-                cwd: spec.cwd.clone(),
-                entrypoint: spec.entrypoint.clone(),
-                argv_len: spec.argv_len,
-                env_count: spec.env_count,
-                pending_jobs: 0,
-                state: EngineContextState::Booted,
-            },
-        );
-        Ok(handle)
+        self.state
+            .create_context(spec, "null-engine-context", "null engine")
     }
 
     fn describe_context(&self, handle: &EngineContextHandle) -> Option<EngineContextSnapshot> {
-        let context = self.contexts.get(&handle.engine_context_id)?;
-
-        Some(EngineContextSnapshot {
-            engine_session_id: handle.engine_session_id.clone(),
-            engine_context_id: handle.engine_context_id.clone(),
-            session_id: context.session_id.clone(),
-            cwd: context.cwd.clone(),
-            entrypoint: context.entrypoint.clone(),
-            argv_len: context.argv_len,
-            env_count: context.env_count,
-            pending_jobs: context.pending_jobs,
-            state: context.state.clone(),
-        })
+        self.state.describe_context(handle)
     }
 
     fn eval(
@@ -222,54 +319,98 @@ impl EngineAdapter for NullEngineAdapter {
         handle: &EngineContextHandle,
         request: &EngineEvalRequest,
     ) -> Result<EngineEvalOutcome, String> {
-        let context = self
-            .contexts
-            .get_mut(&handle.engine_context_id)
-            .ok_or_else(|| format!("null engine context not found: {}", handle.engine_context_id))?;
-
-        context.state = EngineContextState::Ready;
-
-        Ok(EngineEvalOutcome {
-            result_summary: format!(
-                "null-engine skipped {:?} eval for {} ({} bytes)",
-                request.mode,
-                request.filename,
-                request.source.len()
-            ),
-            pending_jobs: context.pending_jobs,
-            state: context.state.clone(),
-        })
+        let mut outcome = self.state.mark_ready(handle, "null engine")?;
+        outcome.result_summary = format!(
+            "null-engine skipped {:?} eval for {} ({} bytes)",
+            request.mode,
+            request.filename,
+            request.source.len()
+        );
+        Ok(outcome)
     }
 
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
-        let context = self
-            .contexts
-            .get_mut(&handle.engine_context_id)
-            .ok_or_else(|| format!("null engine context not found: {}", handle.engine_context_id))?;
-        let drained_jobs = context.pending_jobs;
-        context.pending_jobs = 0;
-
-        Ok(EngineJobDrain {
-            drained_jobs,
-            pending_jobs: context.pending_jobs,
-        })
+        self.state.drain_jobs(handle, "null engine")
     }
 
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
-        if self.contexts.contains_key(&handle.engine_context_id) {
-            Ok(())
-        } else {
-            Err(format!(
-                "null engine context not found: {}",
-                handle.engine_context_id
-            ))
-        }
+        self.state.interrupt(handle, "null engine")
     }
 
     fn dispose_context(&mut self, handle: &EngineContextHandle) {
-        if let Some(context) = self.contexts.get_mut(&handle.engine_context_id) {
-            context.state = EngineContextState::Disposed;
+        self.state.dispose_context(handle);
+    }
+}
+
+impl EngineAdapter for QuickJsNgEngineAdapter {
+    fn descriptor(&self) -> EngineDescriptor {
+        EngineDescriptor {
+            name: "quickjs-ng-stub",
+            supports_interrupts: true,
+            supports_module_loader: true,
+            supports_eval: true,
+            supports_job_queue: true,
         }
-        self.contexts.remove(&handle.engine_context_id);
+    }
+
+    fn plan_run(&self, request: &RunRequest) -> RunPlan {
+        let command_line = std::iter::once(request.command.as_str())
+            .chain(request.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        RunPlan {
+            cwd: request.cwd.clone(),
+            entrypoint: request.command.clone(),
+            command_line,
+            env_count: request.env.len(),
+            command_kind: RunCommandKind::NodeEntrypoint,
+            resolved_script: None,
+        }
+    }
+
+    fn boot_session(&mut self, spec: &EngineSessionSpec) -> Result<EngineSessionHandle, String> {
+        Ok(self.state.boot_session(spec, "quickjs-ng-session"))
+    }
+
+    fn dispose_session(&mut self, handle: &EngineSessionHandle) {
+        self.state.dispose_session(handle);
+    }
+
+    fn create_context(&mut self, spec: &EngineContextSpec) -> Result<EngineContextHandle, String> {
+        self.state
+            .create_context(spec, "quickjs-ng-context", "quickjs-ng")
+    }
+
+    fn describe_context(&self, handle: &EngineContextHandle) -> Option<EngineContextSnapshot> {
+        self.state.describe_context(handle)
+    }
+
+    fn eval(
+        &mut self,
+        handle: &EngineContextHandle,
+        _request: &EngineEvalRequest,
+    ) -> Result<EngineEvalOutcome, String> {
+        let snapshot = self
+            .state
+            .describe_context(handle)
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+
+        Err(format!(
+            "quickjs-ng adapter scaffold is ready for {} but the VM crate is not linked yet",
+            snapshot.entrypoint
+        ))
+    }
+
+    fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
+        self.state.drain_jobs(handle, "quickjs-ng")
+    }
+
+    fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
+        self.state.interrupt(handle, "quickjs-ng")
+    }
+
+    fn dispose_context(&mut self, handle: &EngineContextHandle) {
+        self.state.dispose_context(handle);
     }
 }

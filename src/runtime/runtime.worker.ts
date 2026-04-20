@@ -193,13 +193,22 @@ async function runSession(
 
   let processInfo = runtimeContext.process;
   let processCwd = runtimeContext.process.cwd;
+  let engineContextSummary = "state=<unknown> pending-jobs=<unknown>";
   let runtimeBindingsSummary = "globals=<unknown> builtins=<unknown>";
+  let runtimeBootstrapSummary = "bootstrap=<unknown> modules=<unknown>";
 
   try {
+    const engineContextResponse = await hostAdapter.describeEngineContext(runtimeContext.contextId);
     const runtimeBindingsResponse = await hostAdapter.executeRuntimeCommand(
       runtimeContext.contextId,
       {
         kind: "runtime.describe",
+      },
+    );
+    const runtimeBootstrapResponse = await hostAdapter.executeRuntimeCommand(
+      runtimeContext.contextId,
+      {
+        kind: "runtime.describe-bootstrap",
       },
     );
     const processInfoResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
@@ -213,10 +222,15 @@ async function runSession(
         ? processInfoResponse.process
         : runtimeContext.process;
     processCwd = cwdResponse.kind === "process-cwd" ? cwdResponse.cwd : processInfo.cwd;
+    engineContextSummary = `state=${engineContextResponse.state} pending-jobs=${engineContextResponse.pendingJobs} entry=${engineContextResponse.entrypoint}`;
     runtimeBindingsSummary =
       runtimeBindingsResponse.kind === "runtime-bindings"
         ? `globals=${runtimeBindingsResponse.bindings.globals.join(",")} builtins=${runtimeBindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`
         : runtimeBindingsSummary;
+    runtimeBootstrapSummary =
+      runtimeBootstrapResponse.kind === "runtime-bootstrap"
+        ? `bootstrap=${runtimeBootstrapResponse.plan.bootstrapSpecifier} modules=${runtimeBootstrapResponse.plan.modules.map((module) => module.specifier).join(",")}`
+        : runtimeBootstrapSummary;
   } catch (error) {
     await disposeActiveRun(sessionId);
     record.session.state = "errored";
@@ -271,7 +285,17 @@ async function runSession(
   await enqueueRuntimeStdout(
     hostAdapter,
     runtimeContext.contextId,
+    `[engine-context] ${engineContextSummary}`,
+  );
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
     `[bindings] ${runtimeBindingsSummary}`,
+  );
+  await enqueueRuntimeStdout(
+    hostAdapter,
+    runtimeContext.contextId,
+    `[bootstrap] ${runtimeBootstrapSummary}`,
   );
   await enqueueRuntimeStdout(
     hostAdapter,

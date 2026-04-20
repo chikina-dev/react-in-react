@@ -617,6 +617,39 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     },
   });
 
+  await expect(adapter.describeEngineContext(runtimeContext.contextId)).resolves.toEqual({
+    engineSessionId: `null-engine-session:${runtimeContext.sessionId}`,
+    engineContextId: `null-engine-context:${runtimeContext.contextId}`,
+    sessionId: runtimeContext.sessionId,
+    cwd: "/workspace/src",
+    entrypoint: "/workspace/src/server.ts",
+    argvLen: 2,
+    envCount: 0,
+    pendingJobs: 0,
+    state: "booted",
+  });
+
+  await expect(
+    adapter.evalEngineContext(runtimeContext.contextId, {
+      filename: "/workspace/src/server.ts",
+      source: "console.log('server')",
+      asModule: false,
+    }),
+  ).resolves.toEqual({
+    resultSummary: "null-engine skipped script eval for /workspace/src/server.ts (21 bytes)",
+    pendingJobs: 0,
+    state: "ready",
+  });
+
+  await expect(adapter.drainEngineJobs(runtimeContext.contextId)).resolves.toEqual({
+    drainedJobs: 0,
+    pendingJobs: 0,
+  });
+
+  await expect(adapter.interruptEngineContext(runtimeContext.contextId, "test")).resolves.toBe(
+    undefined,
+  );
+
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "runtime.describe-bootstrap",

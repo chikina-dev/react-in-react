@@ -8,7 +8,7 @@ pub mod vfs;
 pub use engine::{
     EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextState,
     EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain, EngineSessionHandle,
-    NullEngineAdapter,
+    NullEngineAdapter, QuickJsNgEngineAdapter,
 };
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
@@ -106,6 +106,51 @@ mod tests {
         assert!(matches!(
             host.describe_engine_context(&runtime_context.context_id),
             Err(RuntimeHostError::RuntimeContextNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn quickjs_ng_engine_scaffold_reports_unlinked_vm() {
+        let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "quickjs.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("quickjs-app".into()),
+                BTreeMap::new(),
+                vec![VirtualFile::text(
+                    "/workspace/src/main.js",
+                    "console.log('quickjs');",
+                )],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should be created");
+
+        assert_eq!(host.boot_summary().engine_name, "quickjs-ng-stub");
+        assert_eq!(
+            host.describe_engine_context(&runtime_context.context_id)
+                .expect("engine context should exist")
+                .state,
+            EngineContextState::Booted
+        );
+        assert!(matches!(
+            host.eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/src/main.js",
+                "console.log('quickjs');",
+                false,
+            ),
+            Err(RuntimeHostError::EngineFailure(message))
+                if message.contains("quickjs-ng adapter scaffold")
         ));
     }
 
