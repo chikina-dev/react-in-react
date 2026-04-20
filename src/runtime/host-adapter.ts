@@ -154,6 +154,7 @@ export type HostRuntimeResponse =
       port: HostRuntimePort;
       request: HostRuntimeHttpRequest;
       requestHint: HostPreviewRequestHint;
+      responseDescriptor: HostPreviewResponseDescriptor;
     }
   | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
   | { kind: "timer-cleared"; timerId: string; existed: boolean }
@@ -291,6 +292,30 @@ export type HostPreviewRequestHint =
       hydratePaths: string[];
     };
 
+export type HostPreviewResponseDescriptor =
+  | {
+      kind: "workspace-document" | "workspace-file" | "workspace-asset";
+      workspacePath: string;
+      documentRoot: string;
+    }
+  | {
+      kind: "app-shell";
+      workspacePath: string;
+      documentRoot: null;
+    }
+  | {
+      kind:
+        | "host-managed-fallback"
+        | "runtime-state"
+        | "workspace-state"
+        | "file-index"
+        | "diagnostics-state"
+        | "runtime-stylesheet"
+        | "not-found";
+      workspacePath: null;
+      documentRoot: null;
+    };
+
 export interface RuntimeHostAdapter {
   bootSummary(): Promise<HostBootstrapSummary>;
   createSession(input: {
@@ -379,6 +404,49 @@ type HostRuntimeContextRecord = {
   events: HostRuntimeEvent[];
   exitCode: number | null;
 };
+
+function describeMockPreviewResponse(
+  requestHint: HostPreviewRequestHint,
+): HostPreviewResponseDescriptor {
+  switch (requestHint.kind) {
+    case "root-document":
+      return {
+        kind: "workspace-document",
+        workspacePath: requestHint.workspacePath,
+        documentRoot: requestHint.documentRoot,
+      };
+    case "root-entry":
+      return {
+        kind: "app-shell",
+        workspacePath: requestHint.workspacePath,
+        documentRoot: null,
+      };
+    case "fallback-root":
+      return {
+        kind: "host-managed-fallback",
+        workspacePath: null,
+        documentRoot: null,
+      };
+    case "runtime-state":
+    case "workspace-state":
+    case "file-index":
+    case "diagnostics-state":
+    case "runtime-stylesheet":
+    case "not-found":
+      return {
+        kind: requestHint.kind,
+        workspacePath: null,
+        documentRoot: null,
+      };
+    case "workspace-file":
+    case "workspace-asset":
+      return {
+        kind: requestHint.kind,
+        workspacePath: requestHint.workspacePath,
+        documentRoot: requestHint.documentRoot,
+      };
+  }
+}
 
 export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   private readonly sessions = new Map<string, HostSessionRecord>();
@@ -954,15 +1022,17 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         if (!server) {
           throw new Error(`runtime http server not found: ${command.request.port}`);
         }
+        const requestHint = await this.resolvePreviewRequestHint(
+          context.sessionId,
+          command.request.relativePath,
+        );
         return {
           kind: "preview-request-resolved",
           server,
           port: server.port,
           request: { ...command.request },
-          requestHint: await this.resolvePreviewRequestHint(
-            context.sessionId,
-            command.request.relativePath,
-          ),
+          requestHint,
+          responseDescriptor: describeMockPreviewResponse(requestHint),
         };
       }
       case "timers.schedule": {
@@ -1752,6 +1822,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
           port: HostRuntimePort;
           request: HostRuntimeHttpRequest;
           requestHint: HostPreviewRequestHint;
+          responseDescriptor: HostPreviewResponseDescriptor;
         }
       | { kind: "timer-scheduled"; timer: HostRuntimeTimer }
       | { kind: "timer-cleared"; timerId: string; existed: boolean }

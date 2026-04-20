@@ -3,6 +3,7 @@ import {
   createRuntimeHostAdapter,
   type HostRuntimeContext,
   type HostPreviewRequestHint,
+  type HostPreviewResponseDescriptor,
   type HostRunPlan,
 } from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
@@ -46,6 +47,7 @@ type SessionRecord = {
     url: string;
     model: PreviewModel;
     rootRequestHint: HostPreviewRequestHint;
+    rootResponseDescriptor: HostPreviewResponseDescriptor;
     host: PreviewHostSummary;
     run: PreviewRunPlan;
     hostFiles: PreviewHostFileSummary;
@@ -317,6 +319,14 @@ async function runSession(
             workspacePath: null,
             documentRoot: null,
             hydratePaths: [],
+          },
+    rootResponseDescriptor:
+      rootRequestHintResponse.kind === "preview-request-resolved"
+        ? rootRequestHintResponse.responseDescriptor
+        : {
+            kind: "host-managed-fallback",
+            workspacePath: null,
+            documentRoot: null,
           },
     host: bootSummary,
     run: {
@@ -646,6 +656,10 @@ async function resolvePreviewHttpResponse(
       requestHintResponse?.kind === "preview-request-resolved"
         ? requestHintResponse.requestHint
         : null;
+    const responseDescriptor =
+      requestHintResponse?.kind === "preview-request-resolved"
+        ? requestHintResponse.responseDescriptor
+        : null;
     const files =
       record && requestHint ? await ensurePreviewFiles(record, requestHint.hydratePaths) : null;
 
@@ -659,7 +673,9 @@ async function resolvePreviewHttpResponse(
             url: record.preview.url,
             model: record.preview.model,
             rootRequestHint: record.preview.rootRequestHint,
+            rootResponseDescriptor: record.preview.rootResponseDescriptor,
             requestHint: requestHint ?? undefined,
+            responseDescriptor: responseDescriptor ?? undefined,
             host: record.preview.host,
             run: record.preview.run,
             hostFiles: record.preview.hostFiles,

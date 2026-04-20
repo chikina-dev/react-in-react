@@ -176,6 +176,43 @@ test("buildPreviewResponse prefers host-provided request hints", () => {
   expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
 });
 
+test("buildPreviewResponse prefers host-provided response descriptors", () => {
+  const state = createPreviewState(
+    new Map([
+      [
+        "/workspace/dist/index.html",
+        {
+          path: "/workspace/dist/index.html",
+          size: 51,
+          contentType: "text/html; charset=utf-8",
+          isText: true,
+          bytes: new TextEncoder().encode('<script type="module" src="/assets/app.js"></script>'),
+          textContent: '<script type="module" src="/assets/app.js"></script>',
+        },
+      ],
+    ]),
+  );
+
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/",
+    },
+    {
+      ...state,
+      responseDescriptor: {
+        kind: "workspace-document",
+        workspacePath: "/workspace/dist/index.html",
+        documentRoot: "/workspace/dist",
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toContain("text/html");
+  expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
+});
+
 test("buildPreviewResponse serves workspace files from host-provided request hints", () => {
   const response = buildPreviewResponse(
     {

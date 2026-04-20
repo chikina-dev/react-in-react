@@ -377,6 +377,7 @@ pub enum HostRuntimeResponse {
         port: HostRuntimePort,
         request: HostRuntimeHttpRequest,
         request_hint: PreviewRequestHint,
+        response_descriptor: PreviewResponseDescriptor,
     },
     TimerScheduled {
         timer: HostRuntimeTimer,
@@ -451,4 +452,26 @@ pub struct PreviewRequestHint {
     pub workspace_path: Option<String>,
     pub document_root: Option<String>,
     pub hydrate_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewResponseKind {
+    WorkspaceDocument,
+    AppShell,
+    HostManagedFallback,
+    RuntimeState,
+    WorkspaceState,
+    FileIndex,
+    DiagnosticsState,
+    RuntimeStylesheet,
+    WorkspaceFile,
+    WorkspaceAsset,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewResponseDescriptor {
+    pub kind: PreviewResponseKind,
+    pub workspace_path: Option<String>,
+    pub document_root: Option<String>,
 }

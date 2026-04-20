@@ -8,8 +8,9 @@ use crate::protocol::{
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
     HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
     HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
-    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
+    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -799,12 +800,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 };
                 let request_hint =
                     self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
+                let response_descriptor = describe_preview_response(&request_hint);
 
                 Ok(HostRuntimeResponse::PreviewRequestResolved {
                     server: runtime_http_server_view(&server),
                     port: runtime_port_view(&server.port),
                     request: runtime_http_request_view(&request),
                     request_hint,
+                    response_descriptor,
                 })
             }
             HostRuntimeCommand::TimerSchedule { delay_ms, repeat } => {
@@ -1254,6 +1257,28 @@ fn runtime_http_server_view(server: &RuntimeHttpServerRecord) -> HostRuntimeHttp
         kind: server.kind.clone(),
         cwd: server.cwd.clone(),
         entrypoint: server.entrypoint.clone(),
+    }
+}
+
+fn describe_preview_response(request_hint: &PreviewRequestHint) -> PreviewResponseDescriptor {
+    let kind = match request_hint.kind {
+        PreviewRequestKind::RootDocument => PreviewResponseKind::WorkspaceDocument,
+        PreviewRequestKind::RootEntry => PreviewResponseKind::AppShell,
+        PreviewRequestKind::FallbackRoot => PreviewResponseKind::HostManagedFallback,
+        PreviewRequestKind::RuntimeState => PreviewResponseKind::RuntimeState,
+        PreviewRequestKind::WorkspaceState => PreviewResponseKind::WorkspaceState,
+        PreviewRequestKind::FileIndex => PreviewResponseKind::FileIndex,
+        PreviewRequestKind::DiagnosticsState => PreviewResponseKind::DiagnosticsState,
+        PreviewRequestKind::RuntimeStylesheet => PreviewResponseKind::RuntimeStylesheet,
+        PreviewRequestKind::WorkspaceFile => PreviewResponseKind::WorkspaceFile,
+        PreviewRequestKind::WorkspaceAsset => PreviewResponseKind::WorkspaceAsset,
+        PreviewRequestKind::NotFound => PreviewResponseKind::NotFound,
+    };
+
+    PreviewResponseDescriptor {
+        kind,
+        workspace_path: request_hint.workspace_path.clone(),
+        document_root: request_hint.document_root.clone(),
     }
 }
 

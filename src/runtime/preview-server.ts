@@ -20,7 +20,7 @@ import type {
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type { HostPreviewRequestHint } from "./host-adapter";
+import type { HostPreviewRequestHint, HostPreviewResponseDescriptor } from "./host-adapter";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewServerState = {
@@ -30,7 +30,9 @@ type PreviewServerState = {
   url: string;
   model: PreviewModel;
   rootRequestHint?: HostPreviewRequestHint;
+  rootResponseDescriptor?: HostPreviewResponseDescriptor;
   requestHint?: HostPreviewRequestHint;
+  responseDescriptor?: HostPreviewResponseDescriptor;
   host: PreviewHostSummary;
   run: PreviewRunPlan;
   hostFiles: PreviewHostFileSummary;
@@ -94,6 +96,22 @@ export function buildPreviewResponse(
   }
 
   const relativePath = getPreviewRelativePath(request, preview);
+  if (preview.responseDescriptor) {
+    return buildPreviewResponseFromDescriptor(
+      request,
+      preview,
+      relativePath,
+      preview.responseDescriptor,
+    );
+  }
+  if ((relativePath === "/" || relativePath === "/index.html") && preview.rootResponseDescriptor) {
+    return buildPreviewResponseFromDescriptor(
+      request,
+      preview,
+      relativePath,
+      preview.rootResponseDescriptor,
+    );
+  }
   if (preview.requestHint) {
     return buildPreviewResponseFromHint(request, preview, relativePath, preview.requestHint);
   }
@@ -222,6 +240,70 @@ function buildPreviewResponseFromHint(
         preview,
         requestHint.workspacePath,
         requestHint.documentRoot,
+      );
+      return (
+        response ??
+        buildWorkspaceAssetResponse(relativePath, preview) ??
+        unsupportedPreviewPathResponse(request.pathname)
+      );
+    }
+    case "not-found":
+      return unsupportedPreviewPathResponse(request.pathname);
+  }
+}
+
+function buildPreviewResponseFromDescriptor(
+  request: VirtualHttpRequest,
+  preview: PreviewServerState,
+  relativePath: string,
+  descriptor: HostPreviewResponseDescriptor,
+): VirtualHttpResponse {
+  switch (descriptor.kind) {
+    case "workspace-document": {
+      const response = buildHintedWorkspaceFileResponse(
+        preview,
+        descriptor.workspacePath,
+        descriptor.documentRoot,
+      );
+      return response ?? buildPreviewRootResponse(preview, request);
+    }
+    case "app-shell":
+      return htmlResponse(
+        200,
+        renderPreviewAppShell({
+          title: preview.model.title,
+          entryUrl: buildPreviewUrlForWorkspaceFile(
+            descriptor.workspacePath,
+            preview,
+            "/workspace",
+          ),
+        }),
+      );
+    case "host-managed-fallback":
+      return buildPreviewRootResponse(preview, request);
+    case "runtime-state":
+      return previewReadyResponse(preview);
+    case "workspace-state":
+      return jsonResponse(200, preview.session);
+    case "file-index":
+      return jsonResponse(200, buildPreviewFileIndex(preview));
+    case "diagnostics-state":
+      return jsonResponse(200, buildPreviewDiagnostics(preview));
+    case "runtime-stylesheet":
+      return cssResponse(200, renderRuntimeStylesheet());
+    case "workspace-file": {
+      const response = buildHintedWorkspaceFileResponse(
+        preview,
+        descriptor.workspacePath,
+        descriptor.documentRoot,
+      );
+      return response ?? buildPreviewFileResponse(relativePath, preview);
+    }
+    case "workspace-asset": {
+      const response = buildHintedWorkspaceFileResponse(
+        preview,
+        descriptor.workspacePath,
+        descriptor.documentRoot,
       );
       return (
         response ??

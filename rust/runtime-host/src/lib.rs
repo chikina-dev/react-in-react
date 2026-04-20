@@ -14,8 +14,9 @@ pub use protocol::{
     HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent,
     HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort,
     HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, RunPlan, RunRequest,
-    SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary, WorkspaceFileSummary,
+    HostRuntimeTimerKind, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
+    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -360,6 +361,7 @@ mod tests {
                 port,
                 request,
                 request_hint,
+                response_descriptor,
             }) if server
                 == HostRuntimeHttpServer {
                 port: HostRuntimePort {
@@ -385,6 +387,12 @@ mod tests {
                         String::from("/workspace/package.json"),
                         String::from("/workspace/src/main.tsx"),
                     ]
+                && response_descriptor
+                    == PreviewResponseDescriptor {
+                        kind: PreviewResponseKind::WorkspaceAsset,
+                        workspace_path: Some(String::from("/workspace/src/main.tsx")),
+                        document_root: Some(String::from("/workspace")),
+                    }
         ));
         assert!(matches!(
             host.execute_runtime_command(

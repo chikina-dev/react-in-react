@@ -8,7 +8,8 @@ use crate::protocol::{
     HostRuntimeBindings, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer,
     HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, RunRequest,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewResponseDescriptor,
+    PreviewResponseKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 
@@ -1159,12 +1160,14 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             port,
             request,
             request_hint,
+            response_descriptor,
         } => format!(
-            "{{\"kind\":\"preview-request-resolved\",\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{}}}",
+            "{{\"kind\":\"preview-request-resolved\",\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{},\"responseDescriptor\":{}}}",
             render_runtime_http_server_json(server),
             render_runtime_port_json(port),
             render_runtime_http_request_json(request),
-            render_preview_request_hint_json(request_hint)
+            render_preview_request_hint_json(request_hint),
+            render_preview_response_descriptor_json(response_descriptor)
         ),
         HostRuntimeResponse::TimerScheduled { timer } => format!(
             "{{\"kind\":\"timer-scheduled\",\"timer\":{}}}",
@@ -1526,6 +1529,38 @@ fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) 
 
     format!(
         "{{\"kind\":\"{kind}\",\"workspacePath\":{workspace_path},\"documentRoot\":{document_root},\"hydratePaths\":{hydrate_paths}}}"
+    )
+}
+
+fn render_preview_response_descriptor_json(descriptor: &PreviewResponseDescriptor) -> String {
+    let kind = match descriptor.kind {
+        PreviewResponseKind::WorkspaceDocument => "workspace-document",
+        PreviewResponseKind::AppShell => "app-shell",
+        PreviewResponseKind::HostManagedFallback => "host-managed-fallback",
+        PreviewResponseKind::RuntimeState => "runtime-state",
+        PreviewResponseKind::WorkspaceState => "workspace-state",
+        PreviewResponseKind::FileIndex => "file-index",
+        PreviewResponseKind::DiagnosticsState => "diagnostics-state",
+        PreviewResponseKind::RuntimeStylesheet => "runtime-stylesheet",
+        PreviewResponseKind::WorkspaceFile => "workspace-file",
+        PreviewResponseKind::WorkspaceAsset => "workspace-asset",
+        PreviewResponseKind::NotFound => "not-found",
+    };
+
+    let workspace_path = descriptor
+        .workspace_path
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+    let document_root = descriptor
+        .document_root
+        .as_ref()
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".into());
+
+    format!(
+        "{{\"kind\":\"{}\",\"workspacePath\":{},\"documentRoot\":{}}}",
+        kind, workspace_path, document_root
     )
 }
 

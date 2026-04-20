@@ -731,6 +731,11 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       documentRoot: "/workspace",
       hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
     },
+    responseDescriptor: {
+      kind: "workspace-asset",
+      workspacePath: "/workspace/src/server.ts",
+      documentRoot: "/workspace",
+    },
   });
 
   await expect(
