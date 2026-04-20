@@ -132,6 +132,7 @@ export type HostRuntimeModuleLoaderPlan = {
   cwd: string;
   entrypoint: string;
   workspaceRoot: string;
+  entryModule: HostRuntimeResolvedModule;
   registeredSpecifiers: string[];
   nodeModuleSearchRoots: string[];
 };
@@ -545,6 +546,12 @@ function buildMockRuntimeModuleLoaderPlan(
     cwd: context.process.cwd,
     entrypoint: context.process.entrypoint,
     workspaceRoot: "/workspace",
+    entryModule: {
+      requestedSpecifier: context.process.entrypoint,
+      resolvedSpecifier: context.process.entrypoint,
+      kind: "workspace",
+      format: detectMockRuntimeModuleFormat(context.process.entrypoint),
+    },
     registeredSpecifiers: plan.modules.map((module) => module.specifier),
     nodeModuleSearchRoots: buildMockNodeModuleDirectoryRoots(context.process.cwd),
   };

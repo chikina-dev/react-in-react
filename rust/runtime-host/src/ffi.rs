@@ -1485,12 +1485,13 @@ fn render_runtime_module_loader_plan_json(
     plan: &crate::protocol::HostRuntimeModuleLoaderPlan,
 ) -> String {
     format!(
-        "{{\"contextId\":{},\"engineName\":{},\"cwd\":{},\"entrypoint\":{},\"workspaceRoot\":{},\"registeredSpecifiers\":{},\"nodeModuleSearchRoots\":{}}}",
+        "{{\"contextId\":{},\"engineName\":{},\"cwd\":{},\"entrypoint\":{},\"workspaceRoot\":{},\"entryModule\":{},\"registeredSpecifiers\":{},\"nodeModuleSearchRoots\":{}}}",
         format!("\"{}\"", escape_json(&plan.context_id)),
         format!("\"{}\"", escape_json(&plan.engine_name)),
         format!("\"{}\"", escape_json(&plan.cwd)),
         format!("\"{}\"", escape_json(&plan.entrypoint)),
         format!("\"{}\"", escape_json(&plan.workspace_root)),
+        render_runtime_resolved_module_json(&plan.entry_module),
         render_string_array_json(&plan.registered_specifiers),
         render_string_array_json(&plan.node_module_search_roots),
     )

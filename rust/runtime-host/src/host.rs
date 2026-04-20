@@ -124,6 +124,12 @@ struct RuntimeModuleLoaderBridge<'a, E: EngineAdapter> {
 
 impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
     fn describe(&self, context_id: &str) -> RuntimeHostResult<HostRuntimeModuleLoaderPlan> {
+        let entry_module = HostRuntimeResolvedModule {
+            requested_specifier: self.context.process.entrypoint.clone(),
+            resolved_specifier: self.context.process.entrypoint.clone(),
+            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+            format: detect_module_format(&self.context.process.entrypoint),
+        };
         let registered_specifiers = self
             .engine
             .list_modules(&self.context.engine_context)
@@ -138,6 +144,7 @@ impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
             cwd: self.context.process.cwd.clone(),
             entrypoint: self.context.process.entrypoint.clone(),
             workspace_root: self.record.snapshot.workspace_root.clone(),
+            entry_module,
             registered_specifiers,
             node_module_search_roots: node_module_directory_roots(&self.context.process.cwd),
         })

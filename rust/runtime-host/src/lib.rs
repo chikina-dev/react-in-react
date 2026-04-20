@@ -31,6 +31,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::protocol::HostRuntimeModuleFormat;
 
     #[test]
     fn host_boot_summary_uses_engine_descriptor() {
@@ -193,6 +194,8 @@ mod tests {
         assert_eq!(loader_plan.context_id, runtime_context.context_id);
         assert_eq!(loader_plan.cwd, "/workspace/src");
         assert_eq!(loader_plan.workspace_root, "/workspace");
+        assert_eq!(loader_plan.entry_module.resolved_specifier, "/workspace/src/main.js");
+        assert_eq!(loader_plan.entry_module.format, HostRuntimeModuleFormat::Module);
         assert!(loader_plan
             .registered_specifiers
             .contains(&String::from("runtime:bootstrap")));
@@ -340,6 +343,10 @@ mod tests {
         let loader_plan = host
             .describe_runtime_module_loader(&runtime_context.context_id)
             .expect("module loader plan should resolve");
+        assert_eq!(
+            loader_plan.entry_module.resolved_specifier,
+            "/workspace/src/main.tsx"
+        );
         assert_eq!(
             loader_plan.node_module_search_roots,
             vec![

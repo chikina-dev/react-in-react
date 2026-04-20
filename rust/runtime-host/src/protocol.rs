@@ -185,6 +185,7 @@ pub struct HostRuntimeModuleLoaderPlan {
     pub cwd: String,
     pub entrypoint: String,
     pub workspace_root: String,
+    pub entry_module: HostRuntimeResolvedModule,
     pub registered_specifiers: Vec<String>,
     pub node_module_search_roots: Vec<String>,
 }
