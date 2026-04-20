@@ -754,6 +754,37 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
                 Ok(HostRuntimeResponse::HttpServerListening { server })
             }
+            HostRuntimeCommand::HttpCloseServer { port } => {
+                let existed = {
+                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
+                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
+                    })?;
+                    let existed = context.http_servers.remove(&port).is_some();
+                    if existed {
+                        context.ports.remove(&port);
+                        context
+                            .events
+                            .push_back(HostRuntimeEvent::PortClose { port });
+                    }
+                    existed
+                };
+
+                Ok(HostRuntimeResponse::HttpServerClosed { port, existed })
+            }
+            HostRuntimeCommand::HttpListServers => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+                Ok(HostRuntimeResponse::HttpServerList {
+                    servers: context
+                        .http_servers
+                        .values()
+                        .map(runtime_http_server_view)
+                        .collect(),
+                })
+            }
             HostRuntimeCommand::HttpResolvePreview { request } => {
                 let (session_id, server) = {
                     let context = self.runtime_contexts.get(context_id).ok_or_else(|| {

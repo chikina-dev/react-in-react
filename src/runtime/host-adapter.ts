@@ -110,6 +110,8 @@ export type HostRuntimeCommand =
   | { kind: "port.listen"; port?: number | null; protocol: HostRuntimePortProtocol }
   | { kind: "port.close"; port: number }
   | { kind: "http.serve-preview"; port?: number | null }
+  | { kind: "http.close-server"; port: number }
+  | { kind: "http.list-servers" }
   | { kind: "http.resolve-preview"; request: HostRuntimeHttpRequest }
   | { kind: "timers.schedule"; delayMs: number; repeat: boolean }
   | { kind: "timers.clear"; timerId: string }
@@ -136,6 +138,15 @@ export type HostRuntimeResponse =
   | {
       kind: "http-server-listening";
       server: HostRuntimeHttpServer;
+    }
+  | {
+      kind: "http-server-closed";
+      port: number;
+      existed: boolean;
+    }
+  | {
+      kind: "http-server-list";
+      servers: HostRuntimeHttpServer[];
     }
   | {
       kind: "preview-request-resolved";
@@ -916,6 +927,28 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           server,
         };
       }
+      case "http.close-server": {
+        const existed = context.httpServers.delete(command.port);
+        if (existed) {
+          context.ports.delete(command.port);
+          context.events.push({
+            kind: "port-close",
+            port: command.port,
+          });
+        }
+        return {
+          kind: "http-server-closed",
+          port: command.port,
+          existed,
+        };
+      }
+      case "http.list-servers":
+        return {
+          kind: "http-server-list",
+          servers: [...context.httpServers.values()].sort(
+            (left, right) => left.port.port - right.port.port,
+          ),
+        };
       case "http.resolve-preview": {
         const server = context.httpServers.get(command.request.port);
         if (!server) {
@@ -1597,6 +1630,13 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
           lines.push(`port=${String(command.port)}`);
         }
         break;
+      case "http.close-server":
+        lines.push("command=http-close-server");
+        lines.push(`port=${String(command.port)}`);
+        break;
+      case "http.list-servers":
+        lines.push("command=http-list-servers");
+        break;
       case "http.resolve-preview":
         lines.push("command=http-resolve-preview");
         lines.push(`port=${String(command.request.port)}`);
@@ -1696,6 +1736,15 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | {
           kind: "http-server-listening";
           server: HostRuntimeHttpServer;
+        }
+      | {
+          kind: "http-server-closed";
+          port: number;
+          existed: boolean;
+        }
+      | {
+          kind: "http-server-list";
+          servers: HostRuntimeHttpServer[];
         }
       | {
           kind: "preview-request-resolved";

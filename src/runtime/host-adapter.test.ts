@@ -677,6 +677,25 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.list-servers",
+    }),
+  ).resolves.toEqual({
+    kind: "http-server-list",
+    servers: [
+      {
+        port: {
+          port: 4200,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "http.resolve-preview",
       request: {
         port: 4200,
@@ -716,6 +735,17 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "http.close-server",
+      port: 4200,
+    }),
+  ).resolves.toEqual({
+    kind: "http-server-closed",
+    port: 4200,
+    existed: true,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "runtime.drain-events",
     }),
   ).resolves.toEqual({
@@ -741,6 +771,10 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           port: 4200,
           protocol: "http",
         },
+      },
+      {
+        kind: "port-close",
+        port: 4200,
       },
     ],
   });

@@ -293,6 +293,10 @@ pub enum HostRuntimeCommand {
     HttpServePreview {
         port: Option<u16>,
     },
+    HttpCloseServer {
+        port: u16,
+    },
+    HttpListServers,
     HttpResolvePreview {
         request: HostRuntimeHttpRequest,
     },
@@ -360,6 +364,13 @@ pub enum HostRuntimeResponse {
     },
     HttpServerListening {
         server: HostRuntimeHttpServer,
+    },
+    HttpServerClosed {
+        port: u16,
+        existed: bool,
+    },
+    HttpServerList {
+        servers: Vec<HostRuntimeHttpServer>,
     },
     PreviewRequestResolved {
         server: HostRuntimeHttpServer,

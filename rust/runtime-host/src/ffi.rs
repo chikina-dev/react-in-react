@@ -812,6 +812,13 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 .and_then(|value| value.parse::<u16>().ok())
                 .filter(|port| *port > 0),
         }),
+        "http-close-server" => Ok(HostRuntimeCommand::HttpCloseServer {
+            port: fields
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(0),
+        }),
+        "http-list-servers" => Ok(HostRuntimeCommand::HttpListServers),
         "http-resolve-preview" => Ok(HostRuntimeCommand::HttpResolvePreview {
             request: HostRuntimeHttpRequest {
                 port: fields
@@ -1139,6 +1146,14 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"http-server-listening\",\"server\":{}}}",
             render_runtime_http_server_json(server)
         ),
+        HostRuntimeResponse::HttpServerClosed { port, existed } => format!(
+            "{{\"kind\":\"http-server-closed\",\"port\":{},\"existed\":{}}}",
+            port, existed
+        ),
+        HostRuntimeResponse::HttpServerList { servers } => format!(
+            "{{\"kind\":\"http-server-list\",\"servers\":{}}}",
+            render_runtime_http_servers_json(servers)
+        ),
         HostRuntimeResponse::PreviewRequestResolved {
             server,
             port,
@@ -1339,6 +1354,16 @@ fn render_runtime_http_server_json(server: &HostRuntimeHttpServer) -> String {
         escape_json(&server.cwd),
         escape_json(&server.entrypoint),
     )
+}
+
+fn render_runtime_http_servers_json(servers: &[HostRuntimeHttpServer]) -> String {
+    let items = servers
+        .iter()
+        .map(render_runtime_http_server_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
 }
 
 fn render_runtime_ports_json(ports: &[HostRuntimePort]) -> String {

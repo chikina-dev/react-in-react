@@ -329,6 +329,23 @@ mod tests {
         assert!(matches!(
             host.execute_runtime_command(
                 &runtime_context.context_id,
+                HostRuntimeCommand::HttpListServers,
+            ),
+            Ok(HostRuntimeResponse::HttpServerList { servers })
+                if servers
+                    == vec![HostRuntimeHttpServer {
+                        port: HostRuntimePort {
+                            port: 4200,
+                            protocol: HostRuntimePortProtocol::Http,
+                        },
+                        kind: HostRuntimeHttpServerKind::Preview,
+                        cwd: String::from("/workspace/src"),
+                        entrypoint: String::from("/workspace/src/main.tsx"),
+                    }]
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
                 HostRuntimeCommand::HttpResolvePreview {
                     request: crate::protocol::HostRuntimeHttpRequest {
                         port: 4200,
@@ -372,6 +389,14 @@ mod tests {
         assert!(matches!(
             host.execute_runtime_command(
                 &runtime_context.context_id,
+                HostRuntimeCommand::HttpCloseServer { port: 4200 },
+            ),
+            Ok(HostRuntimeResponse::HttpServerClosed { port, existed })
+                if port == 4200 && existed
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
                 HostRuntimeCommand::DrainEvents,
             ),
             Ok(HostRuntimeResponse::RuntimeEvents { events })
@@ -395,6 +420,7 @@ mod tests {
                                 protocol: HostRuntimePortProtocol::Http,
                             },
                         },
+                        HostRuntimeEvent::PortClose { port: 4200 },
                     ]
         ));
         assert!(matches!(

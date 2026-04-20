@@ -380,19 +380,35 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
 
   if (contextId) {
     const hostAdapter = await hostAdapterPromise;
-    const portsResponse = await hostAdapter
+    const serversResponse = await hostAdapter
       .executeRuntimeCommand(contextId, {
-        kind: "port.list",
+        kind: "http.list-servers",
       })
       .catch(() => null);
-    if (portsResponse?.kind === "port-list") {
-      for (const port of portsResponse.ports) {
+    if (serversResponse?.kind === "http-server-list") {
+      for (const server of serversResponse.servers) {
         await hostAdapter
           .executeRuntimeCommand(contextId, {
-            kind: "port.close",
-            port: port.port,
+            kind: "http.close-server",
+            port: server.port.port,
           })
           .catch(() => undefined);
+      }
+    } else {
+      const portsResponse = await hostAdapter
+        .executeRuntimeCommand(contextId, {
+          kind: "port.list",
+        })
+        .catch(() => null);
+      if (portsResponse?.kind === "port-list") {
+        for (const port of portsResponse.ports) {
+          await hostAdapter
+            .executeRuntimeCommand(contextId, {
+              kind: "port.close",
+              port: port.port,
+            })
+            .catch(() => undefined);
+        }
       }
     }
     await flushRuntimeEvents(hostAdapter, sessionId, process.pid, contextId).catch(() => undefined);
