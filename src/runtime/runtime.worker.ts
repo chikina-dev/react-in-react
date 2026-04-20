@@ -319,7 +319,7 @@ async function runSession(
       await enqueueRuntimeStdout(
         hostAdapter,
         runtimeContext.contextId,
-        `[engine-boot] pending-jobs=${bootResponse.report.pendingJobs} drained=${bootResponse.report.drainedJobs} result=${bootResponse.report.resultSummary || "<none>"}`,
+        `[engine-boot] pending-jobs=${bootResponse.report.pendingJobs} drained=${bootResponse.report.drainedJobs} loader-roots=${bootResponse.report.loaderPlan.nodeModuleSearchRoots.join(",") || "<none>"} result=${bootResponse.report.resultSummary || "<none>"}`,
       );
     }
   } catch (error) {

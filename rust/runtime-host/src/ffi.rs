@@ -897,6 +897,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
         "runtime-boot-engine" => Ok(HostRuntimeCommand::BootEngine),
+        "runtime-describe-module-loader" => Ok(HostRuntimeCommand::DescribeModuleLoader),
         "runtime-describe-modules" => Ok(HostRuntimeCommand::DescribeModules),
         "runtime-read-module" => Ok(HostRuntimeCommand::ReadModule {
             specifier: match required_field(fields, "specifier") {
@@ -1257,7 +1258,7 @@ fn render_process_info_json(process_info: &HostProcessInfo) -> String {
 
 fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> String {
     format!(
-        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"registeredModules\":{},\"bootstrapSpecifier\":{},\"state\":\"{}\"}}",
+        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"registeredModules\":{},\"bootstrapSpecifier\":{},\"moduleLoaderRoots\":{},\"state\":\"{}\"}}",
         escape_json(&snapshot.engine_session_id),
         escape_json(&snapshot.engine_context_id),
         escape_json(&snapshot.session_id),
@@ -1272,6 +1273,7 @@ fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> Stri
             .as_ref()
             .map(|value| format!("\"{}\"", escape_json(value)))
             .unwrap_or_else(|| "null".into()),
+        render_string_array_json(&snapshot.module_loader_roots),
         render_engine_context_state(snapshot.state.clone())
     )
 }
@@ -1322,6 +1324,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
         HostRuntimeResponse::EngineBoot(report) => format!(
             "{{\"kind\":\"runtime-engine-boot\",\"report\":{}}}",
             render_runtime_engine_boot_json(report)
+        ),
+        HostRuntimeResponse::ModuleLoaderPlan(plan) => format!(
+            "{{\"kind\":\"runtime-module-loader\",\"plan\":{}}}",
+            render_runtime_module_loader_plan_json(plan)
         ),
         HostRuntimeResponse::ModuleList { modules } => format!(
             "{{\"kind\":\"runtime-module-list\",\"modules\":{}}}",
@@ -1466,11 +1472,27 @@ fn render_runtime_bootstrap_module_json(module: &HostRuntimeBootstrapModule) -> 
 
 fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBoot) -> String {
     format!(
-        "{{\"plan\":{},\"resultSummary\":{},\"pendingJobs\":{},\"drainedJobs\":{}}}",
+        "{{\"plan\":{},\"loaderPlan\":{},\"resultSummary\":{},\"pendingJobs\":{},\"drainedJobs\":{}}}",
         render_runtime_bootstrap_plan_json(&report.plan),
+        render_runtime_module_loader_plan_json(&report.loader_plan),
         format!("\"{}\"", escape_json(&report.result_summary)),
         report.pending_jobs,
         report.drained_jobs,
+    )
+}
+
+fn render_runtime_module_loader_plan_json(
+    plan: &crate::protocol::HostRuntimeModuleLoaderPlan,
+) -> String {
+    format!(
+        "{{\"contextId\":{},\"engineName\":{},\"cwd\":{},\"entrypoint\":{},\"workspaceRoot\":{},\"registeredSpecifiers\":{},\"nodeModuleSearchRoots\":{}}}",
+        format!("\"{}\"", escape_json(&plan.context_id)),
+        format!("\"{}\"", escape_json(&plan.engine_name)),
+        format!("\"{}\"", escape_json(&plan.cwd)),
+        format!("\"{}\"", escape_json(&plan.entrypoint)),
+        format!("\"{}\"", escape_json(&plan.workspace_root)),
+        render_string_array_json(&plan.registered_specifiers),
+        render_string_array_json(&plan.node_module_search_roots),
     )
 }
 

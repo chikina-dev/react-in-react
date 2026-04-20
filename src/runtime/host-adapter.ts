@@ -76,6 +76,7 @@ export type HostEngineContextSnapshot = {
   pendingJobs: number;
   registeredModules: number;
   bootstrapSpecifier: string | null;
+  moduleLoaderRoots: string[];
   state: HostEngineContextState;
 };
 
@@ -92,6 +93,7 @@ export type HostEngineJobDrain = {
 
 export type HostRuntimeEngineBoot = {
   plan: HostRuntimeBootstrapPlan;
+  loaderPlan: HostRuntimeModuleLoaderPlan;
   resultSummary: string;
   pendingJobs: number;
   drainedJobs: number;
@@ -122,6 +124,16 @@ export type HostRuntimeLoadedModule = {
   kind: HostRuntimeModuleKind;
   format: HostRuntimeModuleFormat;
   source: string;
+};
+
+export type HostRuntimeModuleLoaderPlan = {
+  contextId: string;
+  engineName: string;
+  cwd: string;
+  entrypoint: string;
+  workspaceRoot: string;
+  registeredSpecifiers: string[];
+  nodeModuleSearchRoots: string[];
 };
 
 export type HostRuntimeStdioStream = "stdout" | "stderr";
@@ -174,6 +186,7 @@ export type HostRuntimeCommand =
         | "runtime.describe"
         | "runtime.describe-bootstrap"
         | "runtime.boot-engine"
+        | "runtime.describe-module-loader"
         | "runtime.describe-modules"
         | "runtime.drain-events"
         | "port.list"
@@ -214,6 +227,7 @@ export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
   | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
+  | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
   | { kind: "runtime-module-list"; modules: HostRuntimeModuleRecord[] }
   | { kind: "runtime-module-source"; module: HostRuntimeModuleSource }
   | { kind: "runtime-module-resolved"; module: HostRuntimeResolvedModule }
@@ -519,6 +533,23 @@ export async function boot() {
   };
 }
 
+function buildMockRuntimeModuleLoaderPlan(
+  contextId: string,
+  context: HostRuntimeContextRecord,
+): HostRuntimeModuleLoaderPlan {
+  const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+
+  return {
+    contextId,
+    engineName: "null-engine",
+    cwd: context.process.cwd,
+    entrypoint: context.process.entrypoint,
+    workspaceRoot: "/workspace",
+    registeredSpecifiers: plan.modules.map((module) => module.specifier),
+    nodeModuleSearchRoots: buildMockNodeModuleDirectoryRoots(context.process.cwd),
+  };
+}
+
 type MockPreviewRootHint =
   | {
       kind: "workspace-document";
@@ -708,6 +739,7 @@ type HostRuntimeContextRecord = {
   engineState: HostEngineContextState;
   registeredModules: number;
   bootstrapSpecifier: string | null;
+  moduleLoaderRoots: string[];
   clockMs: number;
   nextPort: number;
   ports: Map<number, HostRuntimePort>;
@@ -921,6 +953,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       engineState: "booted" as HostEngineContextState,
       registeredModules: 0,
       bootstrapSpecifier: null as string | null,
+      moduleLoaderRoots: [] as string[],
       clockMs: 0,
       nextPort: 3000,
       ports: new Map<number, HostRuntimePort>(),
@@ -951,6 +984,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       pendingJobs: 0,
       registeredModules: context.registeredModules,
       bootstrapSpecifier: context.bootstrapSpecifier,
+      moduleLoaderRoots: context.moduleLoaderRoots,
       state: context.engineState,
     };
   }
@@ -1286,8 +1320,14 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "runtime-bootstrap",
           plan: buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint),
         };
+      case "runtime.describe-module-loader":
+        return {
+          kind: "runtime-module-loader",
+          plan: buildMockRuntimeModuleLoaderPlan(contextId, context),
+        };
       case "runtime.boot-engine": {
         const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        const loaderPlan = buildMockRuntimeModuleLoaderPlan(contextId, context);
         const bootstrapModule = plan.modules.find(
           (module) => module.specifier === plan.bootstrapSpecifier,
         );
@@ -1305,11 +1345,13 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
         context.registeredModules = plan.modules.length;
         context.bootstrapSpecifier = plan.bootstrapSpecifier;
+        context.moduleLoaderRoots = loaderPlan.nodeModuleSearchRoots;
 
         return {
           kind: "runtime-engine-boot",
           report: {
             plan,
+            loaderPlan,
             resultSummary: evalOutcome.resultSummary,
             pendingJobs: evalOutcome.pendingJobs,
             drainedJobs: drain.drainedJobs,
@@ -2248,6 +2290,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.boot-engine":
         lines.push("command=runtime-boot-engine");
         break;
+      case "runtime.describe-module-loader":
+        lines.push("command=runtime-describe-module-loader");
+        break;
       case "runtime.describe-modules":
         lines.push("command=runtime-describe-modules");
         break;
@@ -2398,6 +2443,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
+      | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
       | { kind: "event-queued"; queueLen: number }
       | { kind: "runtime-events"; events: HostRuntimeEvent[] }
       | { kind: "port-listening"; port: HostRuntimePort }
@@ -2984,6 +3030,27 @@ function buildMockNodeModuleSearchRoots(importerDir: string, packageName: string
   }
 
   return [...roots];
+}
+
+function buildMockNodeModuleDirectoryRoots(importerDir: string): string[] {
+  const roots = new Set<string>();
+  let current = importerDir;
+
+  while (current.startsWith("/workspace")) {
+    if (current.endsWith("/node_modules")) {
+      roots.add(normalizeMockPosixPath(current));
+    } else {
+      roots.add(normalizeMockPosixPath(`${current}/node_modules`));
+    }
+
+    if (current === "/workspace") {
+      break;
+    }
+
+    current = parentMockPosixPath(current);
+  }
+
+  return [...roots].sort();
 }
 
 function detectMockRuntimeModuleFormat(path: string): HostRuntimeModuleFormat {

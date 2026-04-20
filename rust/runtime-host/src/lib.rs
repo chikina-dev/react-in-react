@@ -148,6 +148,7 @@ mod tests {
             .expect("engine context should exist");
         assert_eq!(snapshot.state, EngineContextState::Booted);
         assert_eq!(snapshot.registered_modules, 0);
+        assert!(snapshot.module_loader_roots.is_empty());
         assert!(matches!(
             host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine),
             Err(RuntimeHostError::EngineFailure(message))
@@ -160,6 +161,13 @@ mod tests {
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
             Some("runtime:bootstrap")
+        );
+        assert_eq!(
+            snapshot.module_loader_roots,
+            vec![
+                String::from("/workspace/node_modules"),
+                String::from("/workspace/src/node_modules"),
+            ]
         );
         assert_eq!(
             host.list_engine_modules(&runtime_context.context_id)
@@ -178,6 +186,22 @@ mod tests {
                 .expect("registered module should resolve")
                 .resolved_specifier,
             "node:process"
+        );
+        let loader_plan = host
+            .describe_runtime_module_loader(&runtime_context.context_id)
+            .expect("module loader plan should resolve");
+        assert_eq!(loader_plan.context_id, runtime_context.context_id);
+        assert_eq!(loader_plan.cwd, "/workspace/src");
+        assert_eq!(loader_plan.workspace_root, "/workspace");
+        assert!(loader_plan
+            .registered_specifiers
+            .contains(&String::from("runtime:bootstrap")));
+        assert_eq!(
+            loader_plan.node_module_search_roots,
+            vec![
+                String::from("/workspace/node_modules"),
+                String::from("/workspace/src/node_modules"),
+            ]
         );
     }
 
@@ -313,6 +337,16 @@ mod tests {
             .load_runtime_module(&runtime_context.context_id, &relative_module.resolved_specifier)
             .expect("relative module should load");
         assert!(relative_source.source.contains("generated"));
+        let loader_plan = host
+            .describe_runtime_module_loader(&runtime_context.context_id)
+            .expect("module loader plan should resolve");
+        assert_eq!(
+            loader_plan.node_module_search_roots,
+            vec![
+                String::from("/workspace/node_modules"),
+                String::from("/workspace/src/node_modules"),
+            ]
+        );
         assert_eq!(
             host.write_workspace_file(
                 &session.session_id,

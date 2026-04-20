@@ -650,6 +650,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     pendingJobs: 0,
     registeredModules: 0,
     bootstrapSpecifier: null,
+    moduleLoaderRoots: [],
     state: "booted",
   });
 
@@ -698,6 +699,23 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     }),
   });
 
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe-module-loader",
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-module-loader",
+    plan: {
+      contextId: runtimeContext.contextId,
+      engineName: "null-engine",
+      cwd: "/workspace/src",
+      entrypoint: "/workspace/src/server.ts",
+      workspaceRoot: "/workspace",
+      registeredSpecifiers: expect.arrayContaining(["node:process", "runtime:bootstrap"]),
+      nodeModuleSearchRoots: ["/workspace/node_modules", "/workspace/src/node_modules"],
+    },
+  });
+
   const bootResponse = await adapter.executeRuntimeCommand(runtimeContext.contextId, {
     kind: "runtime.boot-engine",
   });
@@ -708,6 +726,15 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         contextId: runtimeContext.contextId,
         bootstrapSpecifier: "runtime:bootstrap",
       }),
+      loaderPlan: {
+        contextId: runtimeContext.contextId,
+        engineName: "null-engine",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+        workspaceRoot: "/workspace",
+        registeredSpecifiers: expect.arrayContaining(["node:process", "runtime:bootstrap"]),
+        nodeModuleSearchRoots: ["/workspace/node_modules", "/workspace/src/node_modules"],
+      },
       pendingJobs: 0,
       drainedJobs: 0,
     },
@@ -727,6 +754,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     pendingJobs: 0,
     registeredModules: 7,
     bootstrapSpecifier: "runtime:bootstrap",
+    moduleLoaderRoots: ["/workspace/node_modules", "/workspace/src/node_modules"],
     state: "ready",
   });
 

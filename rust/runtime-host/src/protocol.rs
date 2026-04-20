@@ -131,6 +131,7 @@ pub struct HostRuntimeBootstrapPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimeEngineBoot {
     pub plan: HostRuntimeBootstrapPlan,
+    pub loader_plan: HostRuntimeModuleLoaderPlan,
     pub result_summary: String,
     pub pending_jobs: usize,
     pub drained_jobs: usize,
@@ -175,6 +176,17 @@ pub struct HostRuntimeLoadedModule {
     pub kind: HostRuntimeModuleKind,
     pub format: HostRuntimeModuleFormat,
     pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeModuleLoaderPlan {
+    pub context_id: String,
+    pub engine_name: String,
+    pub cwd: String,
+    pub entrypoint: String,
+    pub workspace_root: String,
+    pub registered_specifiers: Vec<String>,
+    pub node_module_search_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +356,7 @@ pub enum HostRuntimeCommand {
     DescribeBindings,
     DescribeBootstrap,
     BootEngine,
+    DescribeModuleLoader,
     DescribeModules,
     ReadModule {
         specifier: String,
@@ -430,6 +443,7 @@ pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
     BootstrapPlan(HostRuntimeBootstrapPlan),
     EngineBoot(HostRuntimeEngineBoot),
+    ModuleLoaderPlan(HostRuntimeModuleLoaderPlan),
     ModuleList {
         modules: Vec<HostRuntimeModuleRecord>,
     },

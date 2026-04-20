@@ -13,7 +13,8 @@ use crate::protocol::{
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
     HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeLoadedModule,
-    HostRuntimeModuleRecord, HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord, HostRuntimeModuleSource,
+    HostRuntimePort, HostRuntimePortProtocol,
     HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
     HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
@@ -113,6 +114,117 @@ struct RuntimeHttpServerRecord {
     kind: HostRuntimeHttpServerKind,
     cwd: String,
     entrypoint: String,
+}
+
+struct RuntimeModuleLoaderBridge<'a, E: EngineAdapter> {
+    engine: &'a E,
+    record: &'a SessionRecord,
+    context: &'a RuntimeContextRecord,
+}
+
+impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
+    fn describe(&self, context_id: &str) -> RuntimeHostResult<HostRuntimeModuleLoaderPlan> {
+        let registered_specifiers = self
+            .engine
+            .list_modules(&self.context.engine_context)
+            .map_err(RuntimeHostError::EngineFailure)?
+            .into_iter()
+            .map(|module| module.specifier)
+            .collect::<Vec<_>>();
+
+        Ok(HostRuntimeModuleLoaderPlan {
+            context_id: context_id.to_string(),
+            engine_name: self.engine.descriptor().name.to_string(),
+            cwd: self.context.process.cwd.clone(),
+            entrypoint: self.context.process.entrypoint.clone(),
+            workspace_root: self.record.snapshot.workspace_root.clone(),
+            registered_specifiers,
+            node_module_search_roots: node_module_directory_roots(&self.context.process.cwd),
+        })
+    }
+
+    fn resolve(
+        &self,
+        specifier: &str,
+        importer: Option<&str>,
+    ) -> RuntimeHostResult<HostRuntimeResolvedModule> {
+        if self
+            .engine
+            .read_module(&self.context.engine_context, specifier)
+            .is_ok()
+        {
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: specifier.to_string(),
+                kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                format: crate::protocol::HostRuntimeModuleFormat::Module,
+            });
+        }
+
+        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+        {
+            let base_dir = importer
+                .filter(|value| value.starts_with("/workspace"))
+                .map(dirname)
+                .unwrap_or(&self.context.process.cwd);
+            let requested = if specifier.starts_with('/') {
+                normalize_posix_path(specifier)
+            } else {
+                normalize_posix_path(&format!("{base_dir}/{specifier}"))
+            };
+            let resolved = resolve_workspace_module(self.record, &requested)?;
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: resolved.clone(),
+                kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+                format: detect_module_format(&resolved),
+            });
+        }
+
+        let base_dir = importer
+            .filter(|value| value.starts_with("/workspace"))
+            .map(dirname)
+            .unwrap_or(&self.context.process.cwd);
+        let resolved = resolve_package_module(self.record, base_dir, specifier)?;
+        Ok(HostRuntimeResolvedModule {
+            requested_specifier: specifier.to_string(),
+            resolved_specifier: resolved.clone(),
+            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+            format: detect_module_format(&resolved),
+        })
+    }
+
+    fn load(&self, resolved_specifier: &str) -> RuntimeHostResult<HostRuntimeLoadedModule> {
+        if let Ok(module) = self
+            .engine
+            .read_module(&self.context.engine_context, resolved_specifier)
+        {
+            return Ok(HostRuntimeLoadedModule {
+                resolved_specifier: module.specifier,
+                kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                format: crate::protocol::HostRuntimeModuleFormat::Module,
+                source: module.source,
+            });
+        }
+
+        let file = self
+            .record
+            .vfs
+            .read(resolved_specifier)
+            .ok_or_else(|| RuntimeHostError::ModuleNotFound(resolved_specifier.to_string()))?;
+        if !file.is_text {
+            return Err(RuntimeHostError::EngineFailure(format!(
+                "module source must be text: {resolved_specifier}"
+            )));
+        }
+
+        Ok(HostRuntimeLoadedModule {
+            resolved_specifier: resolved_specifier.to_string(),
+            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+            format: detect_module_format(resolved_specifier),
+            source: String::from_utf8_lossy(&file.bytes).into_owned(),
+        })
+    }
 }
 
 pub struct RuntimeHostCore<E: EngineAdapter> {
@@ -498,12 +610,10 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .map_err(RuntimeHostError::EngineFailure)
     }
 
-    pub fn resolve_runtime_module(
+    fn runtime_module_loader(
         &self,
         context_id: &str,
-        importer: Option<&str>,
-        specifier: &str,
-    ) -> RuntimeHostResult<HostRuntimeResolvedModule> {
+    ) -> RuntimeHostResult<RuntimeModuleLoaderBridge<'_, E>> {
         let context = self
             .runtime_contexts
             .get(context_id)
@@ -513,50 +623,21 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .get(&context.session_id)
             .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
 
-        if self
-            .engine
-            .read_module(&context.engine_context, specifier)
-            .is_ok()
-        {
-            return Ok(HostRuntimeResolvedModule {
-                requested_specifier: specifier.to_string(),
-                resolved_specifier: specifier.to_string(),
-                kind: crate::protocol::HostRuntimeModuleKind::Registered,
-                format: crate::protocol::HostRuntimeModuleFormat::Module,
-            });
-        }
-
-        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
-        {
-            let base_dir = importer
-                .filter(|value| value.starts_with("/workspace"))
-                .map(dirname)
-                .unwrap_or(&context.process.cwd);
-            let requested = if specifier.starts_with('/') {
-                normalize_posix_path(specifier)
-            } else {
-                normalize_posix_path(&format!("{base_dir}/{specifier}"))
-            };
-            let resolved = resolve_workspace_module(record, &requested)?;
-            return Ok(HostRuntimeResolvedModule {
-                requested_specifier: specifier.to_string(),
-                resolved_specifier: resolved.clone(),
-                kind: crate::protocol::HostRuntimeModuleKind::Workspace,
-                format: detect_module_format(&resolved),
-            });
-        }
-
-        let base_dir = importer
-            .filter(|value| value.starts_with("/workspace"))
-            .map(dirname)
-            .unwrap_or(&context.process.cwd);
-        let resolved = resolve_package_module(record, base_dir, specifier)?;
-        Ok(HostRuntimeResolvedModule {
-            requested_specifier: specifier.to_string(),
-            resolved_specifier: resolved.clone(),
-            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
-            format: detect_module_format(&resolved),
+        Ok(RuntimeModuleLoaderBridge {
+            engine: &self.engine,
+            record,
+            context,
         })
+    }
+
+    pub fn resolve_runtime_module(
+        &self,
+        context_id: &str,
+        importer: Option<&str>,
+        specifier: &str,
+    ) -> RuntimeHostResult<HostRuntimeResolvedModule> {
+        self.runtime_module_loader(context_id)?
+            .resolve(specifier, importer)
     }
 
     pub fn load_runtime_module(
@@ -564,43 +645,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         context_id: &str,
         resolved_specifier: &str,
     ) -> RuntimeHostResult<HostRuntimeLoadedModule> {
-        let context = self
-            .runtime_contexts
-            .get(context_id)
-            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-        let record = self
-            .sessions
-            .get(&context.session_id)
-            .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
+        self.runtime_module_loader(context_id)?.load(resolved_specifier)
+    }
 
-        if let Ok(module) = self
-            .engine
-            .read_module(&context.engine_context, resolved_specifier)
-        {
-            return Ok(HostRuntimeLoadedModule {
-                resolved_specifier: module.specifier,
-                kind: crate::protocol::HostRuntimeModuleKind::Registered,
-                format: crate::protocol::HostRuntimeModuleFormat::Module,
-                source: module.source,
-            });
-        }
-
-        let file = record
-            .vfs
-            .read(resolved_specifier)
-            .ok_or_else(|| RuntimeHostError::ModuleNotFound(resolved_specifier.to_string()))?;
-        if !file.is_text {
-            return Err(RuntimeHostError::EngineFailure(format!(
-                "module source must be text: {resolved_specifier}"
-            )));
-        }
-
-        Ok(HostRuntimeLoadedModule {
-            resolved_specifier: resolved_specifier.to_string(),
-            kind: crate::protocol::HostRuntimeModuleKind::Workspace,
-            format: detect_module_format(resolved_specifier),
-            source: String::from_utf8_lossy(&file.bytes).into_owned(),
-        })
+    pub fn describe_runtime_module_loader(
+        &self,
+        context_id: &str,
+    ) -> RuntimeHostResult<HostRuntimeModuleLoaderPlan> {
+        self.runtime_module_loader(context_id)?.describe(context_id)
     }
 
     pub fn session_file_system(&self, session_id: &str) -> Option<&VirtualFileSystem> {
@@ -893,6 +945,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     build_runtime_bootstrap_plan(&bindings),
                 ))
             }
+            HostRuntimeCommand::DescribeModuleLoader => Ok(HostRuntimeResponse::ModuleLoaderPlan(
+                self.describe_runtime_module_loader(context_id)?,
+            )),
             HostRuntimeCommand::BootEngine => {
                 let context = self
                     .runtime_contexts
@@ -902,9 +957,10 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 let bindings =
                     build_runtime_bindings(context_id, &context, self.engine.descriptor());
                 let plan = build_runtime_bootstrap_plan(&bindings);
+                let loader_plan = self.describe_runtime_module_loader(context_id)?;
                 let eval = self
                     .engine
-                    .bootstrap(&context.engine_context, &plan)
+                    .bootstrap(&context.engine_context, &plan, &loader_plan)
                     .map_err(RuntimeHostError::EngineFailure)?;
                 let drained = self
                     .engine
@@ -913,6 +969,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
                 Ok(HostRuntimeResponse::EngineBoot(HostRuntimeEngineBoot {
                     plan,
+                    loader_plan,
                     result_summary: eval.result_summary,
                     pending_jobs: eval.pending_jobs,
                     drained_jobs: drained.drained_jobs,
@@ -2213,6 +2270,27 @@ fn node_module_search_roots(importer_dir: &str, package_name: &str) -> Vec<Strin
             roots.insert(normalize_posix_path(&format!("{current}/{package_name}")));
         } else {
             roots.insert(normalize_posix_path(&format!("{current}/node_modules/{package_name}")));
+        }
+
+        if current == "/workspace" {
+            break;
+        }
+
+        current = dirname(&current).to_string();
+    }
+
+    roots.into_iter().collect()
+}
+
+fn node_module_directory_roots(importer_dir: &str) -> Vec<String> {
+    let mut roots = BTreeSet::new();
+    let mut current = importer_dir.to_string();
+
+    while current.starts_with("/workspace") {
+        if current.ends_with("/node_modules") {
+            roots.insert(normalize_posix_path(&current));
+        } else {
+            roots.insert(normalize_posix_path(&format!("{current}/node_modules")));
         }
 
         if current == "/workspace" {

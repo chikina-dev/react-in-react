@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::{HostRuntimeBootstrapPlan, RunCommandKind, RunPlan, RunRequest};
+use crate::protocol::{HostRuntimeBootstrapPlan, HostRuntimeModuleLoaderPlan, RunCommandKind, RunPlan, RunRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineDescriptor {
@@ -59,6 +59,7 @@ pub struct EngineContextSnapshot {
     pub pending_jobs: usize,
     pub registered_modules: usize,
     pub bootstrap_specifier: Option<String>,
+    pub module_loader_roots: Vec<String>,
     pub state: EngineContextState,
 }
 
@@ -117,6 +118,7 @@ pub trait EngineAdapter {
         &mut self,
         handle: &EngineContextHandle,
         plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
     ) -> Result<EngineEvalOutcome, String>;
 
     fn list_modules(
@@ -148,6 +150,7 @@ struct EngineContextRecord {
     pending_jobs: usize,
     registered_modules: usize,
     bootstrap_specifier: Option<String>,
+    module_loader_roots: Vec<String>,
     modules: BTreeMap<String, String>,
     state: EngineContextState,
 }
@@ -208,6 +211,7 @@ impl EngineStateStore {
                 pending_jobs: 0,
                 registered_modules: 0,
                 bootstrap_specifier: None,
+                module_loader_roots: Vec::new(),
                 modules: BTreeMap::new(),
                 state: EngineContextState::Booted,
             },
@@ -229,6 +233,7 @@ impl EngineStateStore {
             pending_jobs: context.pending_jobs,
             registered_modules: context.registered_modules,
             bootstrap_specifier: context.bootstrap_specifier.clone(),
+            module_loader_roots: context.module_loader_roots.clone(),
             state: context.state.clone(),
         })
     }
@@ -237,6 +242,7 @@ impl EngineStateStore {
         &mut self,
         handle: &EngineContextHandle,
         plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
         engine_label: &str,
     ) -> Result<(), String> {
         let context = self
@@ -251,6 +257,7 @@ impl EngineStateStore {
 
         context.registered_modules = plan.modules.len();
         context.bootstrap_specifier = Some(plan.bootstrap_specifier.clone());
+        context.module_loader_roots = loader_plan.node_module_search_roots.clone();
         context.modules = plan
             .modules
             .iter()
@@ -451,13 +458,16 @@ impl EngineAdapter for NullEngineAdapter {
         &mut self,
         handle: &EngineContextHandle,
         plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
     ) -> Result<EngineEvalOutcome, String> {
-        self.state.register_bootstrap(handle, plan, "null engine")?;
+        self.state
+            .register_bootstrap(handle, plan, loader_plan, "null engine")?;
         let mut outcome = self.state.mark_ready(handle, "null engine")?;
         outcome.result_summary = format!(
-            "null-engine prepared bootstrap {} with {} modules",
+            "null-engine prepared bootstrap {} with {} modules across {} loader roots",
             plan.bootstrap_specifier,
-            plan.modules.len()
+            plan.modules.len(),
+            loader_plan.node_module_search_roots.len()
         );
         Ok(outcome)
     }
@@ -550,16 +560,19 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         &mut self,
         handle: &EngineContextHandle,
         plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
     ) -> Result<EngineEvalOutcome, String> {
-        self.state.register_bootstrap(handle, plan, "quickjs-ng")?;
+        self.state
+            .register_bootstrap(handle, plan, loader_plan, "quickjs-ng")?;
         let snapshot = self
             .state
             .describe_context(handle)
             .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
 
         Err(format!(
-            "quickjs-ng adapter scaffold registered {} modules for {} but the VM crate is not linked yet",
+            "quickjs-ng adapter scaffold registered {} modules across {} loader roots for {} but the VM crate is not linked yet",
             plan.modules.len(),
+            loader_plan.node_module_search_roots.len(),
             snapshot.entrypoint
         ))
     }
