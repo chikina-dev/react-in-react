@@ -316,9 +316,9 @@ pub extern "C" fn runtime_host_eval_engine_context_json(ptr: *const u8, len: usi
         .unwrap_or(false);
 
     HOST.with(|host| {
-        let result = host
-            .borrow_mut()
-            .eval_engine_context(&context_id, filename, source, as_module);
+        let result =
+            host.borrow_mut()
+                .eval_engine_context(&context_id, filename, source, as_module);
 
         match result {
             Ok(outcome) => set_last_result(render_engine_eval_outcome_json(&outcome)),
@@ -374,7 +374,10 @@ pub extern "C" fn runtime_host_interrupt_engine_context_json(ptr: *const u8, len
             .interrupt_engine_context(&context_id, &reason);
 
         match result {
-            Ok(()) => set_last_result(format!("{{\"contextId\":\"{}\"}}", escape_json(&context_id))),
+            Ok(()) => set_last_result(format!(
+                "{{\"contextId\":\"{}\"}}",
+                escape_json(&context_id)
+            )),
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -893,6 +896,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
     match kind.as_str() {
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
+        "runtime-boot-engine" => Ok(HostRuntimeCommand::BootEngine),
         "stdio-write" => Ok(HostRuntimeCommand::StdioWrite {
             stream: match required_field(fields, "stream").as_deref() {
                 Some("stderr") => HostRuntimeStdioStream::Stderr,
@@ -1231,7 +1235,7 @@ fn render_process_info_json(process_info: &HostProcessInfo) -> String {
 
 fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> String {
     format!(
-        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"state\":\"{}\"}}",
+        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"registeredModules\":{},\"bootstrapSpecifier\":{},\"state\":\"{}\"}}",
         escape_json(&snapshot.engine_session_id),
         escape_json(&snapshot.engine_context_id),
         escape_json(&snapshot.session_id),
@@ -1240,6 +1244,12 @@ fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> Stri
         snapshot.argv_len,
         snapshot.env_count,
         snapshot.pending_jobs,
+        snapshot.registered_modules,
+        snapshot
+            .bootstrap_specifier
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
         render_engine_context_state(snapshot.state.clone())
     )
 }
@@ -1286,6 +1296,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
         HostRuntimeResponse::BootstrapPlan(plan) => format!(
             "{{\"kind\":\"runtime-bootstrap\",\"plan\":{}}}",
             render_runtime_bootstrap_plan_json(plan)
+        ),
+        HostRuntimeResponse::EngineBoot(report) => format!(
+            "{{\"kind\":\"runtime-engine-boot\",\"report\":{}}}",
+            render_runtime_engine_boot_json(report)
         ),
         HostRuntimeResponse::EventQueued { queue_len } => {
             format!("{{\"kind\":\"event-queued\",\"queueLen\":{queue_len}}}")
@@ -1409,6 +1423,16 @@ fn render_runtime_bootstrap_module_json(module: &HostRuntimeBootstrapModule) -> 
         "{{\"specifier\":{},\"source\":{}}}",
         format!("\"{}\"", escape_json(&module.specifier)),
         format!("\"{}\"", escape_json(&module.source))
+    )
+}
+
+fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBoot) -> String {
+    format!(
+        "{{\"plan\":{},\"resultSummary\":{},\"pendingJobs\":{},\"drainedJobs\":{}}}",
+        render_runtime_bootstrap_plan_json(&report.plan),
+        format!("\"{}\"", escape_json(&report.result_summary)),
+        report.pending_jobs,
+        report.drained_jobs,
     )
 }
 

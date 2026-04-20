@@ -626,6 +626,8 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     argvLen: 2,
     envCount: 0,
     pendingJobs: 0,
+    registeredModules: 0,
+    bootstrapSpecifier: null,
     state: "booted",
   });
 
@@ -672,6 +674,38 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         }),
       ]),
     }),
+  });
+
+  const bootResponse = await adapter.executeRuntimeCommand(runtimeContext.contextId, {
+    kind: "runtime.boot-engine",
+  });
+  expect(bootResponse).toMatchObject({
+    kind: "runtime-engine-boot",
+    report: {
+      plan: expect.objectContaining({
+        contextId: runtimeContext.contextId,
+        bootstrapSpecifier: "runtime:bootstrap",
+      }),
+      pendingJobs: 0,
+      drainedJobs: 0,
+    },
+  });
+  expect(
+    bootResponse.kind === "runtime-engine-boot" ? bootResponse.report.resultSummary : "",
+  ).toContain("null-engine skipped module eval for runtime:bootstrap");
+
+  await expect(adapter.describeEngineContext(runtimeContext.contextId)).resolves.toEqual({
+    engineSessionId: `null-engine-session:${runtimeContext.sessionId}`,
+    engineContextId: `null-engine-context:${runtimeContext.contextId}`,
+    sessionId: runtimeContext.sessionId,
+    cwd: "/workspace/src",
+    entrypoint: "/workspace/src/server.ts",
+    argvLen: 2,
+    envCount: 0,
+    pendingJobs: 0,
+    registeredModules: 7,
+    bootstrapSpecifier: "runtime:bootstrap",
+    state: "ready",
   });
 
   await expect(

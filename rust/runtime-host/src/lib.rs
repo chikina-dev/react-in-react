@@ -15,8 +15,8 @@ pub use host::RuntimeHostCore;
 pub use protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
-    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand,
-    HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest,
+    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
+    HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
     HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
     HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
@@ -79,6 +79,12 @@ mod tests {
                 .entrypoint,
             "/workspace/src/main.js"
         );
+        assert_eq!(
+            host.describe_engine_context(&runtime_context.context_id)
+                .expect("engine context should be described")
+                .registered_modules,
+            0
+        );
 
         let eval = host
             .eval_engine_context(
@@ -136,22 +142,24 @@ mod tests {
             .expect("runtime context should be created");
 
         assert_eq!(host.boot_summary().engine_name, "quickjs-ng-stub");
-        assert_eq!(
-            host.describe_engine_context(&runtime_context.context_id)
-                .expect("engine context should exist")
-                .state,
-            EngineContextState::Booted
-        );
+        let snapshot = host
+            .describe_engine_context(&runtime_context.context_id)
+            .expect("engine context should exist");
+        assert_eq!(snapshot.state, EngineContextState::Booted);
+        assert_eq!(snapshot.registered_modules, 0);
         assert!(matches!(
-            host.eval_engine_context(
-                &runtime_context.context_id,
-                "/workspace/src/main.js",
-                "console.log('quickjs');",
-                false,
-            ),
+            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine),
             Err(RuntimeHostError::EngineFailure(message))
-                if message.contains("quickjs-ng adapter scaffold")
+                if message.contains("quickjs-ng adapter scaffold registered")
         ));
+        let snapshot = host
+            .describe_engine_context(&runtime_context.context_id)
+            .expect("engine context should exist");
+        assert_eq!(snapshot.registered_modules, 7);
+        assert_eq!(
+            snapshot.bootstrap_specifier.as_deref(),
+            Some("runtime:bootstrap")
+        );
     }
 
     #[test]

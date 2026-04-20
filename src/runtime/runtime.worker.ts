@@ -309,6 +309,28 @@ async function runSession(
       `[detect] react=${record.session.capabilities.detectedReact} vite=${record.session.capabilities.detectedVite}`,
     ],
   });
+
+  try {
+    const bootResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.boot-engine",
+    });
+
+    if (bootResponse.kind === "runtime-engine-boot") {
+      await enqueueRuntimeStdout(
+        hostAdapter,
+        runtimeContext.contextId,
+        `[engine-boot] pending-jobs=${bootResponse.report.pendingJobs} drained=${bootResponse.report.drainedJobs} result=${bootResponse.report.resultSummary || "<none>"}`,
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown engine boot failure";
+    await enqueueRuntimeStdout(
+      hostAdapter,
+      runtimeContext.contextId,
+      `[engine-boot] bootstrap failed, synthetic fallback active: ${message}`,
+    );
+  }
+
   await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
 
   if (activeProcess.cancelled) {

@@ -74,6 +74,8 @@ export type HostEngineContextSnapshot = {
   argvLen: number;
   envCount: number;
   pendingJobs: number;
+  registeredModules: number;
+  bootstrapSpecifier: string | null;
   state: HostEngineContextState;
 };
 
@@ -86,6 +88,13 @@ export type HostEngineEvalOutcome = {
 export type HostEngineJobDrain = {
   drainedJobs: number;
   pendingJobs: number;
+};
+
+export type HostRuntimeEngineBoot = {
+  plan: HostRuntimeBootstrapPlan;
+  resultSummary: string;
+  pendingJobs: number;
+  drainedJobs: number;
 };
 
 export type HostRuntimeStdioStream = "stdout" | "stderr";
@@ -137,6 +146,7 @@ export type HostRuntimeCommand =
       kind:
         | "runtime.describe"
         | "runtime.describe-bootstrap"
+        | "runtime.boot-engine"
         | "runtime.drain-events"
         | "port.list"
         | "timers.list"
@@ -172,6 +182,7 @@ export type HostRuntimeCommand =
 export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
+  | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
   | { kind: "event-queued"; queueLen: number }
   | { kind: "runtime-events"; events: HostRuntimeEvent[] }
   | { kind: "port-listening"; port: HostRuntimePort }
@@ -660,6 +671,8 @@ type HostRuntimeContextRecord = {
   sessionId: string;
   process: HostProcessInfo;
   engineState: HostEngineContextState;
+  registeredModules: number;
+  bootstrapSpecifier: string | null;
   clockMs: number;
   nextPort: number;
   ports: Map<number, HostRuntimePort>;
@@ -871,6 +884,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       sessionId,
       process,
       engineState: "booted" as HostEngineContextState,
+      registeredModules: 0,
+      bootstrapSpecifier: null as string | null,
       clockMs: 0,
       nextPort: 3000,
       ports: new Map<number, HostRuntimePort>(),
@@ -899,6 +914,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       argvLen: context.process.argv.length,
       envCount: Object.keys(context.process.env).length,
       pendingJobs: 0,
+      registeredModules: context.registeredModules,
+      bootstrapSpecifier: context.bootstrapSpecifier,
       state: context.engineState,
     };
   }
@@ -1234,6 +1251,36 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "runtime-bootstrap",
           plan: buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint),
         };
+      case "runtime.boot-engine": {
+        const plan = buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint);
+        const bootstrapModule = plan.modules.find(
+          (module) => module.specifier === plan.bootstrapSpecifier,
+        );
+
+        if (!bootstrapModule) {
+          throw new Error(`bootstrap module not found: ${plan.bootstrapSpecifier}`);
+        }
+
+        const evalOutcome = await this.evalEngineContext(contextId, {
+          filename: bootstrapModule.specifier,
+          source: bootstrapModule.source,
+          asModule: true,
+        });
+        const drain = await this.drainEngineJobs(contextId);
+
+        context.registeredModules = plan.modules.length;
+        context.bootstrapSpecifier = plan.bootstrapSpecifier;
+
+        return {
+          kind: "runtime-engine-boot",
+          report: {
+            plan,
+            resultSummary: evalOutcome.resultSummary,
+            pendingJobs: evalOutcome.pendingJobs,
+            drainedJobs: drain.drainedJobs,
+          },
+        };
+      }
       case "stdio.write":
         context.events.push({
           kind: command.stream,
@@ -2078,6 +2125,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         break;
       case "runtime.describe-bootstrap":
         lines.push("command=runtime-describe-bootstrap");
+        break;
+      case "runtime.boot-engine":
+        lines.push("command=runtime-boot-engine");
         break;
       case "stdio.write":
         lines.push("command=stdio-write");

@@ -129,6 +129,14 @@ pub struct HostRuntimeBootstrapPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeEngineBoot {
+    pub plan: HostRuntimeBootstrapPlan,
+    pub result_summary: String,
+    pub pending_jobs: usize,
+    pub drained_jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRuntimeStdioStream {
     Stdout,
     Stderr,
@@ -294,6 +302,7 @@ pub enum HostContextFsCommand {
 pub enum HostRuntimeCommand {
     DescribeBindings,
     DescribeBootstrap,
+    BootEngine,
     StdioWrite {
         stream: HostRuntimeStdioStream,
         chunk: String,
@@ -368,6 +377,7 @@ pub enum HostRuntimeCommand {
 pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
     BootstrapPlan(HostRuntimeBootstrapPlan),
+    EngineBoot(HostRuntimeEngineBoot),
     EventQueued {
         queue_len: usize,
     },

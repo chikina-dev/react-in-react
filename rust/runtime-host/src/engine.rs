@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::{RunCommandKind, RunPlan, RunRequest};
+use crate::protocol::{HostRuntimeBootstrapPlan, RunCommandKind, RunPlan, RunRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineDescriptor {
@@ -57,6 +57,8 @@ pub struct EngineContextSnapshot {
     pub argv_len: usize,
     pub env_count: usize,
     pub pending_jobs: usize,
+    pub registered_modules: usize,
+    pub bootstrap_specifier: Option<String>,
     pub state: EngineContextState,
 }
 
@@ -105,6 +107,12 @@ pub trait EngineAdapter {
         request: &EngineEvalRequest,
     ) -> Result<EngineEvalOutcome, String>;
 
+    fn bootstrap(
+        &mut self,
+        handle: &EngineContextHandle,
+        plan: &HostRuntimeBootstrapPlan,
+    ) -> Result<EngineEvalOutcome, String>;
+
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String>;
 
     fn interrupt(&mut self, handle: &EngineContextHandle, reason: &str) -> Result<(), String>;
@@ -121,6 +129,8 @@ struct EngineContextRecord {
     argv_len: usize,
     env_count: usize,
     pending_jobs: usize,
+    registered_modules: usize,
+    bootstrap_specifier: Option<String>,
     state: EngineContextState,
 }
 
@@ -178,6 +188,8 @@ impl EngineStateStore {
                 argv_len: spec.argv_len,
                 env_count: spec.env_count,
                 pending_jobs: 0,
+                registered_modules: 0,
+                bootstrap_specifier: None,
                 state: EngineContextState::Booted,
             },
         );
@@ -196,8 +208,32 @@ impl EngineStateStore {
             argv_len: context.argv_len,
             env_count: context.env_count,
             pending_jobs: context.pending_jobs,
+            registered_modules: context.registered_modules,
+            bootstrap_specifier: context.bootstrap_specifier.clone(),
             state: context.state.clone(),
         })
+    }
+
+    fn register_bootstrap(
+        &mut self,
+        handle: &EngineContextHandle,
+        plan: &HostRuntimeBootstrapPlan,
+        engine_label: &str,
+    ) -> Result<(), String> {
+        let context = self
+            .contexts
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| {
+                format!(
+                    "{engine_label} context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
+
+        context.registered_modules = plan.modules.len();
+        context.bootstrap_specifier = Some(plan.bootstrap_specifier.clone());
+
+        Ok(())
     }
 
     fn mark_ready(
@@ -208,7 +244,12 @@ impl EngineStateStore {
         let context = self
             .contexts
             .get_mut(&handle.engine_context_id)
-            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+            .ok_or_else(|| {
+                format!(
+                    "{engine_label} context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
 
         context.state = EngineContextState::Ready;
 
@@ -227,7 +268,12 @@ impl EngineStateStore {
         let context = self
             .contexts
             .get_mut(&handle.engine_context_id)
-            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+            .ok_or_else(|| {
+                format!(
+                    "{engine_label} context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
         let drained_jobs = context.pending_jobs;
         context.pending_jobs = 0;
 
@@ -333,6 +379,21 @@ impl EngineAdapter for NullEngineAdapter {
         self.state.drain_jobs(handle, "null engine")
     }
 
+    fn bootstrap(
+        &mut self,
+        handle: &EngineContextHandle,
+        plan: &HostRuntimeBootstrapPlan,
+    ) -> Result<EngineEvalOutcome, String> {
+        self.state.register_bootstrap(handle, plan, "null engine")?;
+        let mut outcome = self.state.mark_ready(handle, "null engine")?;
+        outcome.result_summary = format!(
+            "null-engine prepared bootstrap {} with {} modules",
+            plan.bootstrap_specifier,
+            plan.modules.len()
+        );
+        Ok(outcome)
+    }
+
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
         self.state.interrupt(handle, "null engine")
     }
@@ -398,6 +459,24 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
 
         Err(format!(
             "quickjs-ng adapter scaffold is ready for {} but the VM crate is not linked yet",
+            snapshot.entrypoint
+        ))
+    }
+
+    fn bootstrap(
+        &mut self,
+        handle: &EngineContextHandle,
+        plan: &HostRuntimeBootstrapPlan,
+    ) -> Result<EngineEvalOutcome, String> {
+        self.state.register_bootstrap(handle, plan, "quickjs-ng")?;
+        let snapshot = self
+            .state
+            .describe_context(handle)
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+
+        Err(format!(
+            "quickjs-ng adapter scaffold registered {} modules for {} but the VM crate is not linked yet",
+            plan.modules.len(),
             snapshot.entrypoint
         ))
     }

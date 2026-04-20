@@ -10,12 +10,13 @@ use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
     ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
-    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand,
-    HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEvent, HostRuntimeHttpRequest,
+    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
+    HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
     HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimePort, HostRuntimePortProtocol,
     HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFileSummary,
+    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -192,7 +193,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 detected_vite: package_manifest
                     .as_ref()
                     .is_some_and(detect_vite_dependency),
-                },
+            },
         };
 
         let engine_session = self
@@ -379,10 +380,12 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
 
         self.engine
             .describe_context(&engine_context)
-            .ok_or_else(|| RuntimeHostError::EngineFailure(format!(
-                "engine context not found: {}",
-                engine_context.engine_context_id
-            )))
+            .ok_or_else(|| {
+                RuntimeHostError::EngineFailure(format!(
+                    "engine context not found: {}",
+                    engine_context.engine_context_id
+                ))
+            })
     }
 
     pub fn eval_engine_context(
@@ -717,7 +720,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .get(context_id)
                     .cloned()
                     .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-                let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
+                let bindings =
+                    build_runtime_bindings(context_id, &context, self.engine.descriptor());
 
                 Ok(HostRuntimeResponse::Bindings(bindings))
             }
@@ -727,11 +731,37 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     .get(context_id)
                     .cloned()
                     .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-                let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
+                let bindings =
+                    build_runtime_bindings(context_id, &context, self.engine.descriptor());
 
-                Ok(HostRuntimeResponse::BootstrapPlan(build_runtime_bootstrap_plan(
-                    &bindings,
-                )))
+                Ok(HostRuntimeResponse::BootstrapPlan(
+                    build_runtime_bootstrap_plan(&bindings),
+                ))
+            }
+            HostRuntimeCommand::BootEngine => {
+                let context = self
+                    .runtime_contexts
+                    .get(context_id)
+                    .cloned()
+                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+                let bindings =
+                    build_runtime_bindings(context_id, &context, self.engine.descriptor());
+                let plan = build_runtime_bootstrap_plan(&bindings);
+                let eval = self
+                    .engine
+                    .bootstrap(&context.engine_context, &plan)
+                    .map_err(RuntimeHostError::EngineFailure)?;
+                let drained = self
+                    .engine
+                    .drain_jobs(&context.engine_context)
+                    .map_err(RuntimeHostError::EngineFailure)?;
+
+                Ok(HostRuntimeResponse::EngineBoot(HostRuntimeEngineBoot {
+                    plan,
+                    result_summary: eval.result_summary,
+                    pending_jobs: eval.pending_jobs,
+                    drained_jobs: drained.drained_jobs,
+                }))
             }
             HostRuntimeCommand::StdioWrite { stream, chunk } => {
                 let queue_len = {
