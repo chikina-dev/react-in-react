@@ -309,7 +309,9 @@ pub extern "C" fn runtime_host_launch_runtime_json(ptr: *const u8, len: usize) -
         .get("max_turns")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
-    let port = fields.get("port").and_then(|value| value.parse::<u16>().ok());
+    let port = fields
+        .get("port")
+        .and_then(|value| value.parse::<u16>().ok());
 
     HOST.with(|host| {
         let result = host.borrow_mut().launch_runtime(
@@ -964,6 +966,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
     match kind.as_str() {
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
+        "runtime-describe-state" => Ok(HostRuntimeCommand::DescribeState),
         "runtime-boot-engine" => Ok(HostRuntimeCommand::BootEngine),
         "runtime-startup" => Ok(HostRuntimeCommand::Startup {
             max_turns: fields
@@ -976,7 +979,9 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                 .get("max_turns")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(1),
-            port: fields.get("port").and_then(|value| value.parse::<u16>().ok()),
+            port: fields
+                .get("port")
+                .and_then(|value| value.parse::<u16>().ok()),
         }),
         "runtime-preview-request" => Ok(HostRuntimeCommand::PreviewRequest {
             request: HostRuntimeHttpRequest {
@@ -1457,6 +1462,10 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
             "{{\"kind\":\"runtime-bootstrap\",\"plan\":{}}}",
             render_runtime_bootstrap_plan_json(plan)
         ),
+        HostRuntimeResponse::StateReport(report) => format!(
+            "{{\"kind\":\"runtime-state\",\"report\":{}}}",
+            render_runtime_state_report_json(report)
+        ),
         HostRuntimeResponse::EngineBoot(report) => format!(
             "{{\"kind\":\"runtime-engine-boot\",\"report\":{}}}",
             render_runtime_engine_boot_json(report)
@@ -1641,11 +1650,9 @@ fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBo
     )
 }
 
-fn render_runtime_launch_report_json(
-    report: &crate::protocol::HostRuntimeLaunchReport,
-) -> String {
+fn render_runtime_launch_report_json(report: &crate::protocol::HostRuntimeLaunchReport) -> String {
     format!(
-        "{{\"bootSummary\":{},\"runPlan\":{},\"runtimeContext\":{},\"engineContext\":{},\"bindings\":{},\"bootstrapPlan\":{},\"previewLaunch\":{},\"startupLogs\":{},\"events\":{}}}",
+        "{{\"bootSummary\":{},\"runPlan\":{},\"runtimeContext\":{},\"engineContext\":{},\"bindings\":{},\"bootstrapPlan\":{},\"previewLaunch\":{},\"state\":{},\"startupLogs\":{},\"events\":{}}}",
         render_boot_summary_json(&report.boot_summary),
         render_run_plan_json(&report.run_plan),
         render_runtime_context_json(&report.runtime_context),
@@ -1653,6 +1660,7 @@ fn render_runtime_launch_report_json(
         render_runtime_bindings_json(&report.bindings),
         render_runtime_bootstrap_plan_json(&report.bootstrap_plan),
         render_runtime_preview_launch_report_json(&report.preview_launch),
+        render_runtime_state_report_json(&report.state),
         render_string_array_json(&report.startup_logs),
         render_runtime_events_json(&report.events),
     )
@@ -1735,6 +1743,149 @@ fn render_runtime_shutdown_report_json(
         render_runtime_http_servers_json(&report.closed_servers),
         render_runtime_events_json(&report.events),
     )
+}
+
+fn render_runtime_state_report_json(report: &crate::protocol::HostRuntimeStateReport) -> String {
+    format!(
+        "{{\"session\":{},\"preview\":{}}}",
+        render_session_state_report_json(&report.session),
+        report
+            .preview
+            .as_ref()
+            .map(render_runtime_preview_state_report_json)
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_session_state_report_json(report: &crate::protocol::HostSessionStateReport) -> String {
+    format!(
+        "{{\"sessionId\":\"{}\",\"state\":\"{}\",\"revision\":{},\"workspaceRoot\":\"{}\",\"archive\":{},\"packageJson\":{},\"capabilities\":{},\"hostFiles\":{}}}",
+        escape_json(&report.session_id),
+        render_session_state_json(&report.state),
+        report.revision,
+        escape_json(&report.workspace_root),
+        render_archive_summary_json(&report.archive, &report.archive_entries),
+        report
+            .package_json
+            .as_ref()
+            .map(render_package_json_summary_json)
+            .unwrap_or_else(|| "null".into()),
+        render_capability_matrix_json(&report.capabilities),
+        render_workspace_file_index_summary_json(&report.host_files),
+    )
+}
+
+fn render_runtime_preview_state_report_json(
+    report: &crate::protocol::HostRuntimePreviewStateReport,
+) -> String {
+    format!(
+        "{{\"port\":{},\"rootRequest\":{},\"rootRequestHint\":{},\"rootResponseDescriptor\":{},\"host\":{},\"run\":{},\"hostFiles\":{}}}",
+        render_runtime_port_json(&report.port),
+        render_runtime_http_request_json(&report.root_request),
+        render_preview_request_hint_json(&report.root_request_hint),
+        render_preview_response_descriptor_json(&report.root_response_descriptor),
+        render_boot_summary_json(&report.host),
+        render_run_plan_json(&report.run),
+        render_workspace_file_index_summary_json(&report.host_files),
+    )
+}
+
+fn render_archive_summary_json(
+    archive: &crate::protocol::ArchiveStats,
+    entries: &[crate::protocol::ArchiveEntrySummary],
+) -> String {
+    format!(
+        "{{\"fileName\":\"{}\",\"fileCount\":{},\"directoryCount\":{},\"entries\":{},\"rootPrefix\":{}}}",
+        escape_json(&archive.file_name),
+        archive.file_count,
+        archive.directory_count,
+        render_archive_entries_json(entries),
+        archive
+            .root_prefix
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_archive_entries_json(entries: &[crate::protocol::ArchiveEntrySummary]) -> String {
+    let items = entries
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                crate::protocol::ArchiveEntryKind::File => "file",
+                crate::protocol::ArchiveEntryKind::Directory => "dir",
+            };
+            format!(
+                "{{\"path\":\"{}\",\"size\":{},\"kind\":\"{}\"}}",
+                escape_json(&entry.path),
+                entry.size,
+                kind,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
+}
+
+fn render_package_json_summary_json(summary: &crate::protocol::PackageJsonSummary) -> String {
+    format!(
+        "{{\"name\":{},\"scripts\":{},\"dependencies\":{},\"devDependencies\":{}}}",
+        summary
+            .name
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+        render_string_map_json(&summary.scripts),
+        render_string_array_json(&summary.dependencies),
+        render_string_array_json(&summary.dev_dependencies),
+    )
+}
+
+fn render_capability_matrix_json(capabilities: &crate::protocol::CapabilityMatrix) -> String {
+    format!(
+        "{{\"detectedReact\":{},\"detectedVite\":{}}}",
+        capabilities.detected_react, capabilities.detected_vite,
+    )
+}
+
+fn render_workspace_file_index_summary_json(
+    summary: &crate::protocol::HostWorkspaceFileIndexSummary,
+) -> String {
+    format!(
+        "{{\"count\":{},\"index\":{},\"samplePath\":{},\"sampleSize\":{}}}",
+        summary.count,
+        render_workspace_file_summaries_json(&summary.index),
+        summary
+            .sample_path
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+        summary
+            .sample_size
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_session_state_json(state: &crate::protocol::SessionState) -> &'static str {
+    match state {
+        crate::protocol::SessionState::Booting => "booting",
+        crate::protocol::SessionState::Mounted => "mounted",
+        crate::protocol::SessionState::Running => "running",
+        crate::protocol::SessionState::Stopped => "stopped",
+        crate::protocol::SessionState::Errored => "errored",
+    }
+}
+
+fn render_string_map_json(map: &BTreeMap<String, String>) -> String {
+    let entries = map
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{entries}}}")
 }
 
 fn render_runtime_idle_report_json(report: &crate::protocol::HostRuntimeIdleReport) -> String {

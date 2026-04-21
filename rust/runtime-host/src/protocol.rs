@@ -9,6 +9,27 @@ pub struct ArchiveStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveEntrySummary {
+    pub path: String,
+    pub size: usize,
+    pub kind: ArchiveEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageJsonSummary {
+    pub name: Option<String>,
+    pub scripts: BTreeMap<String, String>,
+    pub dependencies: Vec<String>,
+    pub dev_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityMatrix {
     pub detected_react: bool,
     pub detected_vite: bool,
@@ -264,6 +285,44 @@ pub struct HostRuntimePreviewLaunchReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostWorkspaceFileIndexSummary {
+    pub count: usize,
+    pub index: Vec<WorkspaceFileSummary>,
+    pub sample_path: Option<String>,
+    pub sample_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSessionStateReport {
+    pub session_id: String,
+    pub state: SessionState,
+    pub revision: u64,
+    pub workspace_root: String,
+    pub archive: ArchiveStats,
+    pub archive_entries: Vec<ArchiveEntrySummary>,
+    pub package_json: Option<PackageJsonSummary>,
+    pub capabilities: CapabilityMatrix,
+    pub host_files: HostWorkspaceFileIndexSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewStateReport {
+    pub port: HostRuntimePort,
+    pub root_request: HostRuntimeHttpRequest,
+    pub root_request_hint: PreviewRequestHint,
+    pub root_response_descriptor: PreviewResponseDescriptor,
+    pub host: HostBootstrapSummary,
+    pub run: RunPlan,
+    pub host_files: HostWorkspaceFileIndexSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeStateReport {
+    pub session: HostSessionStateReport,
+    pub preview: Option<HostRuntimePreviewStateReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimeLaunchReport {
     pub boot_summary: HostBootstrapSummary,
     pub run_plan: RunPlan,
@@ -272,6 +331,7 @@ pub struct HostRuntimeLaunchReport {
     pub bindings: HostRuntimeBindings,
     pub bootstrap_plan: HostRuntimeBootstrapPlan,
     pub preview_launch: HostRuntimePreviewLaunchReport,
+    pub state: HostRuntimeStateReport,
     pub startup_logs: Vec<String>,
     pub events: Vec<HostRuntimeEvent>,
 }
@@ -439,6 +499,7 @@ pub enum HostContextFsCommand {
 pub enum HostRuntimeCommand {
     DescribeBindings,
     DescribeBootstrap,
+    DescribeState,
     BootEngine,
     Startup {
         max_turns: usize,
@@ -546,6 +607,7 @@ pub enum HostRuntimeCommand {
 pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
     BootstrapPlan(HostRuntimeBootstrapPlan),
+    StateReport(HostRuntimeStateReport),
     EngineBoot(HostRuntimeEngineBoot),
     StartupReport(HostRuntimeStartupReport),
     PreviewLaunchReport(HostRuntimePreviewLaunchReport),

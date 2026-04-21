@@ -1,6 +1,9 @@
 import { guessContentType, type WorkspaceFileRecord } from "./analyze-archive";
 import type { RunRequest, SessionSnapshot } from "./protocol";
-import { parsePackageJsonSummary } from "./runtime-session-state";
+import {
+  applyWorkspaceEntryToSessionSnapshot,
+  parsePackageJsonSummary,
+} from "./runtime-session-state";
 
 export type HostBootstrapSummary = {
   engineName: string;
@@ -128,6 +131,39 @@ export type HostRuntimePreviewLaunchReport = {
   rootResponseDescriptor: HostPreviewResponseDescriptor | null;
 };
 
+export type HostWorkspaceFileIndexSummary = {
+  count: number;
+  index: HostWorkspaceFileSummary[];
+  samplePath: string | null;
+  sampleSize: number | null;
+};
+
+export type HostSessionStateReport = {
+  sessionId: string;
+  state: SessionSnapshot["state"];
+  revision: number;
+  workspaceRoot: string;
+  archive: SessionSnapshot["archive"];
+  packageJson: SessionSnapshot["packageJson"];
+  capabilities: SessionSnapshot["capabilities"];
+  hostFiles: HostWorkspaceFileIndexSummary;
+};
+
+export type HostRuntimePreviewStateReport = {
+  port: HostRuntimePort;
+  rootRequest: HostRuntimeHttpRequest;
+  rootRequestHint: HostPreviewRequestHint;
+  rootResponseDescriptor: HostPreviewResponseDescriptor;
+  host: HostBootstrapSummary;
+  run: HostRunPlan;
+  hostFiles: HostWorkspaceFileIndexSummary;
+};
+
+export type HostRuntimeStateReport = {
+  session: HostSessionStateReport;
+  preview: HostRuntimePreviewStateReport | null;
+};
+
 export type HostRuntimeLaunchReport = {
   bootSummary: HostBootstrapSummary;
   runPlan: HostRunPlan;
@@ -136,6 +172,7 @@ export type HostRuntimeLaunchReport = {
   bindings: HostRuntimeBindings;
   bootstrapPlan: HostRuntimeBootstrapPlan;
   previewLaunch: HostRuntimePreviewLaunchReport;
+  state: HostRuntimeStateReport;
   startupLogs: string[];
   events: HostRuntimeEvent[];
 };
@@ -253,6 +290,7 @@ export type HostRuntimeCommand =
       kind:
         | "runtime.describe"
         | "runtime.describe-bootstrap"
+        | "runtime.describe-state"
         | "runtime.boot-engine"
         | "runtime.describe-module-loader"
         | "runtime.describe-modules"
@@ -300,6 +338,7 @@ export type HostRuntimeCommand =
 export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
+  | { kind: "runtime-state"; report: HostRuntimeStateReport }
   | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
   | { kind: "runtime-startup"; report: HostRuntimeStartupReport }
   | { kind: "runtime-preview-launch"; report: HostRuntimePreviewLaunchReport }
@@ -835,6 +874,7 @@ const DEFAULT_RUNTIME_HOST_WASM_URL = "/runtime-host.wasm";
 
 type HostSessionRecord = {
   handle: HostSessionHandle;
+  session: SessionSnapshot;
   revision: number;
   capabilities: SessionSnapshot["capabilities"];
   packageScripts: Record<string, string>;
@@ -846,6 +886,7 @@ type HostRuntimeContextRecord = {
   contextId: string;
   sessionId: string;
   process: HostProcessInfo;
+  runPlan: HostRunPlan;
   engineState: HostEngineContextState;
   registeredModules: number;
   bootstrapSpecifier: string | null;
@@ -986,6 +1027,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
     this.sessions.set(input.sessionId, {
       handle,
+      session: structuredClone(input.session),
       revision: input.session.revision,
       capabilities: input.session.capabilities,
       packageScripts: input.session.packageJson?.scripts ?? {},
@@ -1066,12 +1108,14 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext> {
+    const runPlan = await this.planRun(sessionId, request);
     const process = await this.buildProcessInfo(sessionId, request);
     const contextId = `runtime-context-${this.nextRuntimeContextId++}`;
     const context = {
       contextId,
       sessionId,
       process,
+      runPlan,
       engineState: "booted" as HostEngineContextState,
       registeredModules: 0,
       bootstrapSpecifier: null as string | null,
@@ -1093,6 +1137,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     request: RunRequest,
     options?: { maxTurns?: number; port?: number | null },
   ): Promise<HostRuntimeLaunchReport> {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.session.state = "running";
+    }
     const bootSummary = await this.bootSummary();
     const runPlan = await this.planRun(sessionId, request);
     const runtimeContext = await this.createRuntimeContext(sessionId, request);
@@ -1108,6 +1156,9 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       maxTurns: options?.maxTurns ?? 64,
       port: options?.port ?? null,
     });
+    const stateResponse = await this.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe-state",
+    });
 
     if (bindingsResponse.kind !== "runtime-bindings") {
       throw new Error("launchRuntime expected runtime-bindings response");
@@ -1118,6 +1169,44 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     if (previewLaunchResponse.kind !== "runtime-preview-launch") {
       throw new Error("launchRuntime expected runtime-preview-launch response");
     }
+    if (stateResponse.kind !== "runtime-state") {
+      throw new Error("launchRuntime expected runtime-state response");
+    }
+    const previewState = previewLaunchResponse.report.port
+      ? {
+          ...(stateResponse.report.preview ?? {
+            host: bootSummary,
+            run: runPlan,
+            hostFiles: buildMockHostWorkspaceFileIndexSummary(this.sessions.get(sessionId)!),
+          }),
+          port: previewLaunchResponse.report.port,
+          rootRequest: previewLaunchResponse.report.rootRequest ?? {
+            port: previewLaunchResponse.report.port.port,
+            method: "GET",
+            relativePath: "/",
+            search: "",
+          },
+          rootRequestHint: previewLaunchResponse.report.rootRequestHint ?? {
+            kind: "fallback-root",
+            workspacePath: null,
+            documentRoot: null,
+            hydratePaths: [],
+          },
+          rootResponseDescriptor: previewLaunchResponse.report.rootResponseDescriptor ?? {
+            kind: "host-managed-fallback",
+            workspacePath: null,
+            documentRoot: null,
+            hydratePaths: [],
+            statusCode: 200,
+            contentType: "text/html; charset=utf-8",
+            allowMethods: [],
+            omitBody: false,
+          },
+          host: bootSummary,
+          run: runPlan,
+          hostFiles: buildMockHostWorkspaceFileIndexSummary(this.sessions.get(sessionId)!),
+        }
+      : stateResponse.report.preview;
 
     return {
       bootSummary,
@@ -1127,6 +1216,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       bindings: bindingsResponse.bindings,
       bootstrapPlan: bootstrapResponse.plan,
       previewLaunch: previewLaunchResponse.report,
+      state: {
+        ...stateResponse.report,
+        preview: previewState,
+      },
       startupLogs: [
         `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
         `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
@@ -1326,6 +1419,13 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       current = parentMockPosixPath(current);
     }
 
+    applyWorkspaceEntryToSessionSnapshot(record.session, {
+      path: resolved,
+      kind: "directory",
+      size: 0,
+      isText: false,
+    });
+
     return {
       path: resolved,
       kind: "directory",
@@ -1375,6 +1475,13 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       bytes,
       textContent,
     });
+    applyWorkspaceEntryToSessionSnapshot(record.session, {
+      path: resolved,
+      kind: "file",
+      size: bytes.byteLength,
+      isText: input.isText,
+    });
+    syncMockHandleFileIndex(record);
     syncMockPackageManifest(record, resolved, textContent);
 
     return {
@@ -1497,6 +1604,23 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "runtime-bootstrap",
           plan: buildMockRuntimeBootstrapPlan(contextId, context.process.entrypoint),
         };
+      case "runtime.describe-state": {
+        const record = this.sessions.get(context.sessionId);
+        if (!record) {
+          throw new Error(`Rust host session not found: ${context.sessionId}`);
+        }
+        const requestHint =
+          context.httpServers.size > 0
+            ? await this.resolvePreviewRequestHint(context.sessionId, "/")
+            : null;
+        const responseDescriptor = requestHint
+          ? describeMockPreviewResponse(requestHint, "GET")
+          : null;
+        return {
+          kind: "runtime-state",
+          report: buildMockRuntimeStateReport(context, record, requestHint, responseDescriptor),
+        };
+      }
       case "runtime.describe-module-loader":
         return {
           kind: "runtime-module-loader",
@@ -1656,6 +1780,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       }
       case "runtime.shutdown": {
         this.runtimeContexts.delete(context.contextId);
+        const session = this.sessions.get(context.sessionId);
+        if (session) {
+          session.session.state = "stopped";
+        }
         const exitCode = context.exitCode ?? command.code;
         const closedPorts = [...context.ports.values()].sort(
           (left, right) => left.port - right.port,
@@ -2133,6 +2261,9 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         if (shouldEmitWorkspaceChange && response.kind === "entry") {
           const session = this.sessions.get(context.sessionId);
           const revision = session ? ++session.revision : 0;
+          if (session) {
+            session.session.revision = revision;
+          }
           context.events.push({
             kind: "workspace-change",
             entry: response.entry,
@@ -2368,6 +2499,111 @@ function syncMockPackageManifest(
   const parsed = parsePackageJsonSummary(textContent);
   record.packageScripts = parsed?.scripts ?? {};
   record.handle.packageName = parsed?.name ?? null;
+  record.session.packageJson = parsed;
+  record.session.capabilities.detectedReact =
+    parsed?.dependencies.includes("react") === true ||
+    parsed?.dependencies.includes("react-dom") === true ||
+    parsed?.devDependencies.includes("react") === true ||
+    parsed?.devDependencies.includes("react-dom") === true;
+  record.session.capabilities.detectedVite =
+    parsed?.dependencies.includes("vite") === true ||
+    parsed?.devDependencies.includes("vite") === true;
+  record.capabilities = record.session.capabilities;
+}
+
+function syncMockHandleFileIndex(record: HostSessionRecord): void {
+  record.handle.fileIndex = [...record.files.values()]
+    .map((file) => ({
+      path: file.path,
+      size: file.size,
+      isText: file.isText,
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  record.handle.fileCount = record.handle.fileIndex.length;
+  record.handle.samplePath = record.handle.fileIndex[0]?.path ?? null;
+  record.handle.sampleSize = record.handle.fileIndex[0]?.size ?? null;
+}
+
+function buildMockHostWorkspaceFileIndexSummary(
+  record: HostSessionRecord,
+): HostWorkspaceFileIndexSummary {
+  return {
+    count: record.handle.fileIndex.length,
+    index: record.handle.fileIndex.map((file) => ({ ...file })),
+    samplePath: record.handle.samplePath,
+    sampleSize: record.handle.sampleSize,
+  };
+}
+
+function buildMockSessionStateReport(record: HostSessionRecord): HostSessionStateReport {
+  return {
+    sessionId: record.session.sessionId,
+    state: record.session.state,
+    revision: record.session.revision,
+    workspaceRoot: record.session.workspaceRoot,
+    archive: {
+      ...record.session.archive,
+      entries: [...record.session.archive.entries],
+    },
+    packageJson: record.session.packageJson
+      ? {
+          ...record.session.packageJson,
+          scripts: { ...record.session.packageJson.scripts },
+          dependencies: [...record.session.packageJson.dependencies],
+          devDependencies: [...record.session.packageJson.devDependencies],
+        }
+      : null,
+    capabilities: { ...record.session.capabilities },
+    hostFiles: buildMockHostWorkspaceFileIndexSummary(record),
+  };
+}
+
+function buildMockPreviewStateReport(
+  context: HostRuntimeContextRecord,
+  record: HostSessionRecord,
+  requestHint: HostPreviewRequestHint,
+  responseDescriptor: HostPreviewResponseDescriptor,
+): HostRuntimePreviewStateReport {
+  const previewServer = context.httpServers.values().next().value;
+  const port = previewServer?.port ?? {
+    port: 3000,
+    protocol: "http" as const,
+  };
+
+  return {
+    port,
+    rootRequest: {
+      port: port.port,
+      method: "GET",
+      relativePath: "/",
+      search: "",
+    },
+    rootRequestHint: requestHint,
+    rootResponseDescriptor: responseDescriptor,
+    host: {
+      engineName: "null-engine",
+      supportsInterrupts: true,
+      supportsModuleLoader: true,
+      workspaceRoot: record.handle.workspaceRoot,
+    },
+    run: { ...context.runPlan },
+    hostFiles: buildMockHostWorkspaceFileIndexSummary(record),
+  };
+}
+
+function buildMockRuntimeStateReport(
+  context: HostRuntimeContextRecord,
+  record: HostSessionRecord,
+  requestHint: HostPreviewRequestHint | null,
+  responseDescriptor: HostPreviewResponseDescriptor | null,
+): HostRuntimeStateReport {
+  return {
+    session: buildMockSessionStateReport(record),
+    preview:
+      requestHint && responseDescriptor
+        ? buildMockPreviewStateReport(context, record, requestHint, responseDescriptor)
+        : null,
+  };
 }
 
 export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
@@ -2700,6 +2936,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.describe-bootstrap":
         lines.push("command=runtime-describe-bootstrap");
         break;
+      case "runtime.describe-state":
+        lines.push("command=runtime-describe-state");
+        break;
       case "runtime.boot-engine":
         lines.push("command=runtime-boot-engine");
         break;
@@ -2889,6 +3128,7 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
+      | { kind: "runtime-state"; report: HostRuntimeStateReport }
       | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
       | { kind: "runtime-startup"; report: HostRuntimeStartupReport }
       | { kind: "runtime-preview-launch"; report: HostRuntimePreviewLaunchReport }

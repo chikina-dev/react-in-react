@@ -9,7 +9,7 @@ import {
   type HostPreviewRequestHint,
   type HostPreviewResponseDescriptor,
   type HostRunPlan,
-  type HostWorkspaceEntrySummary,
+  type HostRuntimeStateReport,
 } from "./host-adapter";
 import { buildPreviewResponse, isPreviewPath } from "./preview-server";
 import type {
@@ -25,10 +25,6 @@ import type {
   VirtualHttpResponse,
   WorkerToUiMessage,
 } from "./protocol";
-import {
-  applyPackageJsonTextToSessionSnapshot,
-  applyWorkspaceEntryToSessionSnapshot,
-} from "./runtime-session-state";
 
 type ActiveProcess = {
   pid: ProcessId;
@@ -168,6 +164,7 @@ async function runSession(
   let bootSummary;
   let runPlan: HostRunPlan;
   let runtimeContext: HostRuntimeContext;
+  let runtimeState: HostRuntimeStateReport | null = null;
   let startupPreviewReport: {
     startup: HostRuntimeStartupReport;
     server: HostRuntimeHttpServer | null;
@@ -194,9 +191,11 @@ async function runSession(
     runPlan = runtimeLaunch.runPlan;
     runtimeContext = runtimeLaunch.runtimeContext;
     record.runtimeContext = runtimeContext;
+    runtimeState = runtimeLaunch.state;
     startupPreviewReport = runtimeLaunch.previewLaunch;
     startupLogs = runtimeLaunch.startupLogs;
     startupEvents = runtimeLaunch.events;
+    applyRuntimeStateReport(record, runtimeState);
   } catch (error) {
     record.session.state = "errored";
     emitState(sessionId, "errored");
@@ -252,33 +251,36 @@ async function runSession(
     return;
   }
 
-  const port = startupPreviewReport?.port?.port ?? 3000;
+  const previewState = runtimeState?.preview ?? null;
+  const port = previewState?.port.port ?? startupPreviewReport?.port?.port ?? 3000;
   const url = `/preview/${sessionId}/${port}/`;
-  const model = buildPreviewModel(record.session, runPlan);
+  const model = buildPreviewModel(record.session, previewState?.run ?? runPlan);
 
   record.preview = {
     pid,
     port,
     url,
     model,
-    rootRequestHint: startupPreviewReport?.rootRequestHint ?? {
-      kind: "fallback-root",
-      workspacePath: null,
-      documentRoot: null,
-      hydratePaths: [],
-    },
-    rootResponseDescriptor: startupPreviewReport?.rootResponseDescriptor ?? {
-      kind: "host-managed-fallback",
-      workspacePath: null,
-      documentRoot: null,
-      hydratePaths: [],
-      statusCode: 200,
-      contentType: "text/html; charset=utf-8",
-      allowMethods: [],
-      omitBody: false,
-    },
-    host: bootSummary,
-    run: {
+    rootRequestHint: previewState?.rootRequestHint ??
+      startupPreviewReport?.rootRequestHint ?? {
+        kind: "fallback-root",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    rootResponseDescriptor: previewState?.rootResponseDescriptor ??
+      startupPreviewReport?.rootResponseDescriptor ?? {
+        kind: "host-managed-fallback",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+    host: previewState?.host ?? bootSummary,
+    run: previewState?.run ?? {
       cwd: runPlan.cwd,
       entrypoint: runPlan.entrypoint,
       commandLine: runPlan.commandLine,
@@ -286,7 +288,7 @@ async function runSession(
       commandKind: runPlan.commandKind,
       resolvedScript: runPlan.resolvedScript,
     },
-    hostFiles: {
+    hostFiles: previewState?.hostFiles ?? {
       count: record.hostFiles.count,
       samplePath: record.hostFiles.samplePath,
       sampleSize: record.hostFiles.sampleSize,
@@ -499,11 +501,13 @@ async function emitRuntimeEvents(
         const record = sessions.get(sessionId);
         if (record) {
           const hostAdapter = await hostAdapterPromise;
-          record.session.revision = event.revision;
-          applyWorkspaceEntryChange(record, event.entry);
-          await syncSessionSnapshotFromWorkspaceChange(record, hostAdapter, sessionId, event.entry);
-          const refreshed = await refreshPreviewRootPlan(record, hostAdapter, contextId);
-          if (refreshed) {
+          const refreshed = await hostAdapter
+            .executeRuntimeCommand(contextId, {
+              kind: "runtime.describe-state",
+            })
+            .catch(() => null);
+          if (refreshed?.kind === "runtime-state") {
+            applyRuntimeStateReport(record, refreshed.report);
             await emitStdout(
               sessionId,
               pid,
@@ -518,95 +522,72 @@ async function emitRuntimeEvents(
   }
 }
 
-function applyWorkspaceEntryChange(record: SessionRecord, entry: HostWorkspaceEntrySummary): void {
-  applyWorkspaceEntryToSessionSnapshot(record.session, entry);
+function applyRuntimeStateReport(record: SessionRecord, report: HostRuntimeStateReport): void {
+  record.session = cloneSessionSnapshot(report.session);
+  record.hostFiles = cloneHostFileSummary(report.session.hostFiles);
 
-  if (entry.kind === "file") {
-    const nextIndex = record.hostFiles.index.filter((file) => file.path !== entry.path);
-    nextIndex.push({
-      path: entry.path,
-      size: entry.size,
-      isText: entry.isText,
-    });
-    nextIndex.sort((left, right) => left.path.localeCompare(right.path));
-    record.hostFiles.index = nextIndex;
-    record.hostFiles.count = nextIndex.length;
+  const knownPaths = new Set(record.hostFiles.index.map((file) => file.path));
+  for (const path of record.hostFileCache.keys()) {
+    if (!knownPaths.has(path)) {
+      record.hostFileCache.delete(path);
+    }
   }
 
-  record.hostFileCache.delete(entry.path);
-
-  const sample = record.hostFiles.index[0] ?? null;
-  record.hostFiles.samplePath = sample?.path ?? null;
-  record.hostFiles.sampleSize = sample?.size ?? null;
-
   if (record.preview) {
-    record.preview.hostFiles = {
-      count: record.hostFiles.count,
-      samplePath: record.hostFiles.samplePath,
-      sampleSize: record.hostFiles.sampleSize,
+    if (!report.preview) {
+      record.preview = null;
+      return;
+    }
+
+    record.preview = {
+      ...record.preview,
+      port: report.preview.port.port,
+      url: `/preview/${record.session.sessionId}/${report.preview.port.port}/`,
+      model: buildPreviewModel(record.session, report.preview.run),
+      rootRequestHint: report.preview.rootRequestHint,
+      rootResponseDescriptor: report.preview.rootResponseDescriptor,
+      host: report.preview.host,
+      run: report.preview.run,
+      hostFiles: {
+        count: report.preview.hostFiles.count,
+        samplePath: report.preview.hostFiles.samplePath,
+        sampleSize: report.preview.hostFiles.sampleSize,
+      },
     };
   }
 }
 
-async function syncSessionSnapshotFromWorkspaceChange(
-  record: SessionRecord,
-  hostAdapter: Awaited<typeof hostAdapterPromise>,
-  sessionId: string,
-  entry: HostWorkspaceEntrySummary,
-): Promise<void> {
-  if (entry.path === "/workspace/package.json" && entry.kind === "file") {
-    const packageJsonFile = await hostAdapter
-      .readWorkspaceFile(sessionId, entry.path)
-      .catch(() => null);
-    applyPackageJsonTextToSessionSnapshot(record.session, packageJsonFile?.textContent ?? null);
-  }
-
-  if (record.preview) {
-    record.preview.model = buildPreviewModel(record.session, {
-      cwd: record.preview.run.cwd,
-      entrypoint: record.preview.run.entrypoint,
-      commandLine: record.preview.run.commandLine,
-      envCount: record.preview.run.envCount,
-      commandKind: record.preview.run.commandKind,
-      resolvedScript: record.preview.run.resolvedScript,
-    });
-  }
+function cloneSessionSnapshot(report: HostRuntimeStateReport["session"]): SessionSnapshot {
+  return {
+    sessionId: report.sessionId,
+    state: report.state,
+    revision: report.revision,
+    workspaceRoot: report.workspaceRoot,
+    archive: {
+      ...report.archive,
+      entries: [...report.archive.entries],
+    },
+    packageJson: report.packageJson
+      ? {
+          ...report.packageJson,
+          scripts: { ...report.packageJson.scripts },
+          dependencies: [...report.packageJson.dependencies],
+          devDependencies: [...report.packageJson.devDependencies],
+        }
+      : null,
+    capabilities: { ...report.capabilities },
+  };
 }
 
-async function refreshPreviewRootPlan(
-  record: SessionRecord,
-  hostAdapter: Awaited<typeof hostAdapterPromise>,
-  contextId: string,
-): Promise<boolean> {
-  if (!record.preview) {
-    return false;
-  }
-
-  const previousRequestHint = JSON.stringify(record.preview.rootRequestHint);
-  const previousResponseDescriptor = JSON.stringify(record.preview.rootResponseDescriptor);
-  const refreshed = await hostAdapter
-    .executeRuntimeCommand(contextId, {
-      kind: "runtime.preview-request",
-      request: {
-        port: record.preview.port,
-        method: "GET",
-        relativePath: "/",
-        search: "",
-      },
-    })
-    .catch(() => null);
-
-  if (refreshed?.kind !== "runtime-preview-request") {
-    return false;
-  }
-
-  record.preview.rootRequestHint = refreshed.report.requestHint;
-  record.preview.rootResponseDescriptor = refreshed.report.responseDescriptor;
-
-  return (
-    previousRequestHint !== JSON.stringify(refreshed.report.requestHint) ||
-    previousResponseDescriptor !== JSON.stringify(refreshed.report.responseDescriptor)
-  );
+function cloneHostFileSummary(
+  summary: HostRuntimeStateReport["session"]["hostFiles"],
+): SessionRecord["hostFiles"] {
+  return {
+    count: summary.count,
+    index: summary.index.map((file) => ({ ...file })),
+    samplePath: summary.samplePath,
+    sampleSize: summary.sampleSize,
+  };
 }
 
 function emitState(sessionId: string, state: SessionSnapshot["state"]): void {

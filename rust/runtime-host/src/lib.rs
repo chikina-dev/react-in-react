@@ -13,17 +13,19 @@ pub use engine::{
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
-    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
-    HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeIdleReport,
-    HostRuntimeLaunchReport, HostRuntimePreviewLaunchReport, HostRuntimeStartupReport,
-    HostRuntimeModuleRecord, HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
-    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
-    PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
-    WorkspaceFileSummary,
+    ArchiveEntryKind, ArchiveEntrySummary, ArchiveStats, CapabilityMatrix, HostBootstrapSummary,
+    HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo, HostRuntimeBindings,
+    HostRuntimeBootstrapModule, HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec,
+    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEngineBoot,
+    HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind,
+    HostRuntimeIdleReport, HostRuntimeLaunchReport, HostRuntimeModuleRecord,
+    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimePreviewLaunchReport, HostRuntimePreviewStateReport, HostRuntimeResponse,
+    HostRuntimeStartupReport, HostRuntimeStateReport, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind, HostSessionStateReport, HostWorkspaceFileIndexSummary,
+    PackageJsonSummary, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
+    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind,
+    WorkspaceEntrySummary, WorkspaceFileSummary,
 };
 pub use vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -161,10 +163,16 @@ mod tests {
         };
         assert!(!report.startup.exited);
         assert_eq!(report.startup.exit_code, None);
-        assert_eq!(report.server.as_ref().map(|server| server.port.port), Some(3100));
+        assert_eq!(
+            report.server.as_ref().map(|server| server.port.port),
+            Some(3100)
+        );
         assert_eq!(report.port.as_ref().map(|port| port.port), Some(3100));
         assert_eq!(
-            report.root_request.as_ref().map(|request| request.relative_path.as_str()),
+            report
+                .root_request
+                .as_ref()
+                .map(|request| request.relative_path.as_str()),
             Some("/")
         );
         assert_eq!(
@@ -198,10 +206,7 @@ mod tests {
                         "/workspace/package.json",
                         r#"{"name":"launch-app","scripts":{"dev":"node src/server.js"}}"#,
                     ),
-                    VirtualFile::text(
-                        "/workspace/src/server.js",
-                        "console.log('launch runtime');",
-                    ),
+                    VirtualFile::text("/workspace/src/server.js", "console.log('launch runtime');"),
                 ],
             )
             .expect("session should be created");
@@ -216,7 +221,10 @@ mod tests {
             .expect("launch runtime should succeed");
 
         assert_eq!(launched.boot_summary.engine_name, "null-engine");
-        assert_eq!(launched.run_plan.command_kind, crate::protocol::RunCommandKind::NodeEntrypoint);
+        assert_eq!(
+            launched.run_plan.command_kind,
+            crate::protocol::RunCommandKind::NodeEntrypoint
+        );
         assert_eq!(launched.run_plan.entrypoint, "/workspace/src/server.js");
         assert_eq!(launched.runtime_context.process.cwd, "/workspace/src");
         assert_eq!(launched.engine_context.state, EngineContextState::Booted);
@@ -234,11 +242,28 @@ mod tests {
                 .iter()
                 .any(|global| global == "Buffer")
         );
-        assert_eq!(launched.bootstrap_plan.bootstrap_specifier, "runtime:bootstrap");
-        assert!(launched.startup_logs.iter().any(|line| line.contains("[host] engine=null-engine")));
-        assert!(launched.startup_logs.iter().any(|line| line.contains("[context] id=")));
         assert_eq!(
-            launched.preview_launch.server.as_ref().map(|server| server.port.port),
+            launched.bootstrap_plan.bootstrap_specifier,
+            "runtime:bootstrap"
+        );
+        assert!(
+            launched
+                .startup_logs
+                .iter()
+                .any(|line| line.contains("[host] engine=null-engine"))
+        );
+        assert!(
+            launched
+                .startup_logs
+                .iter()
+                .any(|line| line.contains("[context] id="))
+        );
+        assert_eq!(
+            launched
+                .preview_launch
+                .server
+                .as_ref()
+                .map(|server| server.port.port),
             Some(3200)
         );
         assert_eq!(
@@ -248,6 +273,24 @@ mod tests {
                 .as_ref()
                 .map(|hint| &hint.kind),
             Some(&PreviewRequestKind::FallbackRoot)
+        );
+        assert_eq!(launched.state.session.state, SessionState::Running);
+        assert_eq!(
+            launched
+                .state
+                .session
+                .package_json
+                .as_ref()
+                .and_then(|package| package.name.as_deref()),
+            Some("launch-app")
+        );
+        assert_eq!(
+            launched
+                .state
+                .preview
+                .as_ref()
+                .map(|preview| preview.port.port),
+            Some(3200)
         );
         assert!(launched.events.iter().any(|event| matches!(
             event,
@@ -308,14 +351,18 @@ mod tests {
         assert_eq!(report.exit_code, 0);
         assert_eq!(report.closed_ports.len(), 1);
         assert_eq!(report.closed_servers.len(), 1);
-        assert!(report
-            .events
-            .iter()
-            .any(|event| matches!(event, HostRuntimeEvent::ProcessExit { code: 0 })));
-        assert!(report
-            .events
-            .iter()
-            .any(|event| matches!(event, HostRuntimeEvent::PortClose { port: 3100 })));
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| matches!(event, HostRuntimeEvent::ProcessExit { code: 0 }))
+        );
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| matches!(event, HostRuntimeEvent::PortClose { port: 3100 }))
+        );
         assert!(matches!(
             host.describe_engine_context(&runtime_context.context_id),
             Err(RuntimeHostError::RuntimeContextNotFound(_))

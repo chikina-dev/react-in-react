@@ -955,6 +955,27 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         kind: "host-managed-fallback",
       }),
     },
+    state: {
+      session: expect.objectContaining({
+        sessionId: session.sessionId,
+        state: "running",
+        packageJson: expect.objectContaining({
+          name: "demo-app",
+        }),
+        hostFiles: expect.objectContaining({
+          count: 5,
+        }),
+      }),
+      preview: expect.objectContaining({
+        port: {
+          port: 3200,
+          protocol: "http",
+        },
+        run: expect.objectContaining({
+          entrypoint: "/workspace/src/server.ts",
+        }),
+      }),
+    },
     events: [
       {
         kind: "port-listen",

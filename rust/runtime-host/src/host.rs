@@ -10,19 +10,21 @@ use crate::engine::{
 };
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
-    ArchiveStats, CapabilityMatrix, HostBootstrapSummary, HostContextFsCommand, HostFsCommand,
-    HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
-    HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
-    HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeIdleReport,
-    HostRuntimeLaunchReport, HostRuntimePreviewLaunchReport, HostRuntimePreviewRequestReport,
-    HostRuntimeShutdownReport, HostRuntimeStartupReport, HostRuntimeLoadedModule,
-    HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord, HostRuntimeModuleSource,
-    HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResolvedModule, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
-    PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind, RunPlan, RunRequest,
-    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFilePayload,
-    WorkspaceFileSummary,
+    ArchiveEntryKind, ArchiveEntrySummary, ArchiveStats, CapabilityMatrix, HostBootstrapSummary,
+    HostContextFsCommand, HostFsCommand, HostFsResponse, HostProcessInfo, HostRuntimeBindings,
+    HostRuntimeBootstrapModule, HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec,
+    HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext, HostRuntimeEngineBoot,
+    HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind,
+    HostRuntimeIdleReport, HostRuntimeLaunchReport, HostRuntimeLoadedModule,
+    HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord,
+    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimePreviewLaunchReport, HostRuntimePreviewRequestReport, HostRuntimePreviewStateReport,
+    HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeShutdownReport,
+    HostRuntimeStartupReport, HostRuntimeStateReport, HostRuntimeStdioStream, HostRuntimeTimer,
+    HostRuntimeTimerKind, HostSessionStateReport, HostWorkspaceFileIndexSummary,
+    PackageJsonSummary, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
+    PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    WorkspaceFilePayload, WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -104,6 +106,7 @@ enum BrowserMappingResolution {
 struct RuntimeContextRecord {
     session_id: String,
     process: HostProcessInfo,
+    run_plan: RunPlan,
     engine_context: EngineContextHandle,
     clock_ms: u64,
     next_port: u16,
@@ -494,6 +497,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         session_id: &str,
         request: &RunRequest,
     ) -> RuntimeHostResult<HostRuntimeContext> {
+        let run_plan = self.plan_run(session_id, request)?;
         let process = self.build_process_info(session_id, request)?;
         let engine_session = self
             .sessions
@@ -521,6 +525,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             RuntimeContextRecord {
                 session_id: session_id.to_string(),
                 process: process.clone(),
+                run_plan,
                 engine_context,
                 clock_ms: 0,
                 next_port: 3000,
@@ -676,7 +681,10 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         Ok((context.exit_code.is_some(), context.exit_code))
     }
 
-    fn drain_runtime_events(&mut self, context_id: &str) -> RuntimeHostResult<Vec<HostRuntimeEvent>> {
+    fn drain_runtime_events(
+        &mut self,
+        context_id: &str,
+    ) -> RuntimeHostResult<Vec<HostRuntimeEvent>> {
         let context = self
             .runtime_contexts
             .get_mut(context_id)
@@ -684,7 +692,10 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         Ok(context.events.drain(..).collect())
     }
 
-    fn boot_runtime_engine(&mut self, context_id: &str) -> RuntimeHostResult<HostRuntimeEngineBoot> {
+    fn boot_runtime_engine(
+        &mut self,
+        context_id: &str,
+    ) -> RuntimeHostResult<HostRuntimeEngineBoot> {
         let context = self
             .runtime_contexts
             .get(context_id)
@@ -697,7 +708,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
         let plan = build_runtime_bootstrap_plan(&bindings);
         let loader_plan = self.describe_runtime_module_loader(context_id)?;
-        let import_plans = self.collect_runtime_boot_import_graph(context_id, &plan, &loader_plan)?;
+        let import_plans =
+            self.collect_runtime_boot_import_graph(context_id, &plan, &loader_plan)?;
         let bridge = build_engine_bootstrap_bridge(session, &context);
         let eval = self
             .engine
@@ -766,10 +778,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             });
         }
 
-        let server = match self.execute_runtime_command(
-            context_id,
-            HostRuntimeCommand::HttpServePreview { port },
-        )? {
+        let server = match self
+            .execute_runtime_command(context_id, HostRuntimeCommand::HttpServePreview { port })?
+        {
             HostRuntimeResponse::HttpServerListening { server } => server,
             other => {
                 return Err(RuntimeHostError::EngineFailure(format!(
@@ -823,6 +834,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         max_turns: usize,
         port: Option<u16>,
     ) -> RuntimeHostResult<HostRuntimeLaunchReport> {
+        if let Some(record) = self.sessions.get_mut(session_id) {
+            record.snapshot.state = SessionState::Running;
+        }
         let boot_summary = self.boot_summary();
         let run_plan = self.plan_run(session_id, request)?;
         let capabilities = self
@@ -838,9 +852,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .get(&context_id)
             .cloned()
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.clone()))?;
-        let bindings = build_runtime_bindings(&context_id, &runtime_context_record, self.engine.descriptor());
+        let bindings = build_runtime_bindings(
+            &context_id,
+            &runtime_context_record,
+            self.engine.descriptor(),
+        );
         let bootstrap_plan = build_runtime_bootstrap_plan(&bindings);
         let preview_launch = self.launch_runtime_preview(&context_id, max_turns, port)?;
+        let state = self.runtime_state_report(&context_id)?;
         let startup_logs = build_runtime_startup_logs(
             &run_plan,
             &context_id,
@@ -861,6 +880,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             bindings,
             bootstrap_plan,
             preview_launch,
+            state,
             startup_logs,
             events,
         })
@@ -883,7 +903,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 .ok_or(RuntimeHostError::HttpServerNotFound(request.port))?;
             (context.session_id.clone(), server)
         };
-        let request_hint = self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
+        let request_hint =
+            self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
         let response_descriptor = describe_preview_response(&request_hint, request.method.as_str());
         let hydration_paths = if !response_descriptor.hydrate_paths.is_empty() {
             response_descriptor.hydrate_paths.clone()
@@ -932,6 +953,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .runtime_contexts
             .remove(context_id)
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        if let Some(session) = self.sessions.get_mut(&context.session_id) {
+            session.snapshot.state = SessionState::Stopped;
+        }
 
         let closed_servers = context
             .http_servers
@@ -1188,6 +1212,119 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 is_text: file.is_text,
             })
             .collect())
+    }
+
+    fn workspace_file_index_summary(
+        &self,
+        session_id: &str,
+    ) -> RuntimeHostResult<HostWorkspaceFileIndexSummary> {
+        let index = self.workspace_file_summaries(session_id)?;
+        let sample = index.first().cloned();
+
+        Ok(HostWorkspaceFileIndexSummary {
+            count: index.len(),
+            index,
+            sample_path: sample.as_ref().map(|file| file.path.clone()),
+            sample_size: sample.as_ref().map(|file| file.size),
+        })
+    }
+
+    fn session_archive_entries(record: &SessionRecord) -> Vec<ArchiveEntrySummary> {
+        let workspace_root = record.snapshot.workspace_root.as_str();
+        let mut entries = record
+            .vfs
+            .directories()
+            .filter(|path| path.as_str() != workspace_root)
+            .map(|path| ArchiveEntrySummary {
+                path: path.clone(),
+                size: 0,
+                kind: ArchiveEntryKind::Directory,
+            })
+            .collect::<Vec<_>>();
+
+        entries.extend(record.vfs.files().map(|file| ArchiveEntrySummary {
+            path: file.path.clone(),
+            size: file.bytes.len(),
+            kind: ArchiveEntryKind::File,
+        }));
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        entries
+    }
+
+    fn session_package_json_summary(record: &SessionRecord) -> Option<PackageJsonSummary> {
+        read_package_manifest(&record.vfs).map(|manifest| PackageJsonSummary {
+            name: manifest.name,
+            scripts: manifest.scripts.unwrap_or_default(),
+            dependencies: manifest
+                .dependencies
+                .map(|deps| deps.into_keys().collect())
+                .unwrap_or_default(),
+            dev_dependencies: manifest
+                .dev_dependencies
+                .map(|deps| deps.into_keys().collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    fn session_state_report(&self, session_id: &str) -> RuntimeHostResult<HostSessionStateReport> {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+
+        Ok(HostSessionStateReport {
+            session_id: record.snapshot.session_id.clone(),
+            state: record.snapshot.state.clone(),
+            revision: record.snapshot.revision,
+            workspace_root: record.snapshot.workspace_root.clone(),
+            archive: record.snapshot.archive.clone(),
+            archive_entries: Self::session_archive_entries(record),
+            package_json: Self::session_package_json_summary(record),
+            capabilities: record.snapshot.capabilities.clone(),
+            host_files: self.workspace_file_index_summary(session_id)?,
+        })
+    }
+
+    fn preview_state_report(
+        &self,
+        context_id: &str,
+    ) -> RuntimeHostResult<Option<HostRuntimePreviewStateReport>> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let Some(server) = context.http_servers.values().next().cloned() else {
+            return Ok(None);
+        };
+        let request = HostRuntimeHttpRequest {
+            port: server.port.port,
+            method: String::from("GET"),
+            relative_path: String::from("/"),
+            search: String::new(),
+        };
+        let report = self.resolve_runtime_preview_request(context_id, request.clone())?;
+
+        Ok(Some(HostRuntimePreviewStateReport {
+            port: report.port,
+            root_request: request,
+            root_request_hint: report.request_hint,
+            root_response_descriptor: report.response_descriptor,
+            host: self.boot_summary(),
+            run: context.run_plan.clone(),
+            host_files: self.workspace_file_index_summary(&context.session_id)?,
+        }))
+    }
+
+    fn runtime_state_report(&self, context_id: &str) -> RuntimeHostResult<HostRuntimeStateReport> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+        Ok(HostRuntimeStateReport {
+            session: self.session_state_report(&context.session_id)?,
+            preview: self.preview_state_report(context_id)?,
+        })
     }
 
     pub fn read_workspace_file(
@@ -1452,27 +1589,28 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     build_runtime_bootstrap_plan(&bindings),
                 ))
             }
+            HostRuntimeCommand::DescribeState => Ok(HostRuntimeResponse::StateReport(
+                self.runtime_state_report(context_id)?,
+            )),
             HostRuntimeCommand::DescribeModuleLoader => Ok(HostRuntimeResponse::ModuleLoaderPlan(
                 self.describe_runtime_module_loader(context_id)?,
             )),
-            HostRuntimeCommand::BootEngine => {
-                Ok(HostRuntimeResponse::EngineBoot(self.boot_runtime_engine(context_id)?))
-            }
-            HostRuntimeCommand::Startup { max_turns } => Ok(
-                HostRuntimeResponse::StartupReport(
-                    self.run_runtime_startup(context_id, max_turns)?,
-                ),
-            ),
-            HostRuntimeCommand::LaunchPreview { max_turns, port } => Ok(
-                HostRuntimeResponse::PreviewLaunchReport(
+            HostRuntimeCommand::BootEngine => Ok(HostRuntimeResponse::EngineBoot(
+                self.boot_runtime_engine(context_id)?,
+            )),
+            HostRuntimeCommand::Startup { max_turns } => Ok(HostRuntimeResponse::StartupReport(
+                self.run_runtime_startup(context_id, max_turns)?,
+            )),
+            HostRuntimeCommand::LaunchPreview { max_turns, port } => {
+                Ok(HostRuntimeResponse::PreviewLaunchReport(
                     self.launch_runtime_preview(context_id, max_turns, port)?,
-                ),
-            ),
-            HostRuntimeCommand::PreviewRequest { request } => Ok(
-                HostRuntimeResponse::PreviewRequestReport(
+                ))
+            }
+            HostRuntimeCommand::PreviewRequest { request } => {
+                Ok(HostRuntimeResponse::PreviewRequestReport(
                     self.resolve_runtime_preview_request(context_id, request)?,
-                ),
-            ),
+                ))
+            }
             HostRuntimeCommand::Shutdown { code } => Ok(HostRuntimeResponse::ShutdownReport(
                 self.shutdown_runtime_context(context_id, code)?,
             )),
@@ -2246,7 +2384,9 @@ fn build_runtime_startup_logs(
 ) -> Vec<String> {
     let mut logs = vec![format!(
         "[host] engine={} interrupts={} module-loader={}",
-        boot_summary.engine_name, boot_summary.supports_interrupts, boot_summary.supports_module_loader
+        boot_summary.engine_name,
+        boot_summary.supports_interrupts,
+        boot_summary.supports_module_loader
     )];
 
     logs.push(format!(
