@@ -1,6 +1,10 @@
 import { guessContentType, mountArchive, type WorkspaceFileRecord } from "./analyze-archive";
 import {
   createRuntimeHostAdapter,
+  type HostRuntimeHttpServer,
+  type HostRuntimePort,
+  type HostRuntimeEvent,
+  type HostRuntimeStartupReport,
   type HostRuntimeContext,
   type HostPreviewRequestHint,
   type HostPreviewResponseDescriptor,
@@ -95,24 +99,20 @@ async function createSession(
   try {
     const mounted = mountArchive(message.fileName, message.zip, sessionId);
     const hostAdapter = await hostAdapterPromise;
-    await hostAdapter.createSession({
+    const handle = await hostAdapter.createSession({
       sessionId,
       session: mounted.snapshot,
       files: mounted.files,
     });
-    const hostFiles = await hostAdapter.listWorkspaceFiles(sessionId);
-    const sampleFile = hostFiles[0]
-      ? await hostAdapter.readWorkspaceFile(sessionId, hostFiles[0].path)
-      : null;
     sessions.set(sessionId, {
       session: mounted.snapshot,
       process: null,
       runtimeContext: null,
       hostFiles: {
-        count: hostFiles.length,
-        index: hostFiles,
-        samplePath: hostFiles[0]?.path ?? null,
-        sampleSize: sampleFile?.size ?? null,
+        count: handle.fileIndex.length,
+        index: handle.fileIndex,
+        samplePath: handle.samplePath,
+        sampleSize: handle.sampleSize,
       },
       preview: null,
       hostFileCache: new Map(),
@@ -165,22 +165,38 @@ async function runSession(
   emitState(sessionId, "running");
 
   const hostAdapter = await hostAdapterPromise;
-  const bootSummary = await hostAdapter.bootSummary();
+  let bootSummary;
   let runPlan: HostRunPlan;
   let runtimeContext: HostRuntimeContext;
+  let startupPreviewReport: {
+    startup: HostRuntimeStartupReport;
+    server: HostRuntimeHttpServer | null;
+    port: HostRuntimePort | null;
+    rootRequestHint: HostPreviewRequestHint | null;
+    rootResponseDescriptor: HostPreviewResponseDescriptor | null;
+  } | null = null;
+  let startupLogs: string[] = [];
+  let startupEvents: HostRuntimeEvent[] = [];
 
   try {
-    runPlan = await hostAdapter.planRun(sessionId, {
-      cwd: request.cwd,
-      command: request.command,
-      args: request.args,
-    });
-    runtimeContext = await hostAdapter.createRuntimeContext(sessionId, {
-      cwd: request.cwd,
-      command: request.command,
-      args: request.args,
-    });
+    const runtimeLaunch = await hostAdapter.launchRuntime(
+      sessionId,
+      {
+        cwd: request.cwd,
+        command: request.command,
+        args: request.args,
+      },
+      {
+        maxTurns: 64,
+      },
+    );
+    bootSummary = runtimeLaunch.bootSummary;
+    runPlan = runtimeLaunch.runPlan;
+    runtimeContext = runtimeLaunch.runtimeContext;
     record.runtimeContext = runtimeContext;
+    startupPreviewReport = runtimeLaunch.previewLaunch;
+    startupLogs = runtimeLaunch.startupLogs;
+    startupEvents = runtimeLaunch.events;
   } catch (error) {
     record.session.state = "errored";
     emitState(sessionId, "errored");
@@ -191,46 +207,26 @@ async function runSession(
     return;
   }
 
-  let processInfo = runtimeContext.process;
-  let processCwd = runtimeContext.process.cwd;
-  let engineContextSummary = "state=<unknown> pending-jobs=<unknown>";
-  let runtimeBindingsSummary = "globals=<unknown> builtins=<unknown>";
-  let runtimeBootstrapSummary = "bootstrap=<unknown> modules=<unknown>";
-
   try {
-    const engineContextResponse = await hostAdapter.describeEngineContext(runtimeContext.contextId);
-    const runtimeBindingsResponse = await hostAdapter.executeRuntimeCommand(
-      runtimeContext.contextId,
-      {
-        kind: "runtime.describe",
-      },
+    await emitStdout(
+      sessionId,
+      pid,
+      `[mount] ${record.session.archive.fileCount} files available at /workspace`,
     );
-    const runtimeBootstrapResponse = await hostAdapter.executeRuntimeCommand(
-      runtimeContext.contextId,
-      {
-        kind: "runtime.describe-bootstrap",
-      },
+    await emitStdout(sessionId, pid, `[exec] ${request.command} ${request.args.join(" ")}`.trim());
+
+    if (runPlan.resolvedScript) {
+      await emitStdout(sessionId, pid, `[script] ${runPlan.resolvedScript}`);
+    }
+
+    await emitStdout(
+      sessionId,
+      pid,
+      `[host-vfs] files=${record.hostFiles.count} sample=${record.hostFiles.samplePath ?? "<none>"} size=${record.hostFiles.sampleSize ?? 0}`,
     );
-    const processInfoResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-      kind: "process.info",
-    });
-    const cwdResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-      kind: "process.cwd",
-    });
-    processInfo =
-      processInfoResponse.kind === "process-info"
-        ? processInfoResponse.process
-        : runtimeContext.process;
-    processCwd = cwdResponse.kind === "process-cwd" ? cwdResponse.cwd : processInfo.cwd;
-    engineContextSummary = `state=${engineContextResponse.state} pending-jobs=${engineContextResponse.pendingJobs} entry=${engineContextResponse.entrypoint}`;
-    runtimeBindingsSummary =
-      runtimeBindingsResponse.kind === "runtime-bindings"
-        ? `globals=${runtimeBindingsResponse.bindings.globals.join(",")} builtins=${runtimeBindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`
-        : runtimeBindingsSummary;
-    runtimeBootstrapSummary =
-      runtimeBootstrapResponse.kind === "runtime-bootstrap"
-        ? `bootstrap=${runtimeBootstrapResponse.plan.bootstrapSpecifier} modules=${runtimeBootstrapResponse.plan.modules.map((module) => module.specifier).join(",")}`
-        : runtimeBootstrapSummary;
+    for (const line of startupLogs) {
+      await emitStdout(sessionId, pid, line);
+    }
   } catch (error) {
     await disposeActiveRun(sessionId);
     record.session.state = "errored";
@@ -242,162 +238,45 @@ async function runSession(
     return;
   }
 
-  await emitStdout(
-    sessionId,
-    pid,
-    `[mount] ${record.session.archive.fileCount} files available at /workspace`,
-  );
-
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[exec] ${request.command} ${request.args.join(" ")}`.trim(),
-  );
-
-  if (runPlan.resolvedScript) {
-    await enqueueRuntimeStdout(
-      hostAdapter,
-      runtimeContext.contextId,
-      `[script] ${runPlan.resolvedScript}`,
-    );
-  }
-
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[host-vfs] files=${record.hostFiles.count} sample=${record.hostFiles.samplePath ?? "<none>"} size=${record.hostFiles.sampleSize ?? 0}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[process] exec=${processInfo.execPath} cwd=${processCwd} argv=${processInfo.argv.join(" ")}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[engine-context] ${engineContextSummary}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[bindings] ${runtimeBindingsSummary}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[bootstrap] ${runtimeBootstrapSummary}`,
-  );
-  await enqueueRuntimeStdout(
-    hostAdapter,
-    runtimeContext.contextId,
-    `[context] id=${runtimeContext.contextId}`,
-  );
-  await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-    kind: "console.emit",
-    level: "info",
-    values: [
-      `[detect] react=${record.session.capabilities.detectedReact} vite=${record.session.capabilities.detectedVite}`,
-    ],
-  });
-
-  try {
-    const bootResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-      kind: "runtime.boot-engine",
-    });
-
-    if (bootResponse.kind === "runtime-engine-boot") {
-      const entryImportPlanResponse = await hostAdapter.executeRuntimeCommand(
-        runtimeContext.contextId,
-        {
-          kind: "runtime.prepare-module-import",
-          specifier: bootResponse.report.loaderPlan.entryModule.requestedSpecifier,
-        },
-      );
-      await enqueueRuntimeStdout(
-        hostAdapter,
-        runtimeContext.contextId,
-        `[engine-boot] pending-jobs=${bootResponse.report.pendingJobs} drained=${bootResponse.report.drainedJobs} entry=${bootResponse.report.loaderPlan.entryModule.resolvedSpecifier} loader-roots=${bootResponse.report.loaderPlan.nodeModuleSearchRoots.join(",") || "<none>"} result=${bootResponse.report.resultSummary || "<none>"}`,
-      );
-      if (entryImportPlanResponse.kind === "runtime-module-import-plan") {
-        await enqueueRuntimeStdout(
-          hostAdapter,
-          runtimeContext.contextId,
-          `[engine-import] request=${entryImportPlanResponse.plan.requestSpecifier} resolved=${entryImportPlanResponse.plan.resolvedModule.resolvedSpecifier} format=${entryImportPlanResponse.plan.loadedModule.format} bytes=${entryImportPlanResponse.plan.loadedModule.source.length}`,
-        );
-      }
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown engine boot failure";
-    await enqueueRuntimeStdout(
-      hostAdapter,
-      runtimeContext.contextId,
-      `[engine-boot] bootstrap failed, synthetic fallback active: ${message}`,
-    );
-  }
-
-  await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
+  await emitRuntimeEvents(sessionId, pid, runtimeContext.contextId, startupEvents);
 
   if (activeProcess.cancelled) {
     return;
   }
 
-  const portResponse = await hostAdapter.executeRuntimeCommand(runtimeContext.contextId, {
-    kind: "http.serve-preview",
-  });
-  const port = portResponse.kind === "http-server-listening" ? portResponse.server.port.port : 3000;
-  await flushRuntimeEvents(hostAdapter, sessionId, pid, runtimeContext.contextId);
+  const exitedDuringStartup = startupPreviewReport?.startup.exited ?? false;
+  if (exitedDuringStartup) {
+    const exitCode = startupPreviewReport?.startup.exitCode ?? activeProcess.exitCode ?? 0;
+    await emitStdout(sessionId, pid, `[process] exited before preview code=${exitCode}`);
+    await finalizeExitedRun(sessionId, exitCode, runtimeContext.contextId);
+    return;
+  }
+
+  const port = startupPreviewReport?.port?.port ?? 3000;
   const url = `/preview/${sessionId}/${port}/`;
   const model = buildPreviewModel(record.session, runPlan);
-  const rootRequestHintResponse = await hostAdapter.executeRuntimeCommand(
-    runtimeContext.contextId,
-    {
-      kind: "http.resolve-preview",
-      request: {
-        port,
-        method: "GET",
-        relativePath: "/",
-        search: "",
-      },
-    },
-  );
 
   record.preview = {
     pid,
     port,
     url,
     model,
-    rootRequestHint:
-      rootRequestHintResponse.kind === "preview-request-resolved"
-        ? rootRequestHintResponse.requestHint
-        : {
-            kind: "fallback-root",
-            workspacePath: null,
-            documentRoot: null,
-            hydratePaths: [],
-          },
-    rootResponseDescriptor:
-      rootRequestHintResponse.kind === "preview-request-resolved"
-        ? rootRequestHintResponse.responseDescriptor
-        : {
-            kind: "host-managed-fallback",
-            workspacePath: null,
-            documentRoot: null,
-            hydratePaths: [],
-            statusCode: 200,
-            contentType: "text/html; charset=utf-8",
-            allowMethods: [],
-            omitBody: false,
-          },
+    rootRequestHint: startupPreviewReport?.rootRequestHint ?? {
+      kind: "fallback-root",
+      workspacePath: null,
+      documentRoot: null,
+      hydratePaths: [],
+    },
+    rootResponseDescriptor: startupPreviewReport?.rootResponseDescriptor ?? {
+      kind: "host-managed-fallback",
+      workspacePath: null,
+      documentRoot: null,
+      hydratePaths: [],
+      statusCode: 200,
+      contentType: "text/html; charset=utf-8",
+      allowMethods: [],
+      omitBody: false,
+    },
     host: bootSummary,
     run: {
       cwd: runPlan.cwd,
@@ -445,7 +324,12 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
       const contextId = record.runtimeContext.contextId;
       record.runtimeContext = null;
       const hostAdapter = await hostAdapterPromise;
-      await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
+      await hostAdapter
+        .executeRuntimeCommand(contextId, {
+          kind: "runtime.shutdown",
+          code: 0,
+        })
+        .catch(() => undefined);
     }
     record.preview = null;
     record.session.state = "stopped";
@@ -460,46 +344,15 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
 
   if (contextId) {
     const hostAdapter = await hostAdapterPromise;
-    const serversResponse = await hostAdapter
+    const shutdownResponse = await hostAdapter
       .executeRuntimeCommand(contextId, {
-        kind: "http.list-servers",
-      })
-      .catch(() => null);
-    if (serversResponse?.kind === "http-server-list") {
-      for (const server of serversResponse.servers) {
-        await hostAdapter
-          .executeRuntimeCommand(contextId, {
-            kind: "http.close-server",
-            port: server.port.port,
-          })
-          .catch(() => undefined);
-      }
-    } else {
-      const portsResponse = await hostAdapter
-        .executeRuntimeCommand(contextId, {
-          kind: "port.list",
-        })
-        .catch(() => null);
-      if (portsResponse?.kind === "port-list") {
-        for (const port of portsResponse.ports) {
-          await hostAdapter
-            .executeRuntimeCommand(contextId, {
-              kind: "port.close",
-              port: port.port,
-            })
-            .catch(() => undefined);
-        }
-      }
-    }
-    await flushRuntimeEvents(hostAdapter, sessionId, process.pid, contextId).catch(() => undefined);
-    await hostAdapter
-      .executeRuntimeCommand(contextId, {
-        kind: "process.exit",
+        kind: "runtime.shutdown",
         code: 130,
       })
-      .catch(() => undefined);
-    await flushRuntimeEvents(hostAdapter, sessionId, process.pid, contextId).catch(() => undefined);
-    await hostAdapter.dropRuntimeContext(contextId).catch(() => undefined);
+      .catch(() => null);
+    if (shutdownResponse?.kind === "runtime-shutdown") {
+      await emitRuntimeEvents(sessionId, process.pid, contextId, shutdownResponse.report.events);
+    }
   } else {
     postMessage({
       type: "process.exit",
@@ -507,6 +360,55 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
       pid: process.pid,
       code: 130,
     } satisfies WorkerToUiMessage);
+  }
+
+  record.process = null;
+  record.runtimeContext = null;
+  record.preview = null;
+  record.session.state = "stopped";
+  emitState(sessionId, "stopped");
+}
+
+async function finalizeExitedRun(
+  sessionId: string,
+  code: number,
+  contextId: string | null,
+): Promise<void> {
+  const record = sessions.get(sessionId);
+
+  if (!record) {
+    return;
+  }
+
+  const process = record.process;
+  if (process && process.exitCode === null) {
+    process.exitCode = code;
+    if (!contextId) {
+      postMessage({
+        type: "process.exit",
+        sessionId,
+        pid: process.pid,
+        code,
+      } satisfies WorkerToUiMessage);
+    }
+  }
+
+  if (contextId) {
+    const hostAdapter = await hostAdapterPromise;
+    const shutdownResponse = await hostAdapter
+      .executeRuntimeCommand(contextId, {
+        kind: "runtime.shutdown",
+        code,
+      })
+      .catch(() => null);
+    if (shutdownResponse?.kind === "runtime-shutdown") {
+      await emitRuntimeEvents(
+        sessionId,
+        process?.pid ?? 0,
+        contextId,
+        shutdownResponse.report.events,
+      );
+    }
   }
 
   record.process = null;
@@ -548,33 +450,13 @@ async function emitStdout(sessionId: string, pid: number, chunk: string): Promis
   } satisfies WorkerToUiMessage);
 }
 
-async function enqueueRuntimeStdout(
-  hostAdapter: Awaited<typeof hostAdapterPromise>,
-  contextId: string,
-  chunk: string,
-): Promise<void> {
-  await hostAdapter.executeRuntimeCommand(contextId, {
-    kind: "stdio.write",
-    stream: "stdout",
-    chunk,
-  });
-}
-
-async function flushRuntimeEvents(
-  hostAdapter: Awaited<typeof hostAdapterPromise>,
+async function emitRuntimeEvents(
   sessionId: string,
   pid: number,
   contextId: string,
+  events: HostRuntimeEvent[],
 ): Promise<void> {
-  const drained = await hostAdapter.executeRuntimeCommand(contextId, {
-    kind: "runtime.drain-events",
-  });
-
-  if (drained.kind !== "runtime-events") {
-    return;
-  }
-
-  for (const event of drained.events) {
+  for (const event of events) {
     switch (event.kind) {
       case "stdout":
         await emitStdout(sessionId, pid, event.chunk);
@@ -588,6 +470,12 @@ async function flushRuntimeEvents(
         } satisfies WorkerToUiMessage);
         break;
       case "process-exit":
+        {
+          const record = sessions.get(sessionId);
+          if (record?.process) {
+            record.process.exitCode = event.code;
+          }
+        }
         postMessage({
           type: "process.exit",
           sessionId,
@@ -610,6 +498,7 @@ async function flushRuntimeEvents(
       case "workspace-change": {
         const record = sessions.get(sessionId);
         if (record) {
+          const hostAdapter = await hostAdapterPromise;
           record.session.revision = event.revision;
           applyWorkspaceEntryChange(record, event.entry);
           await syncSessionSnapshotFromWorkspaceChange(record, hostAdapter, sessionId, event.entry);
@@ -697,7 +586,7 @@ async function refreshPreviewRootPlan(
   const previousResponseDescriptor = JSON.stringify(record.preview.rootResponseDescriptor);
   const refreshed = await hostAdapter
     .executeRuntimeCommand(contextId, {
-      kind: "http.resolve-preview",
+      kind: "runtime.preview-request",
       request: {
         port: record.preview.port,
         method: "GET",
@@ -707,16 +596,16 @@ async function refreshPreviewRootPlan(
     })
     .catch(() => null);
 
-  if (refreshed?.kind !== "preview-request-resolved") {
+  if (refreshed?.kind !== "runtime-preview-request") {
     return false;
   }
 
-  record.preview.rootRequestHint = refreshed.requestHint;
-  record.preview.rootResponseDescriptor = refreshed.responseDescriptor;
+  record.preview.rootRequestHint = refreshed.report.requestHint;
+  record.preview.rootResponseDescriptor = refreshed.report.responseDescriptor;
 
   return (
-    previousRequestHint !== JSON.stringify(refreshed.requestHint) ||
-    previousResponseDescriptor !== JSON.stringify(refreshed.responseDescriptor)
+    previousRequestHint !== JSON.stringify(refreshed.report.requestHint) ||
+    previousResponseDescriptor !== JSON.stringify(refreshed.report.responseDescriptor)
   );
 }
 
@@ -818,11 +707,11 @@ async function resolvePreviewHttpResponse(
 ): Promise<VirtualHttpResponse> {
   if (isPreviewPath(request.pathname)) {
     const hostAdapter = await hostAdapterPromise;
-    const requestHintResponse =
+    const previewRequestResponse =
       record?.preview && record.runtimeContext
         ? await hostAdapter
             .executeRuntimeCommand(record.runtimeContext.contextId, {
-              kind: "http.resolve-preview",
+              kind: "runtime.preview-request",
               request: {
                 port: request.port,
                 method: request.method,
@@ -833,19 +722,29 @@ async function resolvePreviewHttpResponse(
             .catch(() => null)
         : null;
     const requestHint =
-      requestHintResponse?.kind === "preview-request-resolved"
-        ? requestHintResponse.requestHint
+      previewRequestResponse?.kind === "runtime-preview-request"
+        ? previewRequestResponse.report.requestHint
         : null;
     const responseDescriptor =
-      requestHintResponse?.kind === "preview-request-resolved"
-        ? requestHintResponse.responseDescriptor
+      previewRequestResponse?.kind === "runtime-preview-request"
+        ? previewRequestResponse.report.responseDescriptor
         : null;
+    const hydratedFiles =
+      previewRequestResponse?.kind === "runtime-preview-request"
+        ? previewRequestResponse.report.hydratedFiles
+        : [];
     const files =
-      record && responseDescriptor
-        ? await ensurePreviewFiles(record, responseDescriptor.hydratePaths)
-        : record && requestHint
-          ? await ensurePreviewFiles(record, requestHint.hydratePaths)
-          : null;
+      record && previewRequestResponse?.kind === "runtime-preview-request"
+        ? await ensurePreviewFiles(
+            record,
+            previewRequestResponse.report.hydrationPaths,
+            hydratedFiles,
+          )
+        : record && responseDescriptor
+          ? await ensurePreviewFiles(record, responseDescriptor.hydratePaths)
+          : record && requestHint
+            ? await ensurePreviewFiles(record, requestHint.hydratePaths)
+            : null;
 
     return buildPreviewResponse(
       request,
@@ -886,10 +785,19 @@ async function resolvePreviewHttpResponse(
 async function ensurePreviewFiles(
   record: SessionRecord,
   hydrationPaths: string[],
+  prehydratedFiles: Array<{
+    path: string;
+    size: number;
+    isText: boolean;
+    textContent: string | null;
+    bytes: Uint8Array;
+  }> = [],
 ): Promise<Map<string, WorkspaceFileRecord>> {
   const files = new Map(
     record.hostFiles.index.map((summary) => [summary.path, createPreviewFileStub(summary)]),
   );
+
+  applyHydratedPreviewFiles(record, prehydratedFiles);
 
   for (const [path, file] of record.hostFileCache.entries()) {
     files.set(path, file);
@@ -900,7 +808,25 @@ async function ensurePreviewFiles(
     (path) => !record.hostFileCache.has(path) && files.has(path),
   );
   const hydratedFiles = await hostAdapter.readWorkspaceFiles(record.session.sessionId, nextPaths);
+  applyHydratedPreviewFiles(record, hydratedFiles);
 
+  for (const [path, file] of record.hostFileCache.entries()) {
+    files.set(path, file);
+  }
+
+  return files;
+}
+
+function applyHydratedPreviewFiles(
+  record: SessionRecord,
+  hydratedFiles: Array<{
+    path: string;
+    size: number;
+    isText: boolean;
+    textContent: string | null;
+    bytes: Uint8Array;
+  }>,
+): void {
   for (const file of hydratedFiles) {
     record.hostFileCache.set(file.path, {
       path: file.path,
@@ -911,12 +837,6 @@ async function ensurePreviewFiles(
       textContent: file.textContent,
     });
   }
-
-  for (const [path, file] of record.hostFileCache.entries()) {
-    files.set(path, file);
-  }
-
-  return files;
 }
 
 function createPreviewFileStub(summary: {

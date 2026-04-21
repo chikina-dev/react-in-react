@@ -91,12 +91,72 @@ export type HostEngineJobDrain = {
   pendingJobs: number;
 };
 
+export type HostRuntimeIdleReport = {
+  turns: number;
+  drainedJobs: number;
+  firedTimers: number;
+  nowMs: number;
+  pendingJobs: number;
+  pendingTimers: number;
+  exited: boolean;
+  exitCode: number | null;
+  reachedTurnLimit: boolean;
+};
+
 export type HostRuntimeEngineBoot = {
   plan: HostRuntimeBootstrapPlan;
   loaderPlan: HostRuntimeModuleLoaderPlan;
   resultSummary: string;
   pendingJobs: number;
   drainedJobs: number;
+};
+
+export type HostRuntimeStartupReport = {
+  boot: HostRuntimeEngineBoot;
+  entryImportPlan: HostRuntimeModuleImportPlan;
+  idle: HostRuntimeIdleReport;
+  exited: boolean;
+  exitCode: number | null;
+};
+
+export type HostRuntimePreviewLaunchReport = {
+  startup: HostRuntimeStartupReport;
+  server: HostRuntimeHttpServer | null;
+  port: HostRuntimePort | null;
+  rootRequest: HostRuntimeHttpRequest | null;
+  rootRequestHint: HostPreviewRequestHint | null;
+  rootResponseDescriptor: HostPreviewResponseDescriptor | null;
+};
+
+export type HostRuntimeLaunchReport = {
+  bootSummary: HostBootstrapSummary;
+  runPlan: HostRunPlan;
+  runtimeContext: HostRuntimeContext;
+  engineContext: HostEngineContextSnapshot;
+  bindings: HostRuntimeBindings;
+  bootstrapPlan: HostRuntimeBootstrapPlan;
+  previewLaunch: HostRuntimePreviewLaunchReport;
+  startupLogs: string[];
+  events: HostRuntimeEvent[];
+};
+
+export type HostRuntimePreviewRequestReport = {
+  server: HostRuntimeHttpServer;
+  port: HostRuntimePort;
+  request: HostRuntimeHttpRequest;
+  requestHint: HostPreviewRequestHint;
+  responseDescriptor: HostPreviewResponseDescriptor;
+  hydrationPaths: string[];
+  hydratedFiles: HostWorkspaceFileContent[];
+};
+
+export type HostRuntimeShutdownReport = {
+  contextId: string;
+  sessionId: string;
+  exitCode: number;
+  closedPorts: HostRuntimePort[];
+  closedServers: HostRuntimeHttpServer[];
+  events: HostRuntimeEvent[];
 };
 
 export type HostRuntimeModuleRecord = {
@@ -208,6 +268,11 @@ export type HostRuntimeCommand =
   | { kind: "stdio.write"; stream: HostRuntimeStdioStream; chunk: string }
   | { kind: "runtime.read-module"; specifier: string }
   | { kind: "runtime.prepare-module-import"; specifier: string; importer?: string | null }
+  | { kind: "runtime.run-until-idle"; maxTurns: number }
+  | { kind: "runtime.startup"; maxTurns: number }
+  | { kind: "runtime.launch-preview"; maxTurns: number; port?: number | null }
+  | { kind: "runtime.preview-request"; request: HostRuntimeHttpRequest }
+  | { kind: "runtime.shutdown"; code: number }
   | { kind: "runtime.resolve-module"; specifier: string; importer?: string | null }
   | { kind: "runtime.load-module"; resolvedSpecifier: string }
   | { kind: "console.emit"; level: HostRuntimeConsoleLevel; values: string[] }
@@ -236,6 +301,11 @@ export type HostRuntimeResponse =
   | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
   | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
   | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
+  | { kind: "runtime-startup"; report: HostRuntimeStartupReport }
+  | { kind: "runtime-preview-launch"; report: HostRuntimePreviewLaunchReport }
+  | { kind: "runtime-preview-request"; report: HostRuntimePreviewRequestReport }
+  | { kind: "runtime-shutdown"; report: HostRuntimeShutdownReport }
+  | { kind: "runtime-idle-report"; report: HostRuntimeIdleReport }
   | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
   | { kind: "runtime-module-list"; modules: HostRuntimeModuleRecord[] }
   | { kind: "runtime-module-source"; module: HostRuntimeModuleSource }
@@ -285,6 +355,9 @@ export type HostSessionHandle = {
   workspaceRoot: string;
   packageName: string | null;
   fileCount: number;
+  fileIndex: HostWorkspaceFileSummary[];
+  samplePath: string | null;
+  sampleSize: number | null;
 };
 
 export type HostWorkspaceFileSummary = {
@@ -359,7 +432,16 @@ function buildMockRuntimeBindings(contextId: string, entrypoint: string): HostRu
     contextId,
     engineName: "null-engine",
     entrypoint,
-    globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
+    globals: [
+      "console",
+      "process",
+      "Buffer",
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "__runtime",
+    ],
     builtins: [
       {
         name: "process",
@@ -387,7 +469,7 @@ function buildMockRuntimeBindings(contextId: string, entrypoint: string): HostRu
       },
       {
         name: "timers",
-        globals: ["setTimeout", "clearTimeout"],
+        globals: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
         modules: ["timers", "node:timers"],
         commandPrefixes: ["timers"],
       },
@@ -498,8 +580,11 @@ function invoke(kind, payload = {}) {
 }
 export const setTimeout = (callback, delay = 0) =>
   invoke("timers.schedule", { delayMs: delay, repeat: false, callback });
+export const setInterval = (callback, delay = 0) =>
+  invoke("timers.schedule", { delayMs: delay, repeat: true, callback });
 export const clearTimeout = (timerId) => invoke("timers.clear", { timerId });
-export default { setTimeout, clearTimeout };
+export const clearInterval = clearTimeout;
+export default { setTimeout, clearTimeout, setInterval, clearInterval };
 `,
       },
       {
@@ -526,13 +611,15 @@ export default consoleValue;
         source: `import process from "node:process";
 import { Buffer } from "node:buffer";
 import consoleValue from "node:console";
-import { setTimeout, clearTimeout } from "node:timers";
+import { setTimeout, clearTimeout, setInterval, clearInterval } from "node:timers";
 
 globalThis.process = process;
 globalThis.Buffer = Buffer;
 globalThis.console = consoleValue;
 globalThis.setTimeout = setTimeout;
 globalThis.clearTimeout = clearTimeout;
+globalThis.setInterval = setInterval;
+globalThis.clearInterval = clearInterval;
 
 export async function boot() {
   return import(${entrypointLiteral});
@@ -666,6 +753,11 @@ export interface RuntimeHostAdapter {
   planRun(sessionId: string, request: RunRequest): Promise<HostRunPlan>;
   buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo>;
   createRuntimeContext(sessionId: string, request: RunRequest): Promise<HostRuntimeContext>;
+  launchRuntime(
+    sessionId: string,
+    request: RunRequest,
+    options?: { maxTurns?: number; port?: number | null },
+  ): Promise<HostRuntimeLaunchReport>;
   describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot>;
   evalEngineContext(
     contextId: string,
@@ -719,6 +811,7 @@ type WasmRuntimeHostExports = {
   runtime_host_plan_run_json(ptr: number, len: number): number;
   runtime_host_build_process_info_json(ptr: number, len: number): number;
   runtime_host_create_runtime_context_json(ptr: number, len: number): number;
+  runtime_host_launch_runtime_json(ptr: number, len: number): number;
   runtime_host_describe_engine_context_json(ptr: number, len: number): number;
   runtime_host_eval_engine_context_json(ptr: number, len: number): number;
   runtime_host_drain_engine_jobs_json(ptr: number, len: number): number;
@@ -743,6 +836,7 @@ const DEFAULT_RUNTIME_HOST_WASM_URL = "/runtime-host.wasm";
 type HostSessionRecord = {
   handle: HostSessionHandle;
   revision: number;
+  capabilities: SessionSnapshot["capabilities"];
   packageScripts: Record<string, string>;
   files: Map<string, WorkspaceFileRecord>;
   directories: Set<string>;
@@ -877,11 +971,23 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       workspaceRoot: input.session.workspaceRoot,
       packageName: input.session.packageJson?.name ?? null,
       fileCount: input.files.size,
+      fileIndex: [...input.files.values()]
+        .map((file) => ({
+          path: file.path,
+          size: file.size,
+          isText: file.isText,
+        }))
+        .sort((left, right) => left.path.localeCompare(right.path)),
+      samplePath: null,
+      sampleSize: null,
     };
+    handle.samplePath = handle.fileIndex[0]?.path ?? null;
+    handle.sampleSize = handle.fileIndex[0]?.size ?? null;
 
     this.sessions.set(input.sessionId, {
       handle,
       revision: input.session.revision,
+      capabilities: input.session.capabilities,
       packageScripts: input.session.packageJson?.scripts ?? {},
       files: new Map(
         [...input.files.entries()].map(([path, file]) => [path, cloneWorkspaceFileRecord(file)]),
@@ -980,6 +1086,61 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     };
     this.runtimeContexts.set(contextId, context);
     return context;
+  }
+
+  async launchRuntime(
+    sessionId: string,
+    request: RunRequest,
+    options?: { maxTurns?: number; port?: number | null },
+  ): Promise<HostRuntimeLaunchReport> {
+    const bootSummary = await this.bootSummary();
+    const runPlan = await this.planRun(sessionId, request);
+    const runtimeContext = await this.createRuntimeContext(sessionId, request);
+    const engineContext = await this.describeEngineContext(runtimeContext.contextId);
+    const bindingsResponse = await this.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe",
+    });
+    const bootstrapResponse = await this.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.describe-bootstrap",
+    });
+    const previewLaunchResponse = await this.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.launch-preview",
+      maxTurns: options?.maxTurns ?? 64,
+      port: options?.port ?? null,
+    });
+
+    if (bindingsResponse.kind !== "runtime-bindings") {
+      throw new Error("launchRuntime expected runtime-bindings response");
+    }
+    if (bootstrapResponse.kind !== "runtime-bootstrap") {
+      throw new Error("launchRuntime expected runtime-bootstrap response");
+    }
+    if (previewLaunchResponse.kind !== "runtime-preview-launch") {
+      throw new Error("launchRuntime expected runtime-preview-launch response");
+    }
+
+    return {
+      bootSummary,
+      runPlan,
+      runtimeContext,
+      engineContext,
+      bindings: bindingsResponse.bindings,
+      bootstrapPlan: bootstrapResponse.plan,
+      previewLaunch: previewLaunchResponse.report,
+      startupLogs: [
+        `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
+        `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
+        `[process] exec=${runtimeContext.process.execPath} cwd=${runtimeContext.process.cwd} argv=${runtimeContext.process.argv.join(" ")}`,
+        `[engine-context] state=${engineContext.state} pending-jobs=${engineContext.pendingJobs} entry=${engineContext.entrypoint}`,
+        `[bindings] globals=${bindingsResponse.bindings.globals.join(",")} builtins=${bindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`,
+        `[bootstrap] bootstrap=${bootstrapResponse.plan.bootstrapSpecifier} modules=${bootstrapResponse.plan.modules.map((module) => module.specifier).join(",")}`,
+        `[context] id=${runtimeContext.contextId}`,
+        `[detect] react=${String(this.sessions.get(sessionId)?.capabilities.detectedReact ?? false)} vite=${String(this.sessions.get(sessionId)?.capabilities.detectedVite ?? false)}`,
+      ],
+      events: await this.executeRuntimeCommand(runtimeContext.contextId, {
+        kind: "runtime.drain-events",
+      }).then((response) => (response.kind === "runtime-events" ? response.events : [])),
+    };
   }
 
   async describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot> {
@@ -1371,6 +1532,192 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
             resultSummary: evalOutcome.resultSummary,
             pendingJobs: evalOutcome.pendingJobs,
             drainedJobs: drain.drainedJobs,
+          },
+        };
+      }
+      case "runtime.startup": {
+        const bootResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.boot-engine",
+        });
+        if (bootResponse.kind !== "runtime-engine-boot") {
+          throw new Error("runtime.startup expected runtime-engine-boot response");
+        }
+        const entryImportPlanResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.prepare-module-import",
+          specifier: bootResponse.report.loaderPlan.entryModule.requestedSpecifier,
+        });
+        if (entryImportPlanResponse.kind !== "runtime-module-import-plan") {
+          throw new Error("runtime.startup expected runtime-module-import-plan response");
+        }
+        const idleResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.run-until-idle",
+          maxTurns: command.maxTurns,
+        });
+        if (idleResponse.kind !== "runtime-idle-report") {
+          throw new Error("runtime.startup expected runtime-idle-report response");
+        }
+        const exited = context.exitCode !== null;
+
+        return {
+          kind: "runtime-startup",
+          report: {
+            boot: bootResponse.report,
+            entryImportPlan: entryImportPlanResponse.plan,
+            idle: idleResponse.report,
+            exited,
+            exitCode: context.exitCode,
+          },
+        };
+      }
+      case "runtime.launch-preview": {
+        const startupResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.startup",
+          maxTurns: command.maxTurns,
+        });
+        if (startupResponse.kind !== "runtime-startup") {
+          throw new Error("runtime.launch-preview expected runtime-startup response");
+        }
+        if (startupResponse.report.exited) {
+          return {
+            kind: "runtime-preview-launch",
+            report: {
+              startup: startupResponse.report,
+              server: null,
+              port: null,
+              rootRequest: null,
+              rootRequestHint: null,
+              rootResponseDescriptor: null,
+            },
+          };
+        }
+        const serverResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "http.serve-preview",
+          port: command.port ?? null,
+        });
+        if (serverResponse.kind !== "http-server-listening") {
+          throw new Error("runtime.launch-preview expected http-server-listening response");
+        }
+        const rootRequest: HostRuntimeHttpRequest = {
+          port: serverResponse.server.port.port,
+          method: "GET",
+          relativePath: "/",
+          search: "",
+        };
+        const resolvedResponse = await this.executeRuntimeCommand(contextId, {
+          kind: "http.resolve-preview",
+          request: rootRequest,
+        });
+        if (resolvedResponse.kind !== "preview-request-resolved") {
+          throw new Error("runtime.launch-preview expected preview-request-resolved response");
+        }
+        return {
+          kind: "runtime-preview-launch",
+          report: {
+            startup: startupResponse.report,
+            server: resolvedResponse.server,
+            port: resolvedResponse.port,
+            rootRequest,
+            rootRequestHint: resolvedResponse.requestHint,
+            rootResponseDescriptor: resolvedResponse.responseDescriptor,
+          },
+        };
+      }
+      case "runtime.preview-request": {
+        const server = context.httpServers.get(command.request.port);
+        if (!server) {
+          throw new Error(`runtime http server not found: ${command.request.port}`);
+        }
+        const requestHint = await this.resolvePreviewRequestHint(
+          context.sessionId,
+          command.request.relativePath,
+        );
+        const responseDescriptor = describeMockPreviewResponse(requestHint, command.request.method);
+
+        return {
+          kind: "runtime-preview-request",
+          report: {
+            server,
+            port: server.port,
+            request: { ...command.request },
+            requestHint,
+            responseDescriptor,
+            hydrationPaths:
+              responseDescriptor.hydratePaths.length > 0
+                ? responseDescriptor.hydratePaths
+                : requestHint.hydratePaths,
+            hydratedFiles: await this.readWorkspaceFiles(
+              context.sessionId,
+              responseDescriptor.hydratePaths.length > 0
+                ? responseDescriptor.hydratePaths
+                : requestHint.hydratePaths,
+            ),
+          },
+        };
+      }
+      case "runtime.shutdown": {
+        this.runtimeContexts.delete(context.contextId);
+        const exitCode = context.exitCode ?? command.code;
+        const closedPorts = [...context.ports.values()].sort(
+          (left, right) => left.port - right.port,
+        );
+        const closedServers = [...context.httpServers.values()].sort(
+          (left, right) => left.port.port - right.port.port,
+        );
+        const events = [...context.events];
+        for (const port of closedPorts) {
+          events.push({ kind: "port-close", port: port.port });
+        }
+        if (!events.some((event) => event.kind === "process-exit")) {
+          events.push({ kind: "process-exit", code: exitCode });
+        }
+        return {
+          kind: "runtime-shutdown",
+          report: {
+            contextId: context.contextId,
+            sessionId: context.sessionId,
+            exitCode,
+            closedPorts,
+            closedServers,
+            events,
+          },
+        };
+      }
+      case "runtime.run-until-idle": {
+        const maxTurns = Math.max(command.maxTurns, 1);
+        let turns = 0;
+        let drainedJobs = 0;
+        let firedTimers = 0;
+        let reachedTurnLimit = false;
+
+        while (turns < maxTurns) {
+          if (context.timers.size === 0) {
+            break;
+          }
+          const nextDueAtMs = Math.min(
+            ...[...context.timers.values()].map((timer) => timer.dueAtMs),
+          );
+          context.clockMs = Math.max(context.clockMs, nextDueAtMs);
+          const fired = advanceMockRuntimeTimers(context);
+          firedTimers += fired.length;
+          turns += 1;
+        }
+
+        if (context.timers.size > 0 && turns >= maxTurns) {
+          reachedTurnLimit = true;
+        }
+
+        return {
+          kind: "runtime-idle-report",
+          report: {
+            turns,
+            drainedJobs,
+            firedTimers,
+            nowMs: context.clockMs,
+            pendingJobs: 0,
+            pendingTimers: context.timers.size,
+            exited: context.exitCode !== null,
+            exitCode: context.exitCode,
+            reachedTurnLimit,
           },
         };
       }
@@ -2114,6 +2461,30 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     ]);
   }
 
+  async launchRuntime(
+    sessionId: string,
+    request: RunRequest,
+    options?: { maxTurns?: number; port?: number | null },
+  ): Promise<HostRuntimeLaunchReport> {
+    const args = request.args.join("\u001f");
+    const env = Object.entries(request.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\u001f");
+    const lines = [
+      `session_id=${sessionId}`,
+      `cwd=${request.cwd}`,
+      `command=${request.command}`,
+      `args=${args}`,
+      `env=${env}`,
+      `max_turns=${String(options?.maxTurns ?? 64)}`,
+    ];
+    if (options?.port != null) {
+      lines.push(`port=${String(options.port)}`);
+    }
+
+    return this.invokeWithInput<HostRuntimeLaunchReport>("runtime_host_launch_runtime_json", lines);
+  }
+
   async describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot> {
     return this.invokeWithInput<HostEngineContextSnapshot>(
       "runtime_host_describe_engine_context_json",
@@ -2332,6 +2703,32 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       case "runtime.boot-engine":
         lines.push("command=runtime-boot-engine");
         break;
+      case "runtime.startup":
+        lines.push("command=runtime-startup");
+        lines.push(`max_turns=${String(command.maxTurns)}`);
+        break;
+      case "runtime.launch-preview":
+        lines.push("command=runtime-launch-preview");
+        lines.push(`max_turns=${String(command.maxTurns)}`);
+        if (command.port != null) {
+          lines.push(`port=${String(command.port)}`);
+        }
+        break;
+      case "runtime.preview-request":
+        lines.push("command=runtime-preview-request");
+        lines.push(`port=${String(command.request.port)}`);
+        lines.push(`method=${command.request.method}`);
+        lines.push(`relative_path=${encodeHex(command.request.relativePath)}`);
+        lines.push(`search=${encodeHex(command.request.search)}`);
+        break;
+      case "runtime.shutdown":
+        lines.push("command=runtime-shutdown");
+        lines.push(`code=${String(command.code)}`);
+        break;
+      case "runtime.run-until-idle":
+        lines.push("command=runtime-run-until-idle");
+        lines.push(`max_turns=${String(command.maxTurns)}`);
+        break;
       case "runtime.describe-module-loader":
         lines.push("command=runtime-describe-module-loader");
         break;
@@ -2492,8 +2889,25 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     const response = await this.invokeWithInput<
       | { kind: "runtime-bindings"; bindings: HostRuntimeBindings }
       | { kind: "runtime-bootstrap"; plan: HostRuntimeBootstrapPlan }
+      | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
+      | { kind: "runtime-startup"; report: HostRuntimeStartupReport }
+      | { kind: "runtime-preview-launch"; report: HostRuntimePreviewLaunchReport }
+      | { kind: "runtime-shutdown"; report: HostRuntimeShutdownReport }
+      | {
+          kind: "runtime-preview-request";
+          report: Omit<HostRuntimePreviewRequestReport, "hydratedFiles"> & {
+            hydratedFiles: Array<{
+              path: string;
+              size: number;
+              isText: boolean;
+              textContent: string | null;
+              bytesHex: string;
+            }>;
+          };
+        }
       | { kind: "runtime-module-loader"; plan: HostRuntimeModuleLoaderPlan }
       | { kind: "runtime-module-import-plan"; plan: HostRuntimeModuleImportPlan }
+      | { kind: "runtime-idle-report"; report: HostRuntimeIdleReport }
       | { kind: "event-queued"; queueLen: number }
       | { kind: "runtime-events"; events: HostRuntimeEvent[] }
       | { kind: "port-listening"; port: HostRuntimePort }
@@ -2567,6 +2981,22 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
           isText: response.response.isText,
           textContent: response.response.textContent,
           bytes: decodeHex(response.response.bytesHex),
+        },
+      };
+    }
+
+    if (response.kind === "runtime-preview-request") {
+      return {
+        kind: "runtime-preview-request",
+        report: {
+          ...response.report,
+          hydratedFiles: response.report.hydratedFiles.map((file) => ({
+            path: file.path,
+            size: file.size,
+            isText: file.isText,
+            textContent: file.textContent,
+            bytes: decodeHex(file.bytesHex),
+          })),
         },
       };
     }

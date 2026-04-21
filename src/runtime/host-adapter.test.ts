@@ -102,6 +102,14 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     workspaceRoot: "/workspace",
     packageName: "demo-app",
     fileCount: 4,
+    fileIndex: [
+      { path: "/workspace/logo.png", size: 4, isText: false },
+      { path: "/workspace/package.json", size: 19, isText: true },
+      { path: "/workspace/src/boot.ts", size: 25, isText: true },
+      { path: "/workspace/src/server.ts", size: 20, isText: true },
+    ],
+    samplePath: "/workspace/logo.png",
+    sampleSize: 4,
   });
 
   await expect(
@@ -597,7 +605,16 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       contextId: runtimeContext.contextId,
       engineName: "null-engine",
       entrypoint: "/workspace/src/server.ts",
-      globals: ["console", "process", "Buffer", "setTimeout", "clearTimeout", "__runtime"],
+      globals: [
+        "console",
+        "process",
+        "Buffer",
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "__runtime",
+      ],
       builtins: [
         {
           name: "process",
@@ -625,7 +642,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         },
         {
           name: "timers",
-          globals: ["setTimeout", "clearTimeout"],
+          globals: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
           modules: ["timers", "node:timers"],
           commandPrefixes: ["timers"],
         },
@@ -755,6 +772,220 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     bootResponse.kind === "runtime-engine-boot" ? bootResponse.report.resultSummary : "",
   ).toContain("null-engine skipped module eval for runtime:bootstrap");
 
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.startup",
+      maxTurns: 16,
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-startup",
+    report: {
+      boot: expect.objectContaining({
+        plan: expect.objectContaining({
+          contextId: runtimeContext.contextId,
+          bootstrapSpecifier: "runtime:bootstrap",
+        }),
+        loaderPlan: expect.objectContaining({
+          entryModule: {
+            requestedSpecifier: "/workspace/src/server.ts",
+            resolvedSpecifier: "/workspace/src/server.ts",
+            kind: "workspace",
+            format: "module",
+          },
+        }),
+      }),
+      entryImportPlan: {
+        requestSpecifier: "/workspace/src/server.ts",
+        importer: null,
+        resolvedModule: {
+          requestedSpecifier: "/workspace/src/server.ts",
+          resolvedSpecifier: "/workspace/src/server.ts",
+          kind: "workspace",
+          format: "module",
+        },
+        loadedModule: {
+          resolvedSpecifier: "/workspace/src/server.ts",
+          kind: "workspace",
+          format: "module",
+          source: expect.stringContaining("console.log('server')"),
+        },
+      },
+      idle: {
+        turns: 0,
+        drainedJobs: 0,
+        firedTimers: 0,
+        nowMs: 0,
+        pendingJobs: 0,
+        pendingTimers: 0,
+        exited: false,
+        exitCode: null,
+        reachedTurnLimit: false,
+      },
+      exited: false,
+      exitCode: null,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.launch-preview",
+      maxTurns: 16,
+      port: 3100,
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-preview-launch",
+    report: {
+      startup: expect.objectContaining({
+        boot: expect.objectContaining({
+          plan: expect.objectContaining({
+            contextId: runtimeContext.contextId,
+            bootstrapSpecifier: "runtime:bootstrap",
+          }),
+        }),
+        exited: false,
+        exitCode: null,
+      }),
+      server: {
+        port: {
+          port: 3100,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+      port: {
+        port: 3100,
+        protocol: "http",
+      },
+      rootRequest: {
+        port: 3100,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+      },
+      rootRequestHint: expect.objectContaining({
+        kind: "fallback-root",
+      }),
+      rootResponseDescriptor: expect.objectContaining({
+        kind: "host-managed-fallback",
+      }),
+    },
+  });
+
+  await expect(
+    adapter.launchRuntime(
+      session.sessionId,
+      {
+        cwd: "/workspace/src",
+        command: "node",
+        args: ["server.ts"],
+      },
+      {
+        maxTurns: 16,
+        port: 3200,
+      },
+    ),
+  ).resolves.toEqual({
+    bootSummary: {
+      engineName: "null-engine",
+      supportsInterrupts: true,
+      supportsModuleLoader: true,
+      workspaceRoot: "/workspace",
+    },
+    runPlan: {
+      cwd: "/workspace/src",
+      entrypoint: "/workspace/src/server.ts",
+      envCount: 0,
+      commandLine: "node server.ts",
+      commandKind: "node-entrypoint",
+      resolvedScript: null,
+    },
+    runtimeContext: expect.objectContaining({
+      sessionId: session.sessionId,
+      process: expect.objectContaining({
+        cwd: "/workspace/src",
+        commandKind: "node-entrypoint",
+      }),
+    }),
+    engineContext: expect.objectContaining({
+      sessionId: session.sessionId,
+      cwd: "/workspace/src",
+      entrypoint: "/workspace/src/server.ts",
+      state: "booted",
+    }),
+    bindings: expect.objectContaining({
+      globals: expect.arrayContaining(["process", "Buffer", "setTimeout"]),
+    }),
+    bootstrapPlan: expect.objectContaining({
+      bootstrapSpecifier: "runtime:bootstrap",
+    }),
+    startupLogs: expect.arrayContaining([
+      "[host] engine=null-engine interrupts=true module-loader=true",
+      "[context] id=runtime-context-2",
+    ]),
+    previewLaunch: {
+      startup: expect.objectContaining({
+        exited: false,
+        exitCode: null,
+      }),
+      server: {
+        port: {
+          port: 3200,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+      port: {
+        port: 3200,
+        protocol: "http",
+      },
+      rootRequest: {
+        port: 3200,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+      },
+      rootRequestHint: expect.objectContaining({
+        kind: "fallback-root",
+      }),
+      rootResponseDescriptor: expect.objectContaining({
+        kind: "host-managed-fallback",
+      }),
+    },
+    events: [
+      {
+        kind: "port-listen",
+        port: {
+          port: 3200,
+          protocol: "http",
+        },
+      },
+    ],
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.run-until-idle",
+      maxTurns: 16,
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-idle-report",
+    report: {
+      turns: 0,
+      drainedJobs: 0,
+      firedTimers: 0,
+      nowMs: 0,
+      pendingJobs: 0,
+      pendingTimers: 0,
+      exited: false,
+      exitCode: null,
+      reachedTurnLimit: false,
+    },
+  });
+
   await expect(adapter.describeEngineContext(runtimeContext.contextId)).resolves.toEqual({
     engineSessionId: `null-engine-session:${runtimeContext.sessionId}`,
     engineContextId: `null-engine-context:${runtimeContext.contextId}`,
@@ -866,7 +1097,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     }),
   ).resolves.toEqual({
     kind: "event-queued",
-    queueLen: 1,
+    queueLen: 2,
   });
 
   await expect(
@@ -877,7 +1108,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     }),
   ).resolves.toEqual({
     kind: "event-queued",
-    queueLen: 3,
+    queueLen: 4,
   });
 
   await expect(
@@ -887,6 +1118,13 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   ).resolves.toEqual({
     kind: "runtime-events",
     events: [
+      {
+        kind: "port-listen",
+        port: {
+          port: 3100,
+          protocol: "http",
+        },
+      },
       {
         kind: "stdout",
         chunk: "hello stdout",
@@ -942,6 +1180,10 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         protocol: "http",
       },
       {
+        port: 3100,
+        protocol: "http",
+      },
+      {
         port: 4100,
         protocol: "http",
       },
@@ -973,6 +1215,15 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   ).resolves.toEqual({
     kind: "http-server-list",
     servers: [
+      {
+        port: {
+          port: 3100,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
       {
         port: {
           port: 4200,
@@ -1031,6 +1282,74 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       contentType: "text/plain; charset=utf-8",
       allowMethods: [],
       omitBody: false,
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/src/server.ts",
+        search: "?v=1",
+      },
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-preview-request",
+    report: {
+      server: {
+        port: {
+          port: 4200,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+      port: {
+        port: 4200,
+        protocol: "http",
+      },
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/src/server.ts",
+        search: "?v=1",
+      },
+      requestHint: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/src/server.ts",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/src/server.ts",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+        statusCode: 200,
+        contentType: "text/plain; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      hydrationPaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+      hydratedFiles: [
+        {
+          path: "/workspace/package.json",
+          size: 19,
+          isText: true,
+          textContent: '{"name":"demo-app"}',
+          bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+        },
+        {
+          path: "/workspace/src/server.ts",
+          size: 20,
+          isText: true,
+          textContent: "console.log('server')",
+          bytes: new TextEncoder().encode("console.log('server')"),
+        },
+      ],
     },
   });
 
@@ -1414,29 +1733,68 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
 
   await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
-      kind: "runtime.drain-events",
+      kind: "runtime.shutdown",
+      code: 0,
     }),
   ).resolves.toEqual({
-    kind: "runtime-events",
-    events: [
-      {
-        kind: "workspace-change",
-        entry: {
-          path: "/workspace/src/generated/nested/context.log",
-          kind: "file",
-          size: 13,
-          isText: true,
+    kind: "runtime-shutdown",
+    report: {
+      contextId: runtimeContext.contextId,
+      sessionId: session.sessionId,
+      exitCode: 0,
+      closedPorts: [
+        {
+          port: 3100,
+          protocol: "http",
         },
-        revision: 2,
-      },
-      {
-        kind: "process-exit",
-        code: 0,
-      },
-    ],
+        {
+          port: 4100,
+          protocol: "http",
+        },
+      ],
+      closedServers: [
+        {
+          port: {
+            port: 3100,
+            protocol: "http",
+          },
+          kind: "preview",
+          cwd: "/workspace/src",
+          entrypoint: "/workspace/src/server.ts",
+        },
+      ],
+      events: [
+        {
+          kind: "workspace-change",
+          entry: {
+            path: "/workspace/src/generated/nested/context.log",
+            kind: "file",
+            size: 13,
+            isText: true,
+          },
+          revision: 2,
+        },
+        {
+          kind: "process-exit",
+          code: 0,
+        },
+        {
+          kind: "port-close",
+          port: 3100,
+        },
+        {
+          kind: "port-close",
+          port: 4100,
+        },
+      ],
+    },
   });
 
-  await expect(adapter.dropRuntimeContext(runtimeContext.contextId)).resolves.toBeUndefined();
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.drain-events",
+    }),
+  ).rejects.toThrow("runtime context not found");
 
   await expect(
     adapter.executeContextFsCommand(runtimeContext.contextId, {
@@ -1444,4 +1802,8 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       path: "server.ts",
     }),
   ).rejects.toThrow("runtime context not found");
+
+  await expect(adapter.dropRuntimeContext(runtimeContext.contextId)).rejects.toThrow(
+    "runtime context not found",
+  );
 });

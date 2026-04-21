@@ -73,7 +73,7 @@ function parseArchiveWithFiles(
   files: Map<string, WorkspaceFileRecord>;
 } {
   const unzipped = unzipSync(zipBytes);
-  const entryNames = Object.keys(unzipped).sort();
+  const entryNames = Object.keys(unzipped).filter(isWorkspaceArchiveEntry).sort();
   const commonPrefix = detectCommonPrefix(entryNames);
   const files = new Map<string, WorkspaceFileRecord>();
 
@@ -162,16 +162,19 @@ export function detectCommonPrefix(entryNames: string[]): CommonPrefixResult {
     return { prefix: null, segments: [] };
   }
 
-  const splitEntries = entryNames.map((entry) =>
-    entry.replace(/^\/+/, "").split("/").filter(Boolean),
-  );
+  const splitEntries = entryNames.map((entry) => ({
+    segments: entry.replace(/^\/+/, "").split("/").filter(Boolean),
+    isDirectory: entry.endsWith("/"),
+  }));
 
-  const firstSegments = splitEntries[0];
+  const firstSegments = splitEntries[0]?.segments ?? [];
   const shared: string[] = [];
 
   for (const [index, candidate] of firstSegments.entries()) {
     const isShared = splitEntries.every(
-      (segments) => segments.length > index + 1 && segments[index] === candidate,
+      (entry) =>
+        entry.segments[index] === candidate &&
+        (entry.segments.length > index + 1 || entry.isDirectory),
     );
 
     if (!isShared) {
@@ -185,6 +188,20 @@ export function detectCommonPrefix(entryNames: string[]): CommonPrefixResult {
     prefix: shared.length > 0 ? shared.join("/") : null,
     segments: shared,
   };
+}
+
+function isWorkspaceArchiveEntry(rawPath: string): boolean {
+  const cleaned = rawPath.replace(/^\/+/, "").replace(/\/+/g, "/");
+  if (!cleaned) {
+    return false;
+  }
+
+  const segments = cleaned.split("/").filter(Boolean);
+  if (segments[0] === "__MACOSX") {
+    return false;
+  }
+
+  return !segments.some((segment) => segment.startsWith("._"));
 }
 
 function readPackageJson(bytes: Uint8Array): PackageJsonSummary | null {
