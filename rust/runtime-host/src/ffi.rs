@@ -2103,10 +2103,15 @@ fn render_runtime_event_json(event: &HostRuntimeEvent) -> String {
         HostRuntimeEvent::PortClose { port } => {
             format!("{{\"kind\":\"port-close\",\"port\":{port}}}")
         }
-        HostRuntimeEvent::WorkspaceChange { entry, revision } => format!(
-            "{{\"kind\":\"workspace-change\",\"entry\":{},\"revision\":{}}}",
+        HostRuntimeEvent::WorkspaceChange {
+            entry,
+            revision,
+            state,
+        } => format!(
+            "{{\"kind\":\"workspace-change\",\"entry\":{},\"revision\":{},\"state\":{}}}",
             render_workspace_entry_json(entry),
-            revision
+            revision,
+            render_runtime_state_report_json(state)
         ),
     }
 }

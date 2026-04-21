@@ -1516,7 +1516,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   ).resolves.toEqual({
     kind: "runtime-events",
     events: [
-      {
+      expect.objectContaining({
         kind: "workspace-change",
         entry: {
           path: "/workspace/src/generated/output.json",
@@ -1525,7 +1525,12 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           isText: true,
         },
         revision: 1,
-      },
+        state: expect.objectContaining({
+          session: expect.objectContaining({
+            revision: 1,
+          }),
+        }),
+      }),
     ],
   });
 
@@ -1794,6 +1799,11 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
             isText: true,
           },
           revision: 2,
+          state: expect.objectContaining({
+            session: expect.objectContaining({
+              revision: 2,
+            }),
+          }),
         },
         {
           kind: "process-exit",

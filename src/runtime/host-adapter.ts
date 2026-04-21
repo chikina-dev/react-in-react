@@ -251,7 +251,12 @@ export type HostRuntimeEvent =
   | { kind: "process-exit"; code: number }
   | { kind: "port-listen"; port: HostRuntimePort }
   | { kind: "port-close"; port: number }
-  | { kind: "workspace-change"; entry: HostWorkspaceEntrySummary; revision: number };
+  | {
+      kind: "workspace-change";
+      entry: HostWorkspaceEntrySummary;
+      revision: number;
+      state: HostRuntimeStateReport;
+    };
 
 export type HostRuntimePortProtocol = "http";
 
@@ -2260,14 +2265,23 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
         if (shouldEmitWorkspaceChange && response.kind === "entry") {
           const session = this.sessions.get(context.sessionId);
-          const revision = session ? ++session.revision : 0;
-          if (session) {
-            session.session.revision = revision;
+          if (!session) {
+            throw new Error(`Rust host session not found: ${context.sessionId}`);
           }
+          const revision = session ? ++session.revision : 0;
+          session.session.revision = revision;
+          const requestHint =
+            context.httpServers.size > 0
+              ? await this.resolvePreviewRequestHint(context.sessionId, "/")
+              : null;
+          const responseDescriptor = requestHint
+            ? describeMockPreviewResponse(requestHint, "GET")
+            : null;
           context.events.push({
             kind: "workspace-change",
             entry: response.entry,
             revision,
+            state: buildMockRuntimeStateReport(context, session, requestHint, responseDescriptor),
           });
         }
 

@@ -417,6 +417,7 @@ pub enum HostRuntimeEvent {
     WorkspaceChange {
         entry: WorkspaceEntrySummary,
         revision: u64,
+        state: HostRuntimeStateReport,
     },
 }
 

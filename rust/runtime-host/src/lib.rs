@@ -815,15 +815,27 @@ module.exports = payload.offset + 4;"#,
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                HostRuntimeEvent::WorkspaceChange { entry, revision }
-                    if entry.path == "/workspace/generated" && *revision == 1
+                HostRuntimeEvent::WorkspaceChange {
+                    entry,
+                    revision,
+                    state,
+                }
+                    if entry.path == "/workspace/generated"
+                        && *revision == 1
+                        && state.session.revision == 1
             )
         }));
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                HostRuntimeEvent::WorkspaceChange { entry, revision }
-                    if entry.path == "/workspace/generated/from-native.txt" && *revision == 1
+                HostRuntimeEvent::WorkspaceChange {
+                    entry,
+                    revision,
+                    state,
+                }
+                    if entry.path == "/workspace/generated/from-native.txt"
+                        && *revision == 1
+                        && state.session.revision == 1
             )
         }));
 
@@ -1572,16 +1584,19 @@ export default laterAnswer;"#,
                 HostRuntimeCommand::DrainEvents,
             ),
             Ok(HostRuntimeResponse::RuntimeEvents { events })
-                if events
-                    == vec![HostRuntimeEvent::WorkspaceChange {
+                if matches!(
+                    events.as_slice(),
+                    [HostRuntimeEvent::WorkspaceChange {
                         entry: WorkspaceEntrySummary {
-                            path: String::from("/workspace/src/generated/output.json"),
+                            path,
                             kind: WorkspaceEntryKind::File,
                             size: 11,
                             is_text: true,
                         },
                         revision: 1,
-                    }]
+                        state,
+                    }] if path == "/workspace/src/generated/output.json" && state.session.revision == 1
+                )
         ));
         assert!(matches!(
             host.execute_runtime_command(
@@ -1733,19 +1748,22 @@ export default laterAnswer;"#,
                 HostRuntimeCommand::DrainEvents,
             ),
             Ok(HostRuntimeResponse::RuntimeEvents { events })
-                if events
-                    == vec![
+                if matches!(
+                    events.as_slice(),
+                    [
                         HostRuntimeEvent::WorkspaceChange {
                             entry: WorkspaceEntrySummary {
-                                path: String::from("/workspace/src/generated/runtime.log"),
+                                path,
                                 kind: WorkspaceEntryKind::File,
                                 size: 13,
                                 is_text: true,
                             },
                             revision: 2,
+                            state,
                         },
                         HostRuntimeEvent::ProcessExit { code: 0 },
-                    ]
+                    ] if path == "/workspace/src/generated/runtime.log" && state.session.revision == 2
+                )
         ));
         assert_eq!(
             host.plan_run(

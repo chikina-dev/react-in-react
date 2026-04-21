@@ -237,7 +237,7 @@ async function runSession(
     return;
   }
 
-  await emitRuntimeEvents(sessionId, pid, runtimeContext.contextId, startupEvents);
+  await emitRuntimeEvents(sessionId, pid, startupEvents);
 
   if (activeProcess.cancelled) {
     return;
@@ -353,7 +353,7 @@ async function disposeActiveRun(sessionId: string): Promise<void> {
       })
       .catch(() => null);
     if (shutdownResponse?.kind === "runtime-shutdown") {
-      await emitRuntimeEvents(sessionId, process.pid, contextId, shutdownResponse.report.events);
+      await emitRuntimeEvents(sessionId, process.pid, shutdownResponse.report.events);
     }
   } else {
     postMessage({
@@ -404,12 +404,7 @@ async function finalizeExitedRun(
       })
       .catch(() => null);
     if (shutdownResponse?.kind === "runtime-shutdown") {
-      await emitRuntimeEvents(
-        sessionId,
-        process?.pid ?? 0,
-        contextId,
-        shutdownResponse.report.events,
-      );
+      await emitRuntimeEvents(sessionId, process?.pid ?? 0, shutdownResponse.report.events);
     }
   }
 
@@ -455,7 +450,6 @@ async function emitStdout(sessionId: string, pid: number, chunk: string): Promis
 async function emitRuntimeEvents(
   sessionId: string,
   pid: number,
-  contextId: string,
   events: HostRuntimeEvent[],
 ): Promise<void> {
   for (const event of events) {
@@ -500,20 +494,12 @@ async function emitRuntimeEvents(
       case "workspace-change": {
         const record = sessions.get(sessionId);
         if (record) {
-          const hostAdapter = await hostAdapterPromise;
-          const refreshed = await hostAdapter
-            .executeRuntimeCommand(contextId, {
-              kind: "runtime.describe-state",
-            })
-            .catch(() => null);
-          if (refreshed?.kind === "runtime-state") {
-            applyRuntimeStateReport(record, refreshed.report);
-            await emitStdout(
-              sessionId,
-              pid,
-              `[preview] root-plan ${record.preview?.rootResponseDescriptor.kind ?? "unknown"}`,
-            );
-          }
+          applyRuntimeStateReport(record, event.state);
+          await emitStdout(
+            sessionId,
+            pid,
+            `[preview] root-plan ${record.preview?.rootResponseDescriptor.kind ?? "unknown"}`,
+          );
         }
         await emitStdout(sessionId, pid, `[vfs] ${event.entry.kind} ${event.entry.path} updated`);
         break;
@@ -533,28 +519,28 @@ function applyRuntimeStateReport(record: SessionRecord, report: HostRuntimeState
     }
   }
 
-  if (record.preview) {
-    if (!report.preview) {
-      record.preview = null;
-      return;
-    }
-
-    record.preview = {
-      ...record.preview,
-      port: report.preview.port.port,
-      url: `/preview/${record.session.sessionId}/${report.preview.port.port}/`,
-      model: buildPreviewModel(record.session, report.preview.run),
-      rootRequestHint: report.preview.rootRequestHint,
-      rootResponseDescriptor: report.preview.rootResponseDescriptor,
-      host: report.preview.host,
-      run: report.preview.run,
-      hostFiles: {
-        count: report.preview.hostFiles.count,
-        samplePath: report.preview.hostFiles.samplePath,
-        sampleSize: report.preview.hostFiles.sampleSize,
-      },
-    };
+  if (!report.preview) {
+    record.preview = null;
+    return;
   }
+
+  const previewPid = record.preview?.pid ?? record.process?.pid ?? -1;
+  const previewPort = report.preview.port.port;
+  record.preview = {
+    pid: previewPid,
+    port: previewPort,
+    url: `/preview/${record.session.sessionId}/${previewPort}/`,
+    model: buildPreviewModel(record.session, report.preview.run),
+    rootRequestHint: report.preview.rootRequestHint,
+    rootResponseDescriptor: report.preview.rootResponseDescriptor,
+    host: report.preview.host,
+    run: report.preview.run,
+    hostFiles: {
+      count: report.preview.hostFiles.count,
+      samplePath: report.preview.hostFiles.samplePath,
+      sampleSize: report.preview.hostFiles.sampleSize,
+    },
+  };
 }
 
 function cloneSessionSnapshot(report: HostRuntimeStateReport["session"]): SessionSnapshot {

@@ -2005,14 +2005,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                             session.snapshot.revision += 1;
                             session.snapshot.revision
                         };
-                        let context =
-                            self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
-                                RuntimeHostError::RuntimeContextNotFound(context_id.into())
-                            })?;
-                        context.events.push_back(HostRuntimeEvent::WorkspaceChange {
-                            entry: entry.clone(),
-                            revision,
-                        });
+                        self.push_workspace_change_event(context_id, entry.clone(), revision)?;
                     }
                 }
 
@@ -2089,40 +2082,68 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             apply_engine_bridge_snapshot(session, &snapshot)
         };
 
+        {
+            let context = self
+                .runtime_contexts
+                .get_mut(context_id)
+                .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+            context.process.cwd = snapshot.cwd;
+            context.timers = snapshot
+                .timers
+                .into_iter()
+                .map(|timer| {
+                    (
+                        timer.timer_id.clone(),
+                        RuntimeTimerRecord {
+                            timer_id: timer.timer_id,
+                            kind: timer.kind,
+                            delay_ms: timer.delay_ms,
+                            due_at_ms: timer.due_at_ms,
+                        },
+                    )
+                })
+                .collect();
+            if let Some(code) = snapshot.exit_code {
+                context.exit_code = Some(code);
+            }
+            for event in snapshot.events {
+                context.events.push_back(event);
+            }
+        }
+        if let Some(revision) = revision {
+            let state = self.runtime_state_report(context_id)?;
+            let context = self
+                .runtime_contexts
+                .get_mut(context_id)
+                .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+            for entry in changed_entries {
+                context.events.push_back(HostRuntimeEvent::WorkspaceChange {
+                    entry,
+                    revision,
+                    state: state.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn push_workspace_change_event(
+        &mut self,
+        context_id: &str,
+        entry: WorkspaceEntrySummary,
+        revision: u64,
+    ) -> RuntimeHostResult<()> {
+        let state = self.runtime_state_report(context_id)?;
         let context = self
             .runtime_contexts
             .get_mut(context_id)
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-        context.process.cwd = snapshot.cwd;
-        context.timers = snapshot
-            .timers
-            .into_iter()
-            .map(|timer| {
-                (
-                    timer.timer_id.clone(),
-                    RuntimeTimerRecord {
-                        timer_id: timer.timer_id,
-                        kind: timer.kind,
-                        delay_ms: timer.delay_ms,
-                        due_at_ms: timer.due_at_ms,
-                    },
-                )
-            })
-            .collect();
-        if let Some(code) = snapshot.exit_code {
-            context.exit_code = Some(code);
-        }
-        for event in snapshot.events {
-            context.events.push_back(event);
-        }
-        if let Some(revision) = revision {
-            for entry in changed_entries {
-                context
-                    .events
-                    .push_back(HostRuntimeEvent::WorkspaceChange { entry, revision });
-            }
-        }
-
+        context.events.push_back(HostRuntimeEvent::WorkspaceChange {
+            entry,
+            revision,
+            state,
+        });
         Ok(())
     }
 
