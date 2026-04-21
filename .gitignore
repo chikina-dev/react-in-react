@@ -13,6 +13,10 @@ dist-ssr
 target
 vendor
 public/runtime-host.wasm
+.bun-install
+.bun-tmp
+.tmp
+test-results
 *.local
 
 # Editor directories and files

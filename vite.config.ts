@@ -37,6 +37,10 @@ function syncRustRuntimeHostWasm(): void {
 }
 
 export default defineConfig({
+  test: {
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.spec.ts", "src/**/*.spec.tsx"],
+    exclude: ["sample/**", "e2e/**"],
+  },
   plugins: [
     {
       name: "runtime-host-wasm",
@@ -52,5 +56,8 @@ export default defineConfig({
     "*": "vp check --fix",
   },
   fmt: {},
-  lint: { options: { typeAware: true, typeCheck: true } },
+  lint: {
+    ignorePatterns: ["sample/**"],
+    options: { typeAware: true, typeCheck: true },
+  },
 });
