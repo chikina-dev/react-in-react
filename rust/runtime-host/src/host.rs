@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 
 use crate::engine::{
-    EngineAdapter, EngineBootstrapBridge, EngineBridgeSnapshot, EngineContextHandle, EngineContextSnapshot,
-    EngineContextSpec, EngineEvalMode, EngineEvalOutcome, EngineEvalRequest, EngineJobDrain,
-    EngineSessionHandle, EngineSessionSpec,
+    EngineAdapter, EngineBootstrapBridge, EngineBridgeSnapshot, EngineContextHandle,
+    EngineContextSnapshot, EngineContextSpec, EngineEvalMode, EngineEvalOutcome, EngineEvalRequest,
+    EngineJobDrain, EngineSessionHandle, EngineSessionSpec,
 };
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
@@ -13,13 +14,14 @@ use crate::protocol::{
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeLoadedModule,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeIdleReport,
+    HostRuntimeLaunchReport, HostRuntimePreviewLaunchReport, HostRuntimePreviewRequestReport,
+    HostRuntimeShutdownReport, HostRuntimeStartupReport, HostRuntimeLoadedModule,
     HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord, HostRuntimeModuleSource,
-    HostRuntimePort, HostRuntimePortProtocol,
-    HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer,
-    HostRuntimeTimerKind,
-    PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
-    RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
+    HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResolvedModule, HostRuntimeResponse,
+    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind, PreviewRequestHint,
+    PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind, RunPlan, RunRequest,
+    SessionSnapshot, SessionState, WorkspaceEntrySummary, WorkspaceFilePayload,
     WorkspaceFileSummary,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
@@ -75,10 +77,27 @@ struct PackageManifest {
     name: Option<String>,
     main: Option<String>,
     module: Option<String>,
+    exports: Option<JsonValue>,
+    imports: Option<JsonValue>,
+    browser: Option<JsonValue>,
     scripts: Option<BTreeMap<String, String>>,
     dependencies: Option<BTreeMap<String, String>>,
     #[serde(rename = "devDependencies")]
     dev_dependencies: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackageExportResolution {
+    Missing,
+    Blocked,
+    Target(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserMappingResolution {
+    NotMapped,
+    Blocked,
+    Target(String),
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +199,18 @@ impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
             } else {
                 normalize_posix_path(&format!("{base_dir}/{specifier}"))
             };
+            let requested = match resolve_package_relative_browser_path(
+                self.record,
+                importer,
+                &requested,
+                specifier,
+            )? {
+                BrowserMappingResolution::Target(mapped) => mapped,
+                BrowserMappingResolution::Blocked => {
+                    return Err(RuntimeHostError::ModuleNotFound(specifier.to_string()));
+                }
+                BrowserMappingResolution::NotMapped => requested,
+            };
             let resolved = resolve_workspace_module(self.record, &requested)?;
             return Ok(HostRuntimeResolvedModule {
                 requested_specifier: specifier.to_string(),
@@ -193,6 +224,23 @@ impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
             .filter(|value| value.starts_with("/workspace"))
             .map(dirname)
             .unwrap_or(&self.context.process.cwd);
+        if specifier.starts_with('#') {
+            let resolved = resolve_package_import_module(self.record, base_dir, specifier)?;
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: resolved.clone(),
+                kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+                format: detect_module_format(&resolved),
+            });
+        }
+        if let Some(resolved) = resolve_package_self_module(self.record, base_dir, specifier)? {
+            return Ok(HostRuntimeResolvedModule {
+                requested_specifier: specifier.to_string(),
+                resolved_specifier: resolved.clone(),
+                kind: crate::protocol::HostRuntimeModuleKind::Workspace,
+                format: detect_module_format(&resolved),
+            });
+        }
         let resolved = resolve_package_module(self.record, base_dir, specifier)?;
         Ok(HostRuntimeResolvedModule {
             requested_specifier: specifier.to_string(),
@@ -561,6 +609,370 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         Ok(drain)
     }
 
+    pub fn run_runtime_until_idle(
+        &mut self,
+        context_id: &str,
+        max_turns: usize,
+    ) -> RuntimeHostResult<HostRuntimeIdleReport> {
+        let max_turns = max_turns.max(1);
+        let mut turns = 0usize;
+        let mut drained_jobs = 0usize;
+        let mut fired_timers = 0usize;
+        let mut reached_turn_limit = false;
+
+        loop {
+            if turns >= max_turns {
+                reached_turn_limit = true;
+                break;
+            }
+
+            let snapshot = self.describe_engine_context(context_id)?;
+            if snapshot.pending_jobs > 0 {
+                let drain = self.drain_engine_jobs(context_id)?;
+                drained_jobs = drained_jobs.saturating_add(drain.drained_jobs);
+                turns = turns.saturating_add(1);
+
+                if drain.drained_jobs == 0 && drain.pending_jobs > 0 {
+                    reached_turn_limit = true;
+                    break;
+                }
+
+                continue;
+            }
+
+            let Some(elapsed_ms) = self.next_runtime_timer_elapsed(context_id)? else {
+                break;
+            };
+            let (_, timers, timer_drains) = self.advance_runtime_timers(context_id, elapsed_ms)?;
+            fired_timers = fired_timers.saturating_add(timers.len());
+            drained_jobs = drained_jobs.saturating_add(timer_drains.drained_jobs);
+            turns = turns.saturating_add(1);
+        }
+
+        let snapshot = self.describe_engine_context(context_id)?;
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+        Ok(HostRuntimeIdleReport {
+            turns,
+            drained_jobs,
+            fired_timers,
+            now_ms: context.clock_ms,
+            pending_jobs: snapshot.pending_jobs,
+            pending_timers: context.timers.len(),
+            exited: context.exit_code.is_some(),
+            exit_code: context.exit_code,
+            reached_turn_limit,
+        })
+    }
+
+    fn runtime_process_status(&self, context_id: &str) -> RuntimeHostResult<(bool, Option<i32>)> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        Ok((context.exit_code.is_some(), context.exit_code))
+    }
+
+    fn drain_runtime_events(&mut self, context_id: &str) -> RuntimeHostResult<Vec<HostRuntimeEvent>> {
+        let context = self
+            .runtime_contexts
+            .get_mut(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        Ok(context.events.drain(..).collect())
+    }
+
+    fn boot_runtime_engine(&mut self, context_id: &str) -> RuntimeHostResult<HostRuntimeEngineBoot> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let session = self
+            .sessions
+            .get(&context.session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
+        let bindings = build_runtime_bindings(context_id, &context, self.engine.descriptor());
+        let plan = build_runtime_bootstrap_plan(&bindings);
+        let loader_plan = self.describe_runtime_module_loader(context_id)?;
+        let import_plans = self.collect_runtime_boot_import_graph(context_id, &plan, &loader_plan)?;
+        let bridge = build_engine_bootstrap_bridge(session, &context);
+        let eval = self
+            .engine
+            .bootstrap(
+                &context.engine_context,
+                &plan,
+                &loader_plan,
+                &import_plans,
+                &bridge,
+            )
+            .map_err(RuntimeHostError::EngineFailure)?;
+        let drained = self
+            .engine
+            .drain_jobs(&context.engine_context)
+            .map_err(RuntimeHostError::EngineFailure)?;
+        self.sync_engine_bridge_state(context_id)?;
+
+        Ok(HostRuntimeEngineBoot {
+            plan,
+            loader_plan,
+            result_summary: eval.result_summary,
+            pending_jobs: eval.pending_jobs,
+            drained_jobs: drained.drained_jobs,
+        })
+    }
+
+    fn run_runtime_startup(
+        &mut self,
+        context_id: &str,
+        max_turns: usize,
+    ) -> RuntimeHostResult<HostRuntimeStartupReport> {
+        let boot = self.boot_runtime_engine(context_id)?;
+        let entry_import_plan = self.prepare_runtime_module_import(
+            context_id,
+            &boot.loader_plan.entry_module.requested_specifier,
+            None,
+        )?;
+        let idle = self.run_runtime_until_idle(context_id, max_turns)?;
+        let (exited, exit_code) = self.runtime_process_status(context_id)?;
+
+        Ok(HostRuntimeStartupReport {
+            boot,
+            entry_import_plan,
+            idle,
+            exited,
+            exit_code,
+        })
+    }
+
+    fn launch_runtime_preview(
+        &mut self,
+        context_id: &str,
+        max_turns: usize,
+        port: Option<u16>,
+    ) -> RuntimeHostResult<HostRuntimePreviewLaunchReport> {
+        let startup = self.run_runtime_startup(context_id, max_turns)?;
+
+        if startup.exited {
+            return Ok(HostRuntimePreviewLaunchReport {
+                startup,
+                server: None,
+                port: None,
+                root_request: None,
+                root_request_hint: None,
+                root_response_descriptor: None,
+            });
+        }
+
+        let server = match self.execute_runtime_command(
+            context_id,
+            HostRuntimeCommand::HttpServePreview { port },
+        )? {
+            HostRuntimeResponse::HttpServerListening { server } => server,
+            other => {
+                return Err(RuntimeHostError::EngineFailure(format!(
+                    "launch preview expected http server listening response, got {other:?}",
+                )));
+            }
+        };
+
+        let request = HostRuntimeHttpRequest {
+            port: server.port.port,
+            method: String::from("GET"),
+            relative_path: String::from("/"),
+            search: String::new(),
+        };
+
+        let (resolved_server, resolved_port, root_request_hint, root_response_descriptor) =
+            match self.execute_runtime_command(
+                context_id,
+                HostRuntimeCommand::HttpResolvePreview {
+                    request: request.clone(),
+                },
+            )? {
+                HostRuntimeResponse::PreviewRequestResolved {
+                    server,
+                    port,
+                    request: _,
+                    request_hint,
+                    response_descriptor,
+                } => (server, port, request_hint, response_descriptor),
+                other => {
+                    return Err(RuntimeHostError::EngineFailure(format!(
+                        "launch preview expected preview request resolved response, got {other:?}",
+                    )));
+                }
+            };
+
+        Ok(HostRuntimePreviewLaunchReport {
+            startup,
+            server: Some(resolved_server),
+            port: Some(resolved_port),
+            root_request: Some(request),
+            root_request_hint: Some(root_request_hint),
+            root_response_descriptor: Some(root_response_descriptor),
+        })
+    }
+
+    pub fn launch_runtime(
+        &mut self,
+        session_id: &str,
+        request: &RunRequest,
+        max_turns: usize,
+        port: Option<u16>,
+    ) -> RuntimeHostResult<HostRuntimeLaunchReport> {
+        let boot_summary = self.boot_summary();
+        let run_plan = self.plan_run(session_id, request)?;
+        let capabilities = self
+            .sessions
+            .get(session_id)
+            .map(|record| record.snapshot.capabilities.clone())
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.to_string()))?;
+        let runtime_context = self.create_runtime_context(session_id, request)?;
+        let context_id = runtime_context.context_id.clone();
+        let engine_context = self.describe_engine_context(&context_id)?;
+        let runtime_context_record = self
+            .runtime_contexts
+            .get(&context_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.clone()))?;
+        let bindings = build_runtime_bindings(&context_id, &runtime_context_record, self.engine.descriptor());
+        let bootstrap_plan = build_runtime_bootstrap_plan(&bindings);
+        let preview_launch = self.launch_runtime_preview(&context_id, max_turns, port)?;
+        let startup_logs = build_runtime_startup_logs(
+            &run_plan,
+            &context_id,
+            &capabilities,
+            &runtime_context_record,
+            &boot_summary,
+            &engine_context,
+            &bindings,
+            &bootstrap_plan,
+        );
+        let events = self.drain_runtime_events(&context_id)?;
+
+        Ok(HostRuntimeLaunchReport {
+            boot_summary,
+            run_plan,
+            runtime_context,
+            engine_context,
+            bindings,
+            bootstrap_plan,
+            preview_launch,
+            startup_logs,
+            events,
+        })
+    }
+
+    fn resolve_runtime_preview_request(
+        &self,
+        context_id: &str,
+        request: HostRuntimeHttpRequest,
+    ) -> RuntimeHostResult<HostRuntimePreviewRequestReport> {
+        let (session_id, server) = {
+            let context = self
+                .runtime_contexts
+                .get(context_id)
+                .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+            let server = context
+                .http_servers
+                .get(&request.port)
+                .cloned()
+                .ok_or(RuntimeHostError::HttpServerNotFound(request.port))?;
+            (context.session_id.clone(), server)
+        };
+        let request_hint = self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
+        let response_descriptor = describe_preview_response(&request_hint, request.method.as_str());
+        let hydration_paths = if !response_descriptor.hydrate_paths.is_empty() {
+            response_descriptor.hydrate_paths.clone()
+        } else {
+            request_hint.hydrate_paths.clone()
+        };
+        let hydrated_files = {
+            let record = self
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.clone()))?;
+            hydration_paths
+                .iter()
+                .filter_map(|path| record.vfs.read(path))
+                .map(|file| WorkspaceFilePayload {
+                    path: file.path.clone(),
+                    size: file.bytes.len(),
+                    is_text: file.is_text,
+                    text_content: if file.is_text {
+                        Some(String::from_utf8_lossy(&file.bytes).into_owned())
+                    } else {
+                        None
+                    },
+                    bytes: file.bytes.clone(),
+                })
+                .collect()
+        };
+
+        Ok(HostRuntimePreviewRequestReport {
+            server: runtime_http_server_view(&server),
+            port: runtime_port_view(&server.port),
+            request,
+            request_hint,
+            response_descriptor,
+            hydration_paths,
+            hydrated_files,
+        })
+    }
+
+    fn shutdown_runtime_context(
+        &mut self,
+        context_id: &str,
+        code: i32,
+    ) -> RuntimeHostResult<HostRuntimeShutdownReport> {
+        let mut context = self
+            .runtime_contexts
+            .remove(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+
+        let closed_servers = context
+            .http_servers
+            .values()
+            .map(runtime_http_server_view)
+            .collect::<Vec<_>>();
+        let closed_ports = context
+            .ports
+            .values()
+            .map(runtime_port_view)
+            .collect::<Vec<_>>();
+        let final_exit_code = context.exit_code.unwrap_or(code);
+        context.exit_code = Some(final_exit_code);
+
+        for port in context.ports.keys().copied().collect::<Vec<_>>() {
+            context
+                .events
+                .push_back(HostRuntimeEvent::PortClose { port });
+        }
+        if !context
+            .events
+            .iter()
+            .any(|event| matches!(event, HostRuntimeEvent::ProcessExit { .. }))
+        {
+            context.events.push_back(HostRuntimeEvent::ProcessExit {
+                code: final_exit_code,
+            });
+        }
+
+        self.engine.dispose_context(&context.engine_context);
+
+        Ok(HostRuntimeShutdownReport {
+            context_id: context_id.to_string(),
+            session_id: context.session_id,
+            exit_code: final_exit_code,
+            closed_ports,
+            closed_servers,
+            events: context.events.drain(..).collect(),
+        })
+    }
+
     pub fn interrupt_engine_context(
         &mut self,
         context_id: &str,
@@ -659,7 +1071,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         context_id: &str,
         resolved_specifier: &str,
     ) -> RuntimeHostResult<HostRuntimeLoadedModule> {
-        self.runtime_module_loader(context_id)?.load(resolved_specifier)
+        self.runtime_module_loader(context_id)?
+            .load(resolved_specifier)
     }
 
     pub fn describe_runtime_module_loader(
@@ -693,10 +1106,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         plan: &HostRuntimeBootstrapPlan,
         loader_plan: &HostRuntimeModuleLoaderPlan,
     ) -> RuntimeHostResult<Vec<HostRuntimeModuleImportPlan>> {
-        let entry_module = self.load_runtime_module(
-            context_id,
-            &loader_plan.entry_module.resolved_specifier,
-        )?;
+        let entry_module =
+            self.load_runtime_module(context_id, &loader_plan.entry_module.resolved_specifier)?;
         let mut imports = Vec::new();
         let mut queue = VecDeque::from([HostRuntimeModuleImportPlan {
             request_specifier: loader_plan.entry_module.requested_specifier.clone(),
@@ -715,12 +1126,13 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             let loaded_module = import_plan.loaded_module.clone();
             imports.push(import_plan);
 
-            for specifier in collect_module_dependency_specifiers(
-                &loaded_module.source,
-                &loaded_module.format,
-            ) {
-                let child = if let Some(module) =
-                    plan.modules.iter().find(|module| module.specifier == specifier)
+            for specifier in
+                collect_module_dependency_specifiers(&loaded_module.source, &loaded_module.format)
+            {
+                let child = if let Some(module) = plan
+                    .modules
+                    .iter()
+                    .find(|module| module.specifier == specifier)
                 {
                     HostRuntimeModuleImportPlan {
                         request_specifier: specifier.clone(),
@@ -1044,46 +1456,29 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 self.describe_runtime_module_loader(context_id)?,
             )),
             HostRuntimeCommand::BootEngine => {
-                let context = self
-                    .runtime_contexts
-                    .get(context_id)
-                    .cloned()
-                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-                let session = self
-                    .sessions
-                    .get(&context.session_id)
-                    .ok_or_else(|| RuntimeHostError::SessionNotFound(context.session_id.clone()))?;
-                let bindings =
-                    build_runtime_bindings(context_id, &context, self.engine.descriptor());
-                let plan = build_runtime_bootstrap_plan(&bindings);
-                let loader_plan = self.describe_runtime_module_loader(context_id)?;
-                let import_plans =
-                    self.collect_runtime_boot_import_graph(context_id, &plan, &loader_plan)?;
-                let bridge = build_engine_bootstrap_bridge(session, &context);
-                let eval = self
-                    .engine
-                    .bootstrap(
-                        &context.engine_context,
-                        &plan,
-                        &loader_plan,
-                        &import_plans,
-                        &bridge,
-                    )
-                    .map_err(RuntimeHostError::EngineFailure)?;
-                let drained = self
-                    .engine
-                    .drain_jobs(&context.engine_context)
-                    .map_err(RuntimeHostError::EngineFailure)?;
-                self.sync_engine_bridge_state(context_id)?;
-
-                Ok(HostRuntimeResponse::EngineBoot(HostRuntimeEngineBoot {
-                    plan,
-                    loader_plan,
-                    result_summary: eval.result_summary,
-                    pending_jobs: eval.pending_jobs,
-                    drained_jobs: drained.drained_jobs,
-                }))
+                Ok(HostRuntimeResponse::EngineBoot(self.boot_runtime_engine(context_id)?))
             }
+            HostRuntimeCommand::Startup { max_turns } => Ok(
+                HostRuntimeResponse::StartupReport(
+                    self.run_runtime_startup(context_id, max_turns)?,
+                ),
+            ),
+            HostRuntimeCommand::LaunchPreview { max_turns, port } => Ok(
+                HostRuntimeResponse::PreviewLaunchReport(
+                    self.launch_runtime_preview(context_id, max_turns, port)?,
+                ),
+            ),
+            HostRuntimeCommand::PreviewRequest { request } => Ok(
+                HostRuntimeResponse::PreviewRequestReport(
+                    self.resolve_runtime_preview_request(context_id, request)?,
+                ),
+            ),
+            HostRuntimeCommand::Shutdown { code } => Ok(HostRuntimeResponse::ShutdownReport(
+                self.shutdown_runtime_context(context_id, code)?,
+            )),
+            HostRuntimeCommand::RunUntilIdle { max_turns } => Ok(HostRuntimeResponse::IdleReport(
+                self.run_runtime_until_idle(context_id, max_turns)?,
+            )),
             HostRuntimeCommand::DescribeModules => {
                 let modules = self.list_engine_modules(context_id)?;
                 Ok(HostRuntimeResponse::ModuleList { modules })
@@ -1092,13 +1487,23 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 let module = self.read_engine_module(context_id, &specifier)?;
                 Ok(HostRuntimeResponse::ModuleSource(module))
             }
-            HostRuntimeCommand::PrepareModuleImport { specifier, importer } => {
-                let plan =
-                    self.prepare_runtime_module_import(context_id, &specifier, importer.as_deref())?;
+            HostRuntimeCommand::PrepareModuleImport {
+                specifier,
+                importer,
+            } => {
+                let plan = self.prepare_runtime_module_import(
+                    context_id,
+                    &specifier,
+                    importer.as_deref(),
+                )?;
                 Ok(HostRuntimeResponse::ModuleImportPlan { plan })
             }
-            HostRuntimeCommand::ResolveModule { specifier, importer } => {
-                let module = self.resolve_runtime_module(context_id, importer.as_deref(), &specifier)?;
+            HostRuntimeCommand::ResolveModule {
+                specifier,
+                importer,
+            } => {
+                let module =
+                    self.resolve_runtime_module(context_id, importer.as_deref(), &specifier)?;
                 Ok(HostRuntimeResponse::ModuleResolved { module })
             }
             HostRuntimeCommand::LoadModule { resolved_specifier } => {
@@ -1144,13 +1549,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 Ok(HostRuntimeResponse::EventQueued { queue_len })
             }
             HostRuntimeCommand::DrainEvents => {
-                let events = {
-                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
-                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
-                    })?;
-                    context.events.drain(..).collect::<Vec<_>>()
-                };
-
+                let events = self.drain_runtime_events(context_id)?;
                 Ok(HostRuntimeResponse::RuntimeEvents { events })
             }
             HostRuntimeCommand::PortListen { port, protocol } => {
@@ -1326,15 +1725,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 })
             }
             HostRuntimeCommand::TimerAdvance { elapsed_ms } => {
-                let (now_ms, timers) = {
-                    let context = self.runtime_contexts.get_mut(context_id).ok_or_else(|| {
-                        RuntimeHostError::RuntimeContextNotFound(context_id.into())
-                    })?;
-                    context.clock_ms = context.clock_ms.saturating_add(elapsed_ms);
-                    let now_ms = context.clock_ms;
-                    let timers = advance_runtime_timers(context, now_ms);
-                    (now_ms, timers)
-                };
+                let (now_ms, timers, _) = self.advance_runtime_timers(context_id, elapsed_ms)?;
 
                 Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
             }
@@ -1348,15 +1739,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 Ok(HostRuntimeResponse::ProcessInfo(context.process))
             }
             HostRuntimeCommand::ProcessStatus => {
-                let context = self
-                    .runtime_contexts
-                    .get(context_id)
-                    .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
-
-                Ok(HostRuntimeResponse::ProcessStatus {
-                    exited: context.exit_code.is_some(),
-                    exit_code: context.exit_code,
-                })
+                let (exited, exit_code) = self.runtime_process_status(context_id)?;
+                Ok(HostRuntimeResponse::ProcessStatus { exited, exit_code })
             }
             HostRuntimeCommand::ProcessCwd => {
                 let context = self
@@ -1499,6 +1883,50 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         }
     }
 
+    fn next_runtime_timer_elapsed(&self, context_id: &str) -> RuntimeHostResult<Option<u64>> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let Some(next_due_at_ms) = context.timers.values().map(|timer| timer.due_at_ms).min()
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(next_due_at_ms.saturating_sub(context.clock_ms)))
+    }
+
+    fn advance_runtime_timers(
+        &mut self,
+        context_id: &str,
+        elapsed_ms: u64,
+    ) -> RuntimeHostResult<(u64, Vec<HostRuntimeTimer>, EngineJobDrain)> {
+        let (engine_context, now_ms, timers) = {
+            let context = self
+                .runtime_contexts
+                .get_mut(context_id)
+                .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+            context.clock_ms = context.clock_ms.saturating_add(elapsed_ms);
+            let now_ms = context.clock_ms;
+            let timers = advance_runtime_timers(context, now_ms);
+            (context.engine_context.clone(), now_ms, timers)
+        };
+        let timer_ids = timers
+            .iter()
+            .map(|timer| timer.timer_id.clone())
+            .collect::<Vec<_>>();
+        self.engine
+            .fire_timers(&engine_context, now_ms, &timer_ids)
+            .map_err(RuntimeHostError::EngineFailure)?;
+        let drain = self
+            .engine
+            .drain_jobs(&engine_context)
+            .map_err(RuntimeHostError::EngineFailure)?;
+        self.sync_engine_bridge_state(context_id)?;
+
+        Ok((now_ms, timers, drain))
+    }
+
     fn sync_engine_bridge_state(&mut self, context_id: &str) -> RuntimeHostResult<()> {
         let (session_id, engine_context) = {
             let context = self
@@ -1528,6 +1956,27 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .get_mut(context_id)
             .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
         context.process.cwd = snapshot.cwd;
+        context.timers = snapshot
+            .timers
+            .into_iter()
+            .map(|timer| {
+                (
+                    timer.timer_id.clone(),
+                    RuntimeTimerRecord {
+                        timer_id: timer.timer_id,
+                        kind: timer.kind,
+                        delay_ms: timer.delay_ms,
+                        due_at_ms: timer.due_at_ms,
+                    },
+                )
+            })
+            .collect();
+        if let Some(code) = snapshot.exit_code {
+            context.exit_code = Some(code);
+        }
+        for event in snapshot.events {
+            context.events.push_back(event);
+        }
         if let Some(revision) = revision {
             for entry in changed_entries {
                 context
@@ -1785,6 +2234,70 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
     }
 }
 
+fn build_runtime_startup_logs(
+    run_plan: &RunPlan,
+    context_id: &str,
+    capabilities: &CapabilityMatrix,
+    context: &RuntimeContextRecord,
+    boot_summary: &HostBootstrapSummary,
+    engine_context: &crate::engine::EngineContextSnapshot,
+    bindings: &HostRuntimeBindings,
+    bootstrap_plan: &HostRuntimeBootstrapPlan,
+) -> Vec<String> {
+    let mut logs = vec![format!(
+        "[host] engine={} interrupts={} module-loader={}",
+        boot_summary.engine_name, boot_summary.supports_interrupts, boot_summary.supports_module_loader
+    )];
+
+    logs.push(format!(
+        "[plan] cwd={} entry={} env={}",
+        run_plan.cwd, run_plan.entrypoint, run_plan.env_count
+    ));
+    logs.push(format!(
+        "[process] exec={} cwd={} argv={}",
+        context.process.exec_path,
+        context.process.cwd,
+        context.process.argv.join(" ")
+    ));
+    logs.push(format!(
+        "[engine-context] state={} pending-jobs={} entry={}",
+        match engine_context.state {
+            crate::engine::EngineContextState::Booted => "booted",
+            crate::engine::EngineContextState::Ready => "ready",
+            crate::engine::EngineContextState::Disposed => "disposed",
+        },
+        engine_context.pending_jobs,
+        engine_context.entrypoint,
+    ));
+    logs.push(format!(
+        "[bindings] globals={} builtins={}",
+        bindings.globals.join(","),
+        bindings
+            .builtins
+            .iter()
+            .map(|builtin| builtin.name.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    ));
+    logs.push(format!(
+        "[bootstrap] bootstrap={} modules={}",
+        bootstrap_plan.bootstrap_specifier,
+        bootstrap_plan
+            .modules
+            .iter()
+            .map(|module| module.specifier.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    ));
+    logs.push(format!("[context] id={}", context_id));
+    logs.push(format!(
+        "[detect] react={} vite={}",
+        capabilities.detected_react, capabilities.detected_vite
+    ));
+
+    logs
+}
+
 fn runtime_timer_view(timer: &RuntimeTimerRecord) -> HostRuntimeTimer {
     HostRuntimeTimer {
         timer_id: timer.timer_id.clone(),
@@ -1809,6 +2322,8 @@ fn build_runtime_bindings(
             "Buffer".into(),
             "setTimeout".into(),
             "clearTimeout".into(),
+            "setInterval".into(),
+            "clearInterval".into(),
             "__runtime".into(),
         ],
         builtins: vec![
@@ -1838,7 +2353,12 @@ fn build_runtime_bindings(
             },
             HostRuntimeBuiltinSpec {
                 name: "timers".into(),
-                globals: vec!["setTimeout".into(), "clearTimeout".into()],
+                globals: vec![
+                    "setTimeout".into(),
+                    "clearTimeout".into(),
+                    "setInterval".into(),
+                    "clearInterval".into(),
+                ],
                 modules: vec!["timers".into(), "node:timers".into()],
                 command_prefixes: vec!["timers".into()],
             },
@@ -1955,15 +2475,65 @@ export default { Buffer };
             HostRuntimeBootstrapModule {
                 specifier: "node:timers".into(),
                 source: r#"const runtime = globalThis.__runtime;
+if (!runtime.__timerState) {
+  runtime.__timerState = {
+    nextCallbackId: 1,
+    callbackIdsByTimerId: new Map(),
+    callbacks: new Map(),
+  };
+}
+if (typeof runtime.fireTimer !== "function") {
+  runtime.fireTimer = (callbackId, repeat = false) => {
+    const callback = runtime.__timerState.callbacks.get(callbackId);
+    if (typeof callback === "function") {
+      callback();
+    }
+    if (!repeat) {
+      runtime.__timerState.callbacks.delete(callbackId);
+    }
+    return runtime.__timerState.callbacks.has(callbackId);
+  };
+}
 function invoke(kind, payload = {}) {
   if (!runtime || typeof runtime.invoke !== "function") {
     throw new Error("runtime bridge is not attached");
   }
   return runtime.invoke(kind, payload);
 }
-export const setTimeout = (callback, delay = 0) => invoke("timers.schedule", { delayMs: delay, repeat: false, callback });
-export const clearTimeout = (timerId) => invoke("timers.clear", { timerId });
-export default { setTimeout, clearTimeout };
+export const setTimeout = (callback, delay = 0) => {
+  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
+  runtime.__timerState.callbacks.set(callbackId, callback);
+  const timerId = invoke("timers.schedule", {
+    delayMs: delay,
+    repeat: false,
+    callback,
+    callbackId,
+  });
+  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
+  return timerId;
+};
+export const setInterval = (callback, delay = 0) => {
+  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
+  runtime.__timerState.callbacks.set(callbackId, callback);
+  const timerId = invoke("timers.schedule", {
+    delayMs: delay,
+    repeat: true,
+    callback,
+    callbackId,
+  });
+  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
+  return timerId;
+};
+export const clearTimeout = (timerId) => {
+  const callbackId = runtime.__timerState.callbackIdsByTimerId.get(timerId);
+  if (callbackId) {
+    runtime.__timerState.callbackIdsByTimerId.delete(timerId);
+    runtime.__timerState.callbacks.delete(callbackId);
+  }
+  return invoke("timers.clear", { timerId });
+};
+export const clearInterval = clearTimeout;
+export default { setTimeout, clearTimeout, setInterval, clearInterval };
 "#
                 .into(),
             },
@@ -1993,13 +2563,15 @@ export default consoleValue;
 	                    r#"import process from "node:process";
 	import {{ Buffer }} from "node:buffer";
 	import consoleValue from "node:console";
-	import {{ setTimeout, clearTimeout }} from "node:timers";
+	import {{ setTimeout, clearTimeout, setInterval, clearInterval }} from "node:timers";
 
 globalThis.process = process;
 	globalThis.Buffer = Buffer;
 	globalThis.console = consoleValue;
 	globalThis.setTimeout = setTimeout;
 	globalThis.clearTimeout = clearTimeout;
+	globalThis.setInterval = setInterval;
+	globalThis.clearInterval = clearInterval;
 	
 	const entryPromise = import({entrypoint_literal});
 	
@@ -2023,7 +2595,14 @@ fn collect_module_dependency_specifiers(
     let mut specifiers = Vec::new();
     match format {
         crate::protocol::HostRuntimeModuleFormat::Module => {
-            for marker in [" from \"", " from '", "import(\"", "import('", "export * from \"", "export * from '"] {
+            for marker in [
+                " from \"",
+                " from '",
+                "import(\"",
+                "import('",
+                "export * from \"",
+                "export * from '",
+            ] {
                 collect_string_literals_after_marker(source, marker, &mut specifiers);
             }
             for marker in ["import \"", "import '"] {
@@ -2042,11 +2621,7 @@ fn collect_module_dependency_specifiers(
     specifiers
 }
 
-fn collect_string_literals_after_marker(
-    source: &str,
-    marker: &str,
-    output: &mut Vec<String>,
-) {
+fn collect_string_literals_after_marker(source: &str, marker: &str, output: &mut Vec<String>) {
     let mut search_start = 0usize;
     while let Some(offset) = source[search_start..].find(marker) {
         let start = search_start + offset + marker.len();
@@ -2346,9 +2921,10 @@ fn advance_runtime_timers(
                 context.timers.remove(&timer_id);
             }
             HostRuntimeTimerKind::Interval => {
-                let mut next_due_at = timer.due_at_ms;
                 let step = timer.delay_ms.max(1);
+                let mut next_due_at = timer.due_at_ms.saturating_add(step);
                 while next_due_at <= now_ms {
+                    fired.push(runtime_timer_view(&timer));
                     next_due_at = next_due_at.saturating_add(step);
                 }
 
@@ -2478,27 +3054,420 @@ fn resolve_package_module(
             .vfs
             .read(&package_json_path)
             .and_then(|file| serde_json::from_slice::<PackageManifest>(&file.bytes).ok());
-
-        if let Some(subpath) = subpath.as_deref() {
-            let requested = normalize_posix_path(&format!("{package_root}/{subpath}"));
-            if let Ok(resolved) = resolve_workspace_module(record, &requested) {
-                return Ok(resolved);
-            }
-        } else if let Some(manifest) = manifest {
-            if let Some(entry) = manifest.module.or(manifest.main) {
-                let requested = normalize_posix_path(&format!("{package_root}/{entry}"));
-                if let Ok(resolved) = resolve_workspace_module(record, &requested) {
-                    return Ok(resolved);
-                }
-            }
-        }
-
-        if let Ok(resolved) = resolve_workspace_module(record, &format!("{package_root}/index")) {
+        if let Ok(resolved) = resolve_package_from_root(
+            record,
+            importer_dir,
+            &package_root,
+            manifest.as_ref(),
+            subpath.as_deref(),
+            specifier,
+        ) {
             return Ok(resolved);
         }
     }
 
     Err(RuntimeHostError::ModuleNotFound(specifier.to_string()))
+}
+
+fn resolve_package_import_module(
+    record: &SessionRecord,
+    importer_dir: &str,
+    specifier: &str,
+) -> RuntimeHostResult<String> {
+    let Some(package_root) = resolve_nearest_package_root(record, importer_dir) else {
+        return Err(RuntimeHostError::ModuleNotFound(specifier.to_string()));
+    };
+    let Some(manifest) = read_package_manifest_at(record, &package_root) else {
+        return Err(RuntimeHostError::ModuleNotFound(specifier.to_string()));
+    };
+    let Some(imports_field) = manifest.imports.as_ref() else {
+        return Err(RuntimeHostError::ModuleNotFound(specifier.to_string()));
+    };
+
+    match resolve_package_export_target(imports_field, specifier) {
+        PackageExportResolution::Target(target) => {
+            resolve_package_export_specifier(record, importer_dir, &package_root, &target)
+        }
+        PackageExportResolution::Blocked | PackageExportResolution::Missing => {
+            Err(RuntimeHostError::ModuleNotFound(specifier.to_string()))
+        }
+    }
+}
+
+fn resolve_package_self_module(
+    record: &SessionRecord,
+    importer_dir: &str,
+    specifier: &str,
+) -> RuntimeHostResult<Option<String>> {
+    let Some(package_root) = resolve_nearest_package_root(record, importer_dir) else {
+        return Ok(None);
+    };
+    let Some(manifest) = read_package_manifest_at(record, &package_root) else {
+        return Ok(None);
+    };
+    let Some(package_name) = manifest.name.as_deref() else {
+        return Ok(None);
+    };
+
+    if specifier != package_name && !specifier.starts_with(&format!("{package_name}/")) {
+        return Ok(None);
+    }
+
+    let remainder = specifier
+        .strip_prefix(package_name)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let resolved = resolve_package_from_root(
+        record,
+        importer_dir,
+        &package_root,
+        Some(&manifest),
+        if remainder.is_empty() {
+            None
+        } else {
+            Some(remainder)
+        },
+        specifier,
+    )?;
+    Ok(Some(resolved))
+}
+
+fn resolve_package_from_root(
+    record: &SessionRecord,
+    importer_dir: &str,
+    package_root: &str,
+    manifest: Option<&PackageManifest>,
+    remainder: Option<&str>,
+    requested_specifier: &str,
+) -> RuntimeHostResult<String> {
+    if let Some(manifest) = manifest {
+        if let Some(exports_field) = manifest.exports.as_ref() {
+            let export_subpath = remainder
+                .map(|path| format!("./{path}"))
+                .unwrap_or_else(|| ".".to_string());
+            match resolve_package_export_target(exports_field, &export_subpath) {
+                PackageExportResolution::Target(target) => {
+                    return resolve_package_export_specifier(
+                        record,
+                        importer_dir,
+                        package_root,
+                        &target,
+                    );
+                }
+                PackageExportResolution::Blocked | PackageExportResolution::Missing => {
+                    return Err(RuntimeHostError::ModuleNotFound(
+                        requested_specifier.to_string(),
+                    ));
+                }
+            }
+        }
+
+        if remainder.is_none() {
+            if let Some(browser_entry) = manifest.browser.as_ref().and_then(JsonValue::as_str) {
+                return resolve_package_export_specifier(
+                    record,
+                    importer_dir,
+                    package_root,
+                    browser_entry,
+                );
+            }
+        } else if let Some(remainder) = remainder {
+            match resolve_package_browser_subpath(manifest, package_root, remainder) {
+                BrowserMappingResolution::Target(target) => {
+                    return resolve_workspace_module(record, &target);
+                }
+                BrowserMappingResolution::Blocked => {
+                    return Err(RuntimeHostError::ModuleNotFound(
+                        requested_specifier.to_string(),
+                    ));
+                }
+                BrowserMappingResolution::NotMapped => {}
+            }
+        }
+    }
+
+    if let Some(remainder) = remainder {
+        let requested = normalize_posix_path(&format!("{package_root}/{remainder}"));
+        if let Ok(resolved) = resolve_workspace_module(record, &requested) {
+            return Ok(resolved);
+        }
+    } else if let Some(manifest) = manifest {
+        if let Some(entry) = manifest.module.as_ref().or(manifest.main.as_ref()) {
+            let requested = match resolve_legacy_browser_entry(manifest, package_root, entry) {
+                BrowserMappingResolution::Target(target) => target,
+                BrowserMappingResolution::Blocked => {
+                    return Err(RuntimeHostError::ModuleNotFound(
+                        requested_specifier.to_string(),
+                    ));
+                }
+                BrowserMappingResolution::NotMapped => {
+                    normalize_posix_path(&format!("{package_root}/{entry}"))
+                }
+            };
+            if let Ok(resolved) = resolve_workspace_module(record, &requested) {
+                return Ok(resolved);
+            }
+        }
+    }
+
+    if let Ok(resolved) = resolve_workspace_module(record, &format!("{package_root}/index")) {
+        return Ok(resolved);
+    }
+
+    Err(RuntimeHostError::ModuleNotFound(
+        requested_specifier.to_string(),
+    ))
+}
+
+fn resolve_package_export_specifier(
+    record: &SessionRecord,
+    importer_dir: &str,
+    package_root: &str,
+    target: &str,
+) -> RuntimeHostResult<String> {
+    if target.starts_with('.') {
+        return resolve_workspace_module(
+            record,
+            &normalize_posix_path(&format!("{package_root}/{target}")),
+        );
+    }
+
+    if target.starts_with('/') {
+        return resolve_workspace_module(record, target);
+    }
+
+    resolve_package_module(record, importer_dir, target)
+}
+
+fn resolve_package_relative_browser_path(
+    record: &SessionRecord,
+    importer: Option<&str>,
+    requested_path: &str,
+    requested_specifier: &str,
+) -> RuntimeHostResult<BrowserMappingResolution> {
+    let Some(importer_path) = importer.filter(|value| value.starts_with("/workspace")) else {
+        return Ok(BrowserMappingResolution::NotMapped);
+    };
+    let Some(package_root) = resolve_nearest_package_root(record, dirname(importer_path)) else {
+        return Ok(BrowserMappingResolution::NotMapped);
+    };
+    if !requested_path.starts_with(&format!("{package_root}/")) && requested_path != package_root {
+        return Ok(BrowserMappingResolution::NotMapped);
+    }
+    let Some(manifest) = read_package_manifest_at(record, &package_root) else {
+        return Ok(BrowserMappingResolution::NotMapped);
+    };
+
+    Ok(resolve_package_browser_path(
+        &manifest,
+        &package_root,
+        requested_path,
+        requested_specifier,
+    ))
+}
+
+fn resolve_package_browser_subpath(
+    manifest: &PackageManifest,
+    package_root: &str,
+    remainder: &str,
+) -> BrowserMappingResolution {
+    let requested = normalize_posix_path(&format!("{package_root}/{remainder}"));
+    resolve_package_browser_path(manifest, package_root, &requested, remainder)
+}
+
+fn resolve_legacy_browser_entry(
+    manifest: &PackageManifest,
+    package_root: &str,
+    entry: &str,
+) -> BrowserMappingResolution {
+    let candidate = normalize_posix_path(&format!("{package_root}/{entry}"));
+    resolve_package_browser_path(manifest, package_root, &candidate, entry)
+}
+
+fn resolve_package_browser_path(
+    manifest: &PackageManifest,
+    package_root: &str,
+    requested_path: &str,
+    fallback: &str,
+) -> BrowserMappingResolution {
+    let Some(browser_field) = manifest.browser.as_ref().and_then(JsonValue::as_object) else {
+        return BrowserMappingResolution::NotMapped;
+    };
+    let Some(browser_subpath) = to_package_browser_subpath(requested_path, package_root) else {
+        return BrowserMappingResolution::NotMapped;
+    };
+    match resolve_browser_object_mapping(browser_field, &browser_subpath) {
+        BrowserMappingResolution::Target(mapped) => {
+            if mapped.starts_with('.') {
+                BrowserMappingResolution::Target(normalize_posix_path(&format!(
+                    "{package_root}/{mapped}"
+                )))
+            } else if mapped.starts_with('/') {
+                BrowserMappingResolution::Target(normalize_posix_path(&mapped))
+            } else {
+                BrowserMappingResolution::Target(normalize_posix_path(&format!(
+                    "{package_root}/{fallback}"
+                )))
+            }
+        }
+        other => other,
+    }
+}
+
+fn resolve_browser_object_mapping(
+    browser_field: &serde_json::Map<String, JsonValue>,
+    subpath: &str,
+) -> BrowserMappingResolution {
+    for candidate in build_browser_subpath_candidates(subpath) {
+        let Some(mapped) = browser_field.get(&candidate) else {
+            continue;
+        };
+
+        return match mapped {
+            JsonValue::String(value) if !value.is_empty() => {
+                BrowserMappingResolution::Target(value.clone())
+            }
+            JsonValue::Bool(false) => BrowserMappingResolution::Blocked,
+            _ => BrowserMappingResolution::NotMapped,
+        };
+    }
+
+    BrowserMappingResolution::NotMapped
+}
+
+fn build_browser_subpath_candidates(subpath: &str) -> Vec<String> {
+    let normalized = normalize_browser_subpath(subpath);
+    if let Some(stripped) = normalized.strip_prefix("./") {
+        vec![normalized.clone(), stripped.to_string()]
+    } else {
+        vec![normalized]
+    }
+}
+
+fn normalize_browser_subpath(subpath: &str) -> String {
+    if subpath == "." {
+        ".".into()
+    } else if subpath.starts_with("./") {
+        subpath.to_string()
+    } else {
+        format!("./{}", subpath.trim_start_matches('/'))
+    }
+}
+
+fn to_package_browser_subpath(requested_path: &str, package_root: &str) -> Option<String> {
+    if requested_path == package_root {
+        return Some(".".into());
+    }
+    if !requested_path.starts_with(&format!("{package_root}/")) {
+        return None;
+    }
+    Some(format!(".{}", &requested_path[package_root.len()..]))
+}
+
+fn resolve_package_export_target(
+    exports_field: &JsonValue,
+    subpath: &str,
+) -> PackageExportResolution {
+    match exports_field {
+        JsonValue::String(value) => {
+            if subpath == "." {
+                PackageExportResolution::Target(value.clone())
+            } else {
+                PackageExportResolution::Missing
+            }
+        }
+        JsonValue::Null => {
+            if subpath == "." {
+                PackageExportResolution::Blocked
+            } else {
+                PackageExportResolution::Missing
+            }
+        }
+        JsonValue::Object(map) => {
+            if has_conditional_export_keys(map) {
+                if subpath == "." {
+                    resolve_conditional_export_value(exports_field)
+                } else {
+                    PackageExportResolution::Missing
+                }
+            } else {
+                if let Some(value) = map.get(subpath) {
+                    let resolved = resolve_conditional_export_value(value);
+                    if !matches!(resolved, PackageExportResolution::Missing) {
+                        return resolved;
+                    }
+                }
+
+                if subpath == "." {
+                    if let Some(value) = map.get(".") {
+                        let resolved = resolve_conditional_export_value(value);
+                        if !matches!(resolved, PackageExportResolution::Missing) {
+                            return resolved;
+                        }
+                    }
+                }
+
+                resolve_wildcard_export_target(map, subpath)
+            }
+        }
+        _ => PackageExportResolution::Missing,
+    }
+}
+
+fn resolve_conditional_export_value(value: &JsonValue) -> PackageExportResolution {
+    match value {
+        JsonValue::String(target) => PackageExportResolution::Target(target.clone()),
+        JsonValue::Null => PackageExportResolution::Blocked,
+        JsonValue::Object(map) => {
+            for condition in ["browser", "import", "module", "default", "require"] {
+                if let Some(nested) = map.get(condition) {
+                    let resolved = resolve_conditional_export_value(nested);
+                    if !matches!(resolved, PackageExportResolution::Missing) {
+                        return resolved;
+                    }
+                }
+            }
+            PackageExportResolution::Missing
+        }
+        _ => PackageExportResolution::Missing,
+    }
+}
+
+fn resolve_wildcard_export_target(
+    exports_field: &serde_json::Map<String, JsonValue>,
+    subpath: &str,
+) -> PackageExportResolution {
+    for (key, value) in exports_field {
+        if !key.contains('*') {
+            continue;
+        }
+
+        let mut parts = key.splitn(2, '*');
+        let prefix = parts.next().unwrap_or_default();
+        let suffix = parts.next().unwrap_or_default();
+
+        if !subpath.starts_with(prefix) || !subpath.ends_with(suffix) {
+            continue;
+        }
+
+        let matched = &subpath[prefix.len()..subpath.len().saturating_sub(suffix.len())];
+        match resolve_conditional_export_value(value) {
+            PackageExportResolution::Target(target) => {
+                let replaced = target.replace('*', matched);
+                return PackageExportResolution::Target(replaced);
+            }
+            PackageExportResolution::Blocked => return PackageExportResolution::Blocked,
+            PackageExportResolution::Missing => continue,
+        }
+    }
+
+    PackageExportResolution::Missing
+}
+
+fn has_conditional_export_keys(map: &serde_json::Map<String, JsonValue>) -> bool {
+    ["browser", "import", "module", "default", "require"]
+        .iter()
+        .any(|key| map.contains_key(*key))
 }
 
 fn workspace_module_candidates(requested: &str) -> Vec<String> {
@@ -2540,6 +3509,33 @@ fn split_package_specifier(specifier: &str) -> (String, Option<String>) {
     (package_name, subpath)
 }
 
+fn resolve_nearest_package_root(record: &SessionRecord, importer_dir: &str) -> Option<String> {
+    let mut current = normalize_posix_path(importer_dir);
+
+    while current.starts_with("/workspace") {
+        let package_json_path = format!("{current}/package.json");
+        if record.vfs.read(&package_json_path).is_some() {
+            return Some(current);
+        }
+
+        if current == "/workspace" {
+            break;
+        }
+
+        current = dirname(&current).to_string();
+    }
+
+    None
+}
+
+fn read_package_manifest_at(record: &SessionRecord, package_root: &str) -> Option<PackageManifest> {
+    let package_json_path = format!("{package_root}/package.json");
+    record
+        .vfs
+        .read(&package_json_path)
+        .and_then(|file| serde_json::from_slice::<PackageManifest>(&file.bytes).ok())
+}
+
 fn node_module_search_roots(importer_dir: &str, package_name: &str) -> Vec<String> {
     let mut roots = BTreeSet::new();
     let mut current = importer_dir.to_string();
@@ -2548,7 +3544,9 @@ fn node_module_search_roots(importer_dir: &str, package_name: &str) -> Vec<Strin
         if current.ends_with("/node_modules") {
             roots.insert(normalize_posix_path(&format!("{current}/{package_name}")));
         } else {
-            roots.insert(normalize_posix_path(&format!("{current}/node_modules/{package_name}")));
+            roots.insert(normalize_posix_path(&format!(
+                "{current}/node_modules/{package_name}"
+            )));
         }
 
         if current == "/workspace" {

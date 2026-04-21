@@ -232,6 +232,81 @@ pub struct HostRuntimeTimer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeIdleReport {
+    pub turns: usize,
+    pub drained_jobs: usize,
+    pub fired_timers: usize,
+    pub now_ms: u64,
+    pub pending_jobs: usize,
+    pub pending_timers: usize,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub reached_turn_limit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeStartupReport {
+    pub boot: HostRuntimeEngineBoot,
+    pub entry_import_plan: HostRuntimeModuleImportPlan,
+    pub idle: HostRuntimeIdleReport,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewLaunchReport {
+    pub startup: HostRuntimeStartupReport,
+    pub server: Option<HostRuntimeHttpServer>,
+    pub port: Option<HostRuntimePort>,
+    pub root_request: Option<HostRuntimeHttpRequest>,
+    pub root_request_hint: Option<PreviewRequestHint>,
+    pub root_response_descriptor: Option<PreviewResponseDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeLaunchReport {
+    pub boot_summary: HostBootstrapSummary,
+    pub run_plan: RunPlan,
+    pub runtime_context: HostRuntimeContext,
+    pub engine_context: crate::engine::EngineContextSnapshot,
+    pub bindings: HostRuntimeBindings,
+    pub bootstrap_plan: HostRuntimeBootstrapPlan,
+    pub preview_launch: HostRuntimePreviewLaunchReport,
+    pub startup_logs: Vec<String>,
+    pub events: Vec<HostRuntimeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewRequestReport {
+    pub server: HostRuntimeHttpServer,
+    pub port: HostRuntimePort,
+    pub request: HostRuntimeHttpRequest,
+    pub request_hint: PreviewRequestHint,
+    pub response_descriptor: PreviewResponseDescriptor,
+    pub hydration_paths: Vec<String>,
+    pub hydrated_files: Vec<WorkspaceFilePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeShutdownReport {
+    pub context_id: String,
+    pub session_id: String,
+    pub exit_code: i32,
+    pub closed_ports: Vec<HostRuntimePort>,
+    pub closed_servers: Vec<HostRuntimeHttpServer>,
+    pub events: Vec<HostRuntimeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFilePayload {
+    pub path: String,
+    pub size: usize,
+    pub is_text: bool,
+    pub text_content: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimePort {
     pub port: u16,
     pub protocol: HostRuntimePortProtocol,
@@ -365,6 +440,22 @@ pub enum HostRuntimeCommand {
     DescribeBindings,
     DescribeBootstrap,
     BootEngine,
+    Startup {
+        max_turns: usize,
+    },
+    LaunchPreview {
+        max_turns: usize,
+        port: Option<u16>,
+    },
+    PreviewRequest {
+        request: HostRuntimeHttpRequest,
+    },
+    Shutdown {
+        code: i32,
+    },
+    RunUntilIdle {
+        max_turns: usize,
+    },
     DescribeModuleLoader,
     DescribeModules,
     ReadModule {
@@ -456,6 +547,11 @@ pub enum HostRuntimeResponse {
     Bindings(HostRuntimeBindings),
     BootstrapPlan(HostRuntimeBootstrapPlan),
     EngineBoot(HostRuntimeEngineBoot),
+    StartupReport(HostRuntimeStartupReport),
+    PreviewLaunchReport(HostRuntimePreviewLaunchReport),
+    PreviewRequestReport(HostRuntimePreviewRequestReport),
+    ShutdownReport(HostRuntimeShutdownReport),
+    IdleReport(HostRuntimeIdleReport),
     ModuleLoaderPlan(HostRuntimeModuleLoaderPlan),
     ModuleList {
         modules: Vec<HostRuntimeModuleRecord>,

@@ -7,8 +7,8 @@ pub mod vfs;
 
 pub use engine::{
     EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextState,
-    EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain,
-    EngineRegisteredModule, EngineSessionHandle, NullEngineAdapter, QuickJsNgEngineAdapter,
+    EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain, EngineRegisteredModule,
+    EngineSessionHandle, NullEngineAdapter, QuickJsNgEngineAdapter,
 };
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
@@ -17,9 +17,10 @@ pub use protocol::{
     HostFsResponse, HostProcessInfo, HostRuntimeBindings, HostRuntimeBootstrapModule,
     HostRuntimeBootstrapPlan, HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel,
     HostRuntimeContext, HostRuntimeEngineBoot, HostRuntimeEvent, HostRuntimeHttpRequest,
-    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeModuleRecord,
-    HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse,
-    HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    HostRuntimeHttpServer, HostRuntimeHttpServerKind, HostRuntimeIdleReport,
+    HostRuntimeLaunchReport, HostRuntimePreviewLaunchReport, HostRuntimeStartupReport,
+    HostRuntimeModuleRecord, HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
     PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor, PreviewResponseKind,
     RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntryKind, WorkspaceEntrySummary,
     WorkspaceFileSummary,
@@ -118,6 +119,209 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn runtime_launch_preview_collapses_boot_and_preview_setup() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "preview.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("preview-app".into()),
+                BTreeMap::new(),
+                vec![VirtualFile::text(
+                    "/workspace/src/main.js",
+                    "console.log('hello from preview');",
+                )],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should be created");
+
+        let launched = host
+            .execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::LaunchPreview {
+                    max_turns: 16,
+                    port: Some(3100),
+                },
+            )
+            .expect("launch preview should succeed");
+
+        let report = match launched {
+            HostRuntimeResponse::PreviewLaunchReport(report) => report,
+            other => panic!("expected preview launch report, got {other:?}"),
+        };
+        assert!(!report.startup.exited);
+        assert_eq!(report.startup.exit_code, None);
+        assert_eq!(report.server.as_ref().map(|server| server.port.port), Some(3100));
+        assert_eq!(report.port.as_ref().map(|port| port.port), Some(3100));
+        assert_eq!(
+            report.root_request.as_ref().map(|request| request.relative_path.as_str()),
+            Some("/")
+        );
+        assert_eq!(
+            report.root_request_hint.as_ref().map(|hint| &hint.kind),
+            Some(&PreviewRequestKind::RootEntry)
+        );
+        assert_eq!(
+            report
+                .root_response_descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.kind),
+            Some(&PreviewResponseKind::AppShell)
+        );
+    }
+
+    #[test]
+    fn launch_runtime_collapses_run_startup_setup() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "launch.zip".into(),
+                    file_count: 2,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("launch-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"launch-app","scripts":{"dev":"node src/server.js"}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/src/server.js",
+                        "console.log('launch runtime');",
+                    ),
+                ],
+            )
+            .expect("session should be created");
+
+        let launched = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("server.js")]),
+                16,
+                Some(3200),
+            )
+            .expect("launch runtime should succeed");
+
+        assert_eq!(launched.boot_summary.engine_name, "null-engine");
+        assert_eq!(launched.run_plan.command_kind, crate::protocol::RunCommandKind::NodeEntrypoint);
+        assert_eq!(launched.run_plan.entrypoint, "/workspace/src/server.js");
+        assert_eq!(launched.runtime_context.process.cwd, "/workspace/src");
+        assert_eq!(launched.engine_context.state, EngineContextState::Booted);
+        assert!(
+            launched
+                .bindings
+                .globals
+                .iter()
+                .any(|global| global == "process")
+        );
+        assert!(
+            launched
+                .bindings
+                .globals
+                .iter()
+                .any(|global| global == "Buffer")
+        );
+        assert_eq!(launched.bootstrap_plan.bootstrap_specifier, "runtime:bootstrap");
+        assert!(launched.startup_logs.iter().any(|line| line.contains("[host] engine=null-engine")));
+        assert!(launched.startup_logs.iter().any(|line| line.contains("[context] id=")));
+        assert_eq!(
+            launched.preview_launch.server.as_ref().map(|server| server.port.port),
+            Some(3200)
+        );
+        assert_eq!(
+            launched
+                .preview_launch
+                .root_request_hint
+                .as_ref()
+                .map(|hint| &hint.kind),
+            Some(&PreviewRequestKind::FallbackRoot)
+        );
+        assert!(launched.events.iter().any(|event| matches!(
+            event,
+            HostRuntimeEvent::PortListen { port } if port.port == 3200
+        )));
+    }
+
+    #[test]
+    fn runtime_shutdown_collapses_stop_and_context_drop() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "shutdown.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("shutdown-app".into()),
+                BTreeMap::new(),
+                vec![VirtualFile::text(
+                    "/workspace/src/main.js",
+                    "console.log('shutdown');",
+                )],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+            )
+            .expect("runtime context should be created");
+
+        host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::HttpServePreview { port: Some(3100) },
+        )
+        .expect("preview server should start");
+        host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::ProcessExit { code: 0 },
+        )
+        .expect("process exit should succeed");
+
+        let shutdown = host
+            .execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::Shutdown { code: 0 },
+            )
+            .expect("shutdown should succeed");
+
+        let report = match shutdown {
+            HostRuntimeResponse::ShutdownReport(report) => report,
+            other => panic!("expected shutdown report, got {other:?}"),
+        };
+        assert_eq!(report.context_id, runtime_context.context_id);
+        assert_eq!(report.session_id, session.session_id);
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.closed_ports.len(), 1);
+        assert_eq!(report.closed_servers.len(), 1);
+        assert!(report
+            .events
+            .iter()
+            .any(|event| matches!(event, HostRuntimeEvent::ProcessExit { code: 0 })));
+        assert!(report
+            .events
+            .iter()
+            .any(|event| matches!(event, HostRuntimeEvent::PortClose { port: 3100 })));
+        assert!(matches!(
+            host.describe_engine_context(&runtime_context.context_id),
+            Err(RuntimeHostError::RuntimeContextNotFound(_))
+        ));
+    }
+
     #[cfg(not(feature = "quickjs-ng-engine"))]
     #[test]
     fn quickjs_ng_engine_scaffold_reports_unlinked_vm() {
@@ -196,11 +400,19 @@ mod tests {
         assert_eq!(loader_plan.context_id, runtime_context.context_id);
         assert_eq!(loader_plan.cwd, "/workspace/src");
         assert_eq!(loader_plan.workspace_root, "/workspace");
-        assert_eq!(loader_plan.entry_module.resolved_specifier, "/workspace/src/main.js");
-        assert_eq!(loader_plan.entry_module.format, HostRuntimeModuleFormat::Module);
-        assert!(loader_plan
-            .registered_specifiers
-            .contains(&String::from("runtime:bootstrap")));
+        assert_eq!(
+            loader_plan.entry_module.resolved_specifier,
+            "/workspace/src/main.js"
+        );
+        assert_eq!(
+            loader_plan.entry_module.format,
+            HostRuntimeModuleFormat::Module
+        );
+        assert!(
+            loader_plan
+                .registered_specifiers
+                .contains(&String::from("runtime:bootstrap"))
+        );
         assert_eq!(
             loader_plan.node_module_search_roots,
             vec![
@@ -232,6 +444,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { answer as localAnswer } from "./boot.js";
 import packageAnswer from "demo-pkg";
+import packageFeature from "demo-pkg/feature";
 console.log("quickjs native bootstrap");
 globalThis.cwdValue = process.cwd();
 globalThis.argvCount = process.argv.length;
@@ -243,21 +456,42 @@ fs.mkdirSync("../generated", { recursive: true });
 fs.writeFileSync("../generated/from-native.txt", "native quickjs");
 process.chdir("..");
 globalThis.cwdAfterChdir = process.cwd();
+globalThis.pendingTimer = setTimeout(() => {
+  globalThis.lateTimerHit = 1;
+}, 25);
+globalThis.intervalCount = 0;
+globalThis.intervalId = setInterval(() => {
+  globalThis.intervalCount += 1;
+  if (globalThis.intervalCount >= 3) {
+    clearInterval(globalThis.intervalId);
+  }
+}, 10);
+Promise.resolve().then(() => {
+  globalThis.microtaskValue = 1;
+  setTimeout(() => {
+    globalThis.microtaskTimerHit = 1;
+  }, 5);
+});
 setTimeout(() => {
   globalThis.timerHit = 1;
 }, 0);
-globalThis.answer = localAnswer + packageAnswer;
+globalThis.answer = localAnswer + packageAnswer + packageFeature;
 globalThis.answer;"#,
                     ),
                     VirtualFile::text("/workspace/src/boot.js", "export const answer = 40 + 2;"),
                     VirtualFile::text(
                         "/workspace/src/later.js",
-                        r#"import laterPackage from "late-pkg";
+                        r#"import laterPackage from "late-pkg/feature";
 export default laterPackage + 3;"#,
                     ),
                     VirtualFile::text(
                         "/workspace/node_modules/demo-pkg/package.json",
-                        r#"{"name":"demo-pkg","main":"./index.cjs"}"#,
+                        r#"{"name":"demo-pkg","exports":{".":{"import":"./esm/root.js","default":"./index.cjs"},"./feature":{"default":"./feature.cjs"}}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/esm/root.js",
+                        r#"import payload from "../value.json";
+export default payload.offset + 1;"#,
                     ),
                     VirtualFile::text(
                         "/workspace/node_modules/demo-pkg/index.cjs",
@@ -265,14 +499,21 @@ export default laterPackage + 3;"#,
 const payload = require("./value.json");
 module.exports = extra + payload.offset;"#,
                     ),
-                    VirtualFile::text("/workspace/node_modules/demo-pkg/util.cjs", "module.exports = 1;"),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/util.cjs",
+                        "module.exports = 1;",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/demo-pkg/feature.cjs",
+                        "module.exports = 2;",
+                    ),
                     VirtualFile::text(
                         "/workspace/node_modules/demo-pkg/value.json",
                         r#"{"offset":1}"#,
                     ),
                     VirtualFile::text(
                         "/workspace/node_modules/late-pkg/package.json",
-                        r#"{"name":"late-pkg","main":"./index.cjs"}"#,
+                        r#"{"name":"late-pkg","exports":{"./feature":{"default":"./index.cjs"}}}"#,
                     ),
                     VirtualFile::text(
                         "/workspace/node_modules/late-pkg/index.cjs",
@@ -286,8 +527,7 @@ module.exports = payload.offset + 4;"#,
                 ],
             )
             .expect("session should be created");
-        let mut request =
-            RunRequest::new("/workspace/src", "node", vec![String::from("main")]);
+        let mut request = RunRequest::new("/workspace/src", "node", vec![String::from("main")]);
         request
             .env
             .insert(String::from("RUNTIME_SAMPLE"), String::from("present"));
@@ -316,25 +556,43 @@ module.exports = payload.offset + 4;"#,
             .expect("engine context should exist");
         assert_eq!(snapshot.state, EngineContextState::Ready);
 
-        let boot = host
-            .execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine)
-            .expect("quickjs-ng should bootstrap registered modules");
-        let report = match boot {
-            HostRuntimeResponse::EngineBoot(report) => report,
-            other => panic!("expected engine boot report, got {other:?}"),
+        let startup = host
+            .execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::Startup { max_turns: 32 },
+            )
+            .expect("quickjs-ng should boot runtime and flush it until idle");
+        let report = match startup {
+            HostRuntimeResponse::StartupReport(report) => report,
+            other => panic!("expected runtime startup report, got {other:?}"),
         };
-        assert_eq!(report.plan.bootstrap_specifier, "runtime:bootstrap");
-        assert_eq!(report.plan.modules.len(), 7);
+        assert_eq!(report.boot.plan.bootstrap_specifier, "runtime:bootstrap");
+        assert_eq!(report.boot.plan.modules.len(), 7);
         assert_eq!(
-            report.loader_plan.node_module_search_roots,
+            report.boot.loader_plan.node_module_search_roots,
             vec![
                 String::from("/workspace/node_modules"),
                 String::from("/workspace/src/node_modules"),
             ]
         );
-        assert!(report
-            .result_summary
-            .contains("quickjs-ng booted 7 bootstrap modules"));
+        assert!(
+            report
+                .boot
+                .result_summary
+                .contains("quickjs-ng booted 7 bootstrap modules")
+        );
+        assert_eq!(
+            report.entry_import_plan.resolved_module.resolved_specifier,
+            "/workspace/src/main.js"
+        );
+        assert!(!report.idle.reached_turn_limit);
+        assert_eq!(report.idle.pending_jobs, 0);
+        assert_eq!(report.idle.pending_timers, 0);
+        assert_eq!(report.idle.now_ms, 30);
+        assert_eq!(report.idle.fired_timers, 5);
+        assert_eq!(report.idle.turns, 5);
+        assert!(!report.exited);
+        assert_eq!(report.exit_code, None);
 
         let imported_answer = host
             .eval_engine_context(
@@ -344,7 +602,7 @@ module.exports = payload.offset + 4;"#,
                 false,
             )
             .expect("entry module side effects should run during bootstrap");
-        assert!(imported_answer.result_summary.contains("44"));
+        assert!(imported_answer.result_summary.contains("46"));
 
         let globals = host
             .eval_engine_context(
@@ -353,13 +611,23 @@ module.exports = payload.offset + 4;"#,
                 r#"JSON.stringify({
   process: typeof globalThis.process,
   setTimeout: typeof globalThis.setTimeout,
+  setInterval: typeof globalThis.setInterval,
   Buffer: typeof globalThis.Buffer,
-})"#,
+	})"#,
                 false,
             )
             .expect("bootstrap globals should be installed");
         assert!(globals.result_summary.contains(r#""process":"object""#));
-        assert!(globals.result_summary.contains(r#""setTimeout":"function""#));
+        assert!(
+            globals
+                .result_summary
+                .contains(r#""setTimeout":"function""#)
+        );
+        assert!(
+            globals
+                .result_summary
+                .contains(r#""setInterval":"function""#)
+        );
         assert!(globals.result_summary.contains(r#""Buffer":"function""#));
 
         let builtin_state = host
@@ -373,32 +641,61 @@ module.exports = payload.offset + 4;"#,
   bootExists: globalThis.bootExists,
   bootPath: globalThis.bootPath,
   timerHit: globalThis.timerHit,
+  intervalType: typeof globalThis.setInterval,
   cwdAfterChdir: globalThis.cwdAfterChdir,
   bootSourceHasAnswer: globalThis.bootSource.includes("answer = 40 + 2"),
 })"#,
                 false,
             )
             .expect("native bridge builtins should be usable during bootstrap");
-        assert!(builtin_state.result_summary.contains(r#""cwd":"/workspace/src""#));
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""cwd":"/workspace/src""#)
+        );
         assert!(builtin_state.result_summary.contains(r#""argvCount":2"#));
-        assert!(builtin_state.result_summary.contains(r#""envValue":"present""#));
-        assert!(builtin_state.result_summary.contains(r#""bootExists":true"#));
-        assert!(builtin_state.result_summary.contains(r#""bootPath":"/workspace/src/boot.js""#));
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""envValue":"present""#)
+        );
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""bootExists":true"#)
+        );
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""bootPath":"/workspace/src/boot.js""#)
+        );
         assert!(builtin_state.result_summary.contains(r#""timerHit":1"#));
-        assert!(builtin_state
-            .result_summary
-            .contains(r#""cwdAfterChdir":"/workspace""#));
-        assert!(builtin_state
-            .result_summary
-            .contains(r#""bootSourceHasAnswer":true"#));
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""intervalType":"function""#)
+        );
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""cwdAfterChdir":"/workspace""#)
+        );
+        assert!(
+            builtin_state
+                .result_summary
+                .contains(r#""bootSourceHasAnswer":true"#)
+        );
 
         let generated = host
             .read_workspace_file(&session.session_id, "/workspace/generated/from-native.txt")
             .expect("native fs.writeFileSync should sync back to host workspace");
         assert_eq!(String::from_utf8_lossy(&generated.bytes), "native quickjs");
         assert_eq!(
-            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::ProcessCwd)
-                .expect("process cwd should reflect native process.chdir"),
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::ProcessCwd
+            )
+            .expect("process cwd should reflect native process.chdir"),
             HostRuntimeResponse::ProcessCwd {
                 cwd: String::from("/workspace"),
             }
@@ -407,14 +704,67 @@ module.exports = payload.offset + 4;"#,
             .session_snapshot(&session.session_id)
             .expect("session snapshot should exist");
         assert_eq!(session_snapshot.revision, 1);
-        assert_eq!(session_snapshot.archive.file_count, 11);
-        assert_eq!(session_snapshot.archive.directory_count, 6);
+        assert_eq!(session_snapshot.archive.file_count, 13);
+        assert_eq!(session_snapshot.archive.directory_count, 7);
+        let runtime_state = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/runtime-state.js",
+                r#"JSON.stringify({
+  lateTimerHit: globalThis.lateTimerHit,
+  intervalCount: globalThis.intervalCount,
+  microtaskValue: globalThis.microtaskValue,
+  microtaskTimerHit: globalThis.microtaskTimerHit,
+})"#,
+                false,
+            )
+            .expect("run-until-idle should flush native microtasks and timers");
+        assert!(runtime_state.result_summary.contains(r#""lateTimerHit":1"#));
+        assert!(
+            runtime_state
+                .result_summary
+                .contains(r#""intervalCount":3"#)
+        );
+        assert!(
+            runtime_state
+                .result_summary
+                .contains(r#""microtaskValue":1"#)
+        );
+        assert!(
+            runtime_state
+                .result_summary
+                .contains(r#""microtaskTimerHit":1"#)
+        );
+        let timers_after_fire = host
+            .execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::TimerList)
+            .expect("idle run should leave no native timers behind");
+        let HostRuntimeResponse::TimerList {
+            now_ms: after_fire_now_ms,
+            timers: remaining_timers,
+        } = timers_after_fire
+        else {
+            panic!("expected timer list after idle run");
+        };
+        assert_eq!(after_fire_now_ms, 30);
+        assert!(remaining_timers.is_empty());
         let runtime_events = host
             .execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::DrainEvents)
             .expect("workspace change events should be queued after native writes");
         let HostRuntimeResponse::RuntimeEvents { events } = runtime_events else {
             panic!("expected runtime events after native bridge sync");
         };
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Console { line, .. } if line == "quickjs native bootstrap"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Stdout { chunk } if chunk == "quickjs native bootstrap"
+            )
+        }));
         assert!(events.iter().any(|event| {
             matches!(
                 event,
@@ -430,16 +780,15 @@ module.exports = payload.offset + 4;"#,
             )
         }));
 
-        host
-            .eval_engine_context(
-                &runtime_context.context_id,
-                "/workspace/src/later-check.mjs",
-                r#"import laterAnswer from "./later.js";
+        host.eval_engine_context(
+            &runtime_context.context_id,
+            "/workspace/src/later-check.mjs",
+            r#"import laterAnswer from "./later.js";
 globalThis.lateAnswer = laterAnswer;
 export default laterAnswer;"#,
-                true,
-            )
-            .expect("native loader should resolve workspace and node_modules modules on demand");
+            true,
+        )
+        .expect("native loader should resolve workspace and node_modules modules on demand");
 
         let late_state = host
             .eval_engine_context(
@@ -484,8 +833,43 @@ export default laterAnswer;"#,
                 Some("demo-app".into()),
                 BTreeMap::from([(String::from("dev"), String::from("vite"))]),
                 vec![
-                    VirtualFile::text("/workspace/package.json", r#"{"name":"demo-app"}"#),
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r##"{"name":"demo-app","imports":{"#main":"./src/main.tsx"},"exports":{".":"./src/main.tsx","./self":"./src/generated/app.ts"}}"##,
+                    ),
                     VirtualFile::text("/workspace/src/main.tsx", "export default null;"),
+                    VirtualFile::text(
+                        "/workspace/node_modules/exports-pkg/package.json",
+                        r#"{"name":"exports-pkg","exports":{".":{"import":"./esm/root.js","default":"./index.cjs"},"./feature":{"default":"./feature.cjs"}}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/exports-pkg/esm/root.js",
+                        "export default 'exports-root';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/exports-pkg/feature.cjs",
+                        "module.exports = 'exports-feature';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/browser-pkg/package.json",
+                        r#"{"name":"browser-pkg","main":"./server.js","browser":{"./server.js":"./browser.js","./feature.js":"./feature-browser.js"}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/browser-pkg/server.js",
+                        "export { default } from './feature.js';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/browser-pkg/browser.js",
+                        "export default 'browser-entry';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/browser-pkg/feature.js",
+                        "export default 'server-feature';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/browser-pkg/feature-browser.js",
+                        "export default 'browser-feature';",
+                    ),
                 ],
             )
             .expect("session should be created");
@@ -497,7 +881,7 @@ export default laterAnswer;"#,
             host.workspace_file_summaries(&session.session_id)
                 .expect("workspace files should be listed")
                 .len(),
-            2
+            10
         );
         assert_eq!(
             host.read_workspace_file(&session.session_id, "/workspace/src/main.tsx")
@@ -517,6 +901,8 @@ export default laterAnswer;"#,
                 .expect("preview root request hint should resolve")
                 .hydrate_paths,
             vec![
+                "/workspace/node_modules/browser-pkg/package.json".to_string(),
+                "/workspace/node_modules/exports-pkg/package.json".to_string(),
                 "/workspace/package.json".to_string(),
                 "/workspace/src/main.tsx".to_string(),
             ]
@@ -532,6 +918,8 @@ export default laterAnswer;"#,
                 .expect("preview request hint should resolve")
                 .hydrate_paths,
             vec![
+                "/workspace/node_modules/browser-pkg/package.json".to_string(),
+                "/workspace/node_modules/exports-pkg/package.json".to_string(),
                 "/workspace/package.json".to_string(),
                 "/workspace/src/main.tsx".to_string(),
             ]
@@ -555,6 +943,7 @@ export default laterAnswer;"#,
                 .map(|entry| entry.path)
                 .collect::<Vec<_>>(),
             vec![
+                "/workspace/node_modules".to_string(),
                 "/workspace/package.json".to_string(),
                 "/workspace/src".to_string(),
             ]
@@ -595,9 +984,15 @@ export default laterAnswer;"#,
                 "./generated/app",
             )
             .expect("relative module should resolve");
-        assert_eq!(relative_module.resolved_specifier, "/workspace/src/generated/app.ts");
+        assert_eq!(
+            relative_module.resolved_specifier,
+            "/workspace/src/generated/app.ts"
+        );
         let relative_source = host
-            .load_runtime_module(&runtime_context.context_id, &relative_module.resolved_specifier)
+            .load_runtime_module(
+                &runtime_context.context_id,
+                &relative_module.resolved_specifier,
+            )
             .expect("relative module should load");
         assert!(relative_source.source.contains("generated"));
         let import_plan = host
@@ -612,6 +1007,77 @@ export default laterAnswer;"#,
             "/workspace/src/generated/app.ts"
         );
         assert!(import_plan.loaded_module.source.contains("generated"));
+        let package_import = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "#main",
+            )
+            .expect("package imports alias should resolve");
+        assert_eq!(package_import.resolved_specifier, "/workspace/src/main.tsx");
+        let self_root = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "demo-app",
+            )
+            .expect("package self root should resolve");
+        assert_eq!(self_root.resolved_specifier, "/workspace/src/main.tsx");
+        let self_subpath = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "demo-app/self",
+            )
+            .expect("package self subpath should resolve");
+        assert_eq!(
+            self_subpath.resolved_specifier,
+            "/workspace/src/generated/app.ts"
+        );
+        let package_module = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "exports-pkg",
+            )
+            .expect("package exports root should resolve");
+        assert_eq!(
+            package_module.resolved_specifier,
+            "/workspace/node_modules/exports-pkg/esm/root.js"
+        );
+        let package_subpath = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "exports-pkg/feature",
+            )
+            .expect("package exports subpath should resolve");
+        assert_eq!(
+            package_subpath.resolved_specifier,
+            "/workspace/node_modules/exports-pkg/feature.cjs"
+        );
+        let browser_entry = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "browser-pkg",
+            )
+            .expect("browser field should remap package entry");
+        assert_eq!(
+            browser_entry.resolved_specifier,
+            "/workspace/node_modules/browser-pkg/browser.js"
+        );
+        let browser_relative = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/node_modules/browser-pkg/server.js"),
+                "./feature.js",
+            )
+            .expect("browser object mapping should remap package relative imports");
+        assert_eq!(
+            browser_relative.resolved_specifier,
+            "/workspace/node_modules/browser-pkg/feature-browser.js"
+        );
         let loader_plan = host
             .describe_runtime_module_loader(&runtime_context.context_id)
             .expect("module loader plan should resolve");
@@ -910,6 +1376,8 @@ export default laterAnswer;"#,
                 && request_hint.document_root == Some(String::from("/workspace"))
                 && request_hint.hydrate_paths
                     == vec![
+                        String::from("/workspace/node_modules/browser-pkg/package.json"),
+                        String::from("/workspace/node_modules/exports-pkg/package.json"),
                         String::from("/workspace/package.json"),
                         String::from("/workspace/src/main.tsx"),
                     ]
@@ -919,6 +1387,8 @@ export default laterAnswer;"#,
                         workspace_path: Some(String::from("/workspace/src/main.tsx")),
                         document_root: Some(String::from("/workspace")),
                         hydrate_paths: vec![
+                            String::from("/workspace/node_modules/browser-pkg/package.json"),
+                            String::from("/workspace/node_modules/exports-pkg/package.json"),
                             String::from("/workspace/package.json"),
                             String::from("/workspace/src/main.tsx"),
                         ],
@@ -1125,9 +1595,9 @@ export default laterAnswer;"#,
             ),
             Ok(HostRuntimeResponse::TimerFired { now_ms, timers })
                 if now_ms == 85
-                    && timers.len() == 1
-                    && timers[0].timer_id == "runtime-timer-2"
-                    && timers[0].kind == HostRuntimeTimerKind::Interval
+                    && timers.len() == 3
+                    && timers.iter().all(|timer| timer.timer_id == "runtime-timer-2"
+                        && timer.kind == HostRuntimeTimerKind::Interval)
         ));
         assert!(matches!(
             host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::TimerList,),

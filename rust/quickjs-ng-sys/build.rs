@@ -70,10 +70,7 @@ fn download_wasi_sdk() -> PathBuf {
 
         let uri = format!(
             "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{}/wasi-sdk-{}.{}-{}.tar.gz",
-            WASI_SDK_VERSION_MAJOR,
-            WASI_SDK_VERSION_MAJOR,
-            WASI_SDK_VERSION_MINOR,
-            file_suffix
+            WASI_SDK_VERSION_MAJOR, WASI_SDK_VERSION_MAJOR, WASI_SDK_VERSION_MINOR, file_suffix
         );
 
         let output = process::Command::new("curl")

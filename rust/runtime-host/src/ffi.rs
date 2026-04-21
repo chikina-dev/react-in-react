@@ -101,7 +101,16 @@ pub extern "C" fn runtime_host_create_session_json(ptr: *const u8, len: usize) -
         );
 
         match result {
-            Ok(snapshot) => set_last_result(render_session_handle_json(&snapshot)),
+            Ok(snapshot) => {
+                let files = match host.borrow().workspace_file_summaries(&snapshot.session_id) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        set_last_result(render_error_json(&error.to_string()));
+                        return;
+                    }
+                };
+                set_last_result(render_session_handle_json(&snapshot, &files))
+            }
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -258,6 +267,65 @@ pub extern "C" fn runtime_host_create_runtime_context_json(ptr: *const u8, len: 
 
         match result {
             Ok(context) => set_last_result(render_runtime_context_json(&context)),
+            Err(error) => set_last_result(render_error_json(&error.to_string())),
+        }
+    });
+
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_host_launch_runtime_json(ptr: *const u8, len: usize) -> u32 {
+    let input = match read_input(ptr, len) {
+        Ok(input) => input,
+        Err(error) => return write_error(error),
+    };
+
+    let fields = parse_fields(&input);
+    let session_id = required_field(&fields, "session_id").unwrap_or_default();
+    let cwd = required_field(&fields, "cwd").unwrap_or_else(|| "/workspace".into());
+    let command = required_field(&fields, "command").unwrap_or_default();
+    let args = fields
+        .get("args")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter(|segment| !segment.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = fields
+        .get("env")
+        .map(|value| {
+            value
+                .split('\u{1f}')
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let max_turns = fields
+        .get("max_turns")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let port = fields.get("port").and_then(|value| value.parse::<u16>().ok());
+
+    HOST.with(|host| {
+        let result = host.borrow_mut().launch_runtime(
+            &session_id,
+            &RunRequest {
+                cwd,
+                command,
+                args,
+                env,
+            },
+            max_turns,
+            port,
+        );
+
+        match result {
+            Ok(report) => set_last_result(render_runtime_launch_report_json(&report)),
             Err(error) => set_last_result(render_error_json(&error.to_string())),
         }
     });
@@ -897,6 +965,51 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
         "runtime-describe" => Ok(HostRuntimeCommand::DescribeBindings),
         "runtime-describe-bootstrap" => Ok(HostRuntimeCommand::DescribeBootstrap),
         "runtime-boot-engine" => Ok(HostRuntimeCommand::BootEngine),
+        "runtime-startup" => Ok(HostRuntimeCommand::Startup {
+            max_turns: fields
+                .get("max_turns")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1),
+        }),
+        "runtime-launch-preview" => Ok(HostRuntimeCommand::LaunchPreview {
+            max_turns: fields
+                .get("max_turns")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1),
+            port: fields.get("port").and_then(|value| value.parse::<u16>().ok()),
+        }),
+        "runtime-preview-request" => Ok(HostRuntimeCommand::PreviewRequest {
+            request: HostRuntimeHttpRequest {
+                port: fields
+                    .get("port")
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .unwrap_or(3000),
+                method: fields
+                    .get("method")
+                    .cloned()
+                    .unwrap_or_else(|| "GET".into()),
+                relative_path: match required_field(fields, "relative_path") {
+                    Some(encoded) => decode_hex(&encoded)?,
+                    None => String::from("/"),
+                },
+                search: required_field(fields, "search")
+                    .map(|encoded| decode_hex(&encoded))
+                    .transpose()?
+                    .unwrap_or_default(),
+            },
+        }),
+        "runtime-shutdown" => Ok(HostRuntimeCommand::Shutdown {
+            code: fields
+                .get("code")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0),
+        }),
+        "runtime-run-until-idle" => Ok(HostRuntimeCommand::RunUntilIdle {
+            max_turns: fields
+                .get("max_turns")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1),
+        }),
         "runtime-describe-module-loader" => Ok(HostRuntimeCommand::DescribeModuleLoader),
         "runtime-describe-modules" => Ok(HostRuntimeCommand::DescribeModules),
         "runtime-read-module" => Ok(HostRuntimeCommand::ReadModule {
@@ -1202,19 +1315,33 @@ fn render_boot_summary_json(summary: &crate::protocol::HostBootstrapSummary) -> 
     )
 }
 
-fn render_session_handle_json(snapshot: &crate::protocol::SessionSnapshot) -> String {
+fn render_session_handle_json(
+    snapshot: &crate::protocol::SessionSnapshot,
+    files: &[crate::protocol::WorkspaceFileSummary],
+) -> String {
     let package_name = snapshot
         .package_name
         .as_ref()
         .map(|name| format!("\"{}\"", escape_json(name)))
         .unwrap_or_else(|| "null".into());
+    let sample_path = files
+        .first()
+        .map(|file| format!("\"{}\"", escape_json(&file.path)))
+        .unwrap_or_else(|| "null".into());
+    let sample_size = files
+        .first()
+        .map(|file| file.size.to_string())
+        .unwrap_or_else(|| "null".into());
 
     format!(
-        "{{\"sessionId\":\"{}\",\"workspaceRoot\":\"{}\",\"packageName\":{},\"fileCount\":{}}}",
+        "{{\"sessionId\":\"{}\",\"workspaceRoot\":\"{}\",\"packageName\":{},\"fileCount\":{},\"fileIndex\":{},\"samplePath\":{},\"sampleSize\":{}}}",
         escape_json(&snapshot.session_id),
         escape_json(&snapshot.workspace_root),
         package_name,
         snapshot.archive.file_count,
+        render_workspace_file_summaries_json(files),
+        sample_path,
+        sample_size,
     )
 }
 
@@ -1333,6 +1460,26 @@ fn render_runtime_response_json(response: &HostRuntimeResponse) -> String {
         HostRuntimeResponse::EngineBoot(report) => format!(
             "{{\"kind\":\"runtime-engine-boot\",\"report\":{}}}",
             render_runtime_engine_boot_json(report)
+        ),
+        HostRuntimeResponse::StartupReport(report) => format!(
+            "{{\"kind\":\"runtime-startup\",\"report\":{}}}",
+            render_runtime_startup_report_json(report)
+        ),
+        HostRuntimeResponse::PreviewLaunchReport(report) => format!(
+            "{{\"kind\":\"runtime-preview-launch\",\"report\":{}}}",
+            render_runtime_preview_launch_report_json(report)
+        ),
+        HostRuntimeResponse::PreviewRequestReport(report) => format!(
+            "{{\"kind\":\"runtime-preview-request\",\"report\":{}}}",
+            render_runtime_preview_request_report_json(report)
+        ),
+        HostRuntimeResponse::ShutdownReport(report) => format!(
+            "{{\"kind\":\"runtime-shutdown\",\"report\":{}}}",
+            render_runtime_shutdown_report_json(report)
+        ),
+        HostRuntimeResponse::IdleReport(report) => format!(
+            "{{\"kind\":\"runtime-idle-report\",\"report\":{}}}",
+            render_runtime_idle_report_json(report)
         ),
         HostRuntimeResponse::ModuleLoaderPlan(plan) => format!(
             "{{\"kind\":\"runtime-module-loader\",\"plan\":{}}}",
@@ -1494,6 +1641,120 @@ fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBo
     )
 }
 
+fn render_runtime_launch_report_json(
+    report: &crate::protocol::HostRuntimeLaunchReport,
+) -> String {
+    format!(
+        "{{\"bootSummary\":{},\"runPlan\":{},\"runtimeContext\":{},\"engineContext\":{},\"bindings\":{},\"bootstrapPlan\":{},\"previewLaunch\":{},\"startupLogs\":{},\"events\":{}}}",
+        render_boot_summary_json(&report.boot_summary),
+        render_run_plan_json(&report.run_plan),
+        render_runtime_context_json(&report.runtime_context),
+        render_engine_context_snapshot_json(&report.engine_context),
+        render_runtime_bindings_json(&report.bindings),
+        render_runtime_bootstrap_plan_json(&report.bootstrap_plan),
+        render_runtime_preview_launch_report_json(&report.preview_launch),
+        render_string_array_json(&report.startup_logs),
+        render_runtime_events_json(&report.events),
+    )
+}
+
+fn render_runtime_startup_report_json(
+    report: &crate::protocol::HostRuntimeStartupReport,
+) -> String {
+    format!(
+        "{{\"boot\":{},\"entryImportPlan\":{},\"idle\":{},\"exited\":{},\"exitCode\":{}}}",
+        render_runtime_engine_boot_json(&report.boot),
+        render_runtime_module_import_plan_json(&report.entry_import_plan),
+        render_runtime_idle_report_json(&report.idle),
+        report.exited,
+        report
+            .exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_runtime_preview_launch_report_json(
+    report: &crate::protocol::HostRuntimePreviewLaunchReport,
+) -> String {
+    format!(
+        "{{\"startup\":{},\"server\":{},\"port\":{},\"rootRequest\":{},\"rootRequestHint\":{},\"rootResponseDescriptor\":{}}}",
+        render_runtime_startup_report_json(&report.startup),
+        report
+            .server
+            .as_ref()
+            .map(render_runtime_http_server_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .port
+            .as_ref()
+            .map(render_runtime_port_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .root_request
+            .as_ref()
+            .map(render_runtime_http_request_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .root_request_hint
+            .as_ref()
+            .map(render_preview_request_hint_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .root_response_descriptor
+            .as_ref()
+            .map(render_preview_response_descriptor_json)
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_runtime_preview_request_report_json(
+    report: &crate::protocol::HostRuntimePreviewRequestReport,
+) -> String {
+    format!(
+        "{{\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{},\"responseDescriptor\":{},\"hydrationPaths\":{},\"hydratedFiles\":{}}}",
+        render_runtime_http_server_json(&report.server),
+        render_runtime_port_json(&report.port),
+        render_runtime_http_request_json(&report.request),
+        render_preview_request_hint_json(&report.request_hint),
+        render_preview_response_descriptor_json(&report.response_descriptor),
+        render_string_array_json(&report.hydration_paths),
+        render_workspace_file_payloads_json(&report.hydrated_files),
+    )
+}
+
+fn render_runtime_shutdown_report_json(
+    report: &crate::protocol::HostRuntimeShutdownReport,
+) -> String {
+    format!(
+        "{{\"contextId\":\"{}\",\"sessionId\":\"{}\",\"exitCode\":{},\"closedPorts\":{},\"closedServers\":{},\"events\":{}}}",
+        escape_json(&report.context_id),
+        escape_json(&report.session_id),
+        report.exit_code,
+        render_runtime_ports_json(&report.closed_ports),
+        render_runtime_http_servers_json(&report.closed_servers),
+        render_runtime_events_json(&report.events),
+    )
+}
+
+fn render_runtime_idle_report_json(report: &crate::protocol::HostRuntimeIdleReport) -> String {
+    format!(
+        "{{\"turns\":{},\"drainedJobs\":{},\"firedTimers\":{},\"nowMs\":{},\"pendingJobs\":{},\"pendingTimers\":{},\"exited\":{},\"exitCode\":{},\"reachedTurnLimit\":{}}}",
+        report.turns,
+        report.drained_jobs,
+        report.fired_timers,
+        report.now_ms,
+        report.pending_jobs,
+        report.pending_timers,
+        report.exited,
+        report
+            .exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".into()),
+        report.reached_turn_limit,
+    )
+}
+
 fn render_runtime_module_loader_plan_json(
     plan: &crate::protocol::HostRuntimeModuleLoaderPlan,
 ) -> String {
@@ -1510,7 +1771,9 @@ fn render_runtime_module_loader_plan_json(
     )
 }
 
-fn render_runtime_module_records_json(modules: &[crate::protocol::HostRuntimeModuleRecord]) -> String {
+fn render_runtime_module_records_json(
+    modules: &[crate::protocol::HostRuntimeModuleRecord],
+) -> String {
     format!(
         "[{}]",
         modules
@@ -1816,6 +2079,33 @@ fn render_workspace_files_json(files: &[VirtualFile]) -> String {
     let items = files
         .iter()
         .map(render_workspace_file_json)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("[{items}]")
+}
+
+fn render_workspace_file_payload_json(file: &crate::protocol::WorkspaceFilePayload) -> String {
+    let text_content = file
+        .text_content
+        .as_ref()
+        .map(|content| format!("\"{}\"", escape_json(content)))
+        .unwrap_or_else(|| "null".into());
+
+    format!(
+        "{{\"path\":\"{}\",\"size\":{},\"isText\":{},\"textContent\":{},\"bytesHex\":\"{}\"}}",
+        escape_json(&file.path),
+        file.size,
+        file.is_text,
+        text_content,
+        encode_hex(&file.bytes),
+    )
+}
+
+fn render_workspace_file_payloads_json(files: &[crate::protocol::WorkspaceFilePayload]) -> String {
+    let items = files
+        .iter()
+        .map(render_workspace_file_payload_json)
         .collect::<Vec<_>>()
         .join(",");
 

@@ -1,15 +1,17 @@
-use std::collections::BTreeMap;
-#[cfg(feature = "quickjs-ng-engine")]
-use std::ffi::{c_void, CStr, CString};
-#[cfg(feature = "quickjs-ng-engine")]
-use std::ptr;
 #[cfg(feature = "quickjs-ng-engine")]
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
+#[cfg(feature = "quickjs-ng-engine")]
+use std::ffi::{CStr, CString, c_void};
+#[cfg(feature = "quickjs-ng-engine")]
+use std::ptr;
 
 use crate::protocol::{
-    HostRuntimeBootstrapPlan, HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan,
-    RunCommandKind, RunPlan, RunRequest,
+    HostRuntimeBootstrapPlan, HostRuntimeEvent, HostRuntimeModuleImportPlan,
+    HostRuntimeModuleLoaderPlan, HostRuntimeTimer, RunCommandKind, RunPlan, RunRequest,
 };
+#[cfg(feature = "quickjs-ng-engine")]
+use crate::protocol::{HostRuntimeConsoleLevel, HostRuntimeTimerKind};
 #[cfg(feature = "quickjs-ng-engine")]
 use crate::protocol::{HostRuntimeModuleFormat, WorkspaceEntryKind, WorkspaceEntrySummary};
 use crate::vfs::VirtualFileSystem;
@@ -104,6 +106,9 @@ pub struct EngineBootstrapBridge {
 pub struct EngineBridgeSnapshot {
     pub cwd: String,
     pub vfs: VirtualFileSystem,
+    pub events: Vec<HostRuntimeEvent>,
+    pub timers: Vec<HostRuntimeTimer>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +173,13 @@ pub trait EngineAdapter {
         &mut self,
         handle: &EngineContextHandle,
     ) -> Result<Option<EngineBridgeSnapshot>, String>;
+
+    fn fire_timers(
+        &mut self,
+        handle: &EngineContextHandle,
+        now_ms: u64,
+        timer_ids: &[String],
+    ) -> Result<usize, String>;
 
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String>;
 
@@ -319,7 +331,12 @@ impl EngineStateStore {
         let context = self
             .contexts
             .get(&handle.engine_context_id)
-            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+            .ok_or_else(|| {
+                format!(
+                    "{engine_label} context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
 
         Ok(context
             .modules
@@ -340,7 +357,12 @@ impl EngineStateStore {
         let context = self
             .contexts
             .get(&handle.engine_context_id)
-            .ok_or_else(|| format!("{engine_label} context not found: {}", handle.engine_context_id))?;
+            .ok_or_else(|| {
+                format!(
+                    "{engine_label} context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
 
         let source = context.modules.get(specifier).ok_or_else(|| {
             format!(
@@ -430,7 +452,7 @@ pub struct NullEngineAdapter {
     state: EngineStateStore,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct QuickJsNgEngineAdapter {
     state: EngineStateStore,
     #[cfg(feature = "quickjs-ng-engine")]
@@ -438,7 +460,6 @@ pub struct QuickJsNgEngineAdapter {
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
-#[derive(Debug)]
 struct QuickJsNativeSessionRecord {
     runtime: *mut qjs::JSRuntime,
     opaque: Box<QuickJsRuntimeOpaque>,
@@ -453,14 +474,14 @@ struct QuickJsNativeContextRecord {
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct QuickJsNativeStore {
     sessions: BTreeMap<String, QuickJsNativeSessionRecord>,
     contexts: BTreeMap<String, QuickJsNativeContextRecord>,
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct QuickJsRuntimeOpaque {
     active_context_id: Option<String>,
     modules_by_context: BTreeMap<String, BTreeMap<String, String>>,
@@ -469,13 +490,39 @@ struct QuickJsRuntimeOpaque {
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
-#[derive(Debug, Clone)]
 struct QuickJsRuntimeBridge {
     cwd: String,
     argv: Vec<String>,
     env: BTreeMap<String, String>,
     vfs: VirtualFileSystem,
+    clock_ms: u64,
     next_timer_id: u64,
+    timers: BTreeMap<String, QuickJsStoredTimer>,
+    pending_events: Vec<HostRuntimeEvent>,
+    exit_code: Option<i32>,
+}
+
+#[cfg(feature = "quickjs-ng-engine")]
+struct QuickJsStoredTimer {
+    timer: HostRuntimeTimer,
+    callback_id: String,
+}
+
+#[cfg(feature = "quickjs-ng-engine")]
+impl Clone for QuickJsRuntimeBridge {
+    fn clone(&self) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            argv: self.argv.clone(),
+            env: self.env.clone(),
+            vfs: self.vfs.clone(),
+            clock_ms: self.clock_ms,
+            next_timer_id: self.next_timer_id,
+            timers: BTreeMap::new(),
+            pending_events: self.pending_events.clone(),
+            exit_code: self.exit_code,
+        }
+    }
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
@@ -511,7 +558,7 @@ impl QuickJsNativeStore {
     fn create_context(&mut self, handle: &EngineContextHandle) -> Result<(), String> {
         let session = self
             .sessions
-            .get(&handle.engine_session_id)
+            .get_mut(&handle.engine_session_id)
             .ok_or_else(|| {
                 format!(
                     "quickjs-ng runtime session not found: {}",
@@ -608,7 +655,11 @@ impl QuickJsNativeStore {
                 argv: bridge.argv.clone(),
                 env: bridge.env.clone(),
                 vfs: bridge.vfs.clone(),
+                clock_ms: 0,
                 next_timer_id: 1,
+                timers: BTreeMap::new(),
+                pending_events: Vec::new(),
+                exit_code: None,
             },
         );
         Ok(())
@@ -636,12 +687,7 @@ impl QuickJsNativeStore {
         let context = self
             .contexts
             .get(&handle.engine_context_id)
-            .ok_or_else(|| {
-                format!(
-                    "quickjs-ng context not found: {}",
-                    handle.engine_context_id
-                )
-            })?;
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
 
         let source = CString::new(request.source.as_str()).map_err(|_| {
             format!(
@@ -657,12 +703,8 @@ impl QuickJsNativeStore {
         })?;
 
         let eval_flags = match request.mode {
-            EngineEvalMode::Script => {
-                (qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_STRICT) as i32
-            }
-            EngineEvalMode::Module => {
-                (qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_STRICT) as i32
-            }
+            EngineEvalMode::Script => (qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_STRICT) as i32,
+            EngineEvalMode::Module => (qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_STRICT) as i32,
         };
 
         let value = unsafe {
@@ -771,7 +813,7 @@ impl QuickJsNativeStore {
     ) -> Result<Option<EngineBridgeSnapshot>, String> {
         let session = self
             .sessions
-            .get(&handle.engine_session_id)
+            .get_mut(&handle.engine_session_id)
             .ok_or_else(|| {
                 format!(
                     "quickjs-ng runtime session not found: {}",
@@ -781,7 +823,7 @@ impl QuickJsNativeStore {
         let Some(bridge) = session
             .opaque
             .bridges_by_context
-            .get(&handle.engine_context_id)
+            .get_mut(&handle.engine_context_id)
         else {
             return Ok(None);
         };
@@ -789,19 +831,109 @@ impl QuickJsNativeStore {
         Ok(Some(EngineBridgeSnapshot {
             cwd: bridge.cwd.clone(),
             vfs: bridge.vfs.clone(),
+            events: std::mem::take(&mut bridge.pending_events),
+            timers: bridge
+                .timers
+                .values()
+                .map(|entry| entry.timer.clone())
+                .collect(),
+            exit_code: bridge.exit_code,
         }))
+    }
+
+    fn fire_timers(
+        &mut self,
+        handle: &EngineContextHandle,
+        now_ms: u64,
+        timer_ids: &[String],
+    ) -> Result<usize, String> {
+        let context = self
+            .contexts
+            .get(&handle.engine_context_id)
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+        let session = self
+            .sessions
+            .get_mut(&handle.engine_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "quickjs-ng runtime session not found: {}",
+                    handle.engine_session_id
+                )
+            })?;
+        let bridge = session
+            .opaque
+            .bridges_by_context
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| {
+                format!(
+                    "quickjs-ng runtime bridge missing context {}",
+                    handle.engine_context_id
+                )
+            })?;
+        bridge.clock_ms = now_ms;
+
+        let mut fired = 0usize;
+        for timer_id in timer_ids {
+            let Some(mut stored_timer) = bridge.timers.remove(timer_id) else {
+                continue;
+            };
+            let global = unsafe { qjs::JS_GetGlobalObject(context.context) };
+            let runtime_value =
+                unsafe { qjs::JS_GetPropertyStr(context.context, global, c"__runtime".as_ptr()) };
+            let fire_timer = unsafe {
+                qjs::JS_GetPropertyStr(context.context, runtime_value, c"fireTimer".as_ptr())
+            };
+            let callback_id = quickjs_new_string(context.context, &stored_timer.callback_id);
+            let repeat_value =
+                quickjs_new_bool(stored_timer.timer.kind == HostRuntimeTimerKind::Interval);
+            let mut args = [callback_id, repeat_value];
+            let result = unsafe {
+                qjs::JS_Call(
+                    context.context,
+                    fire_timer,
+                    runtime_value,
+                    args.len() as i32,
+                    args.as_mut_ptr(),
+                )
+            };
+            unsafe {
+                qjs::JS_FreeValue(context.context, fire_timer);
+                qjs::JS_FreeValue(context.context, runtime_value);
+                qjs::JS_FreeValue(context.context, global);
+            }
+            if unsafe { qjs::JS_IsException(result) } {
+                unsafe {
+                    qjs::JS_FreeValue(context.context, result);
+                }
+                return Err(format!(
+                    "quickjs-ng timer callback failed: {}",
+                    self.take_exception_string(context.context)
+                ));
+            }
+            let keep_alive = unsafe { qjs::JS_ToBool(context.context, result) != 0 };
+            unsafe {
+                qjs::JS_FreeValue(context.context, result);
+            }
+            fired += 1;
+
+            if stored_timer.timer.kind == HostRuntimeTimerKind::Interval && keep_alive {
+                let step = stored_timer.timer.delay_ms.max(1);
+                while stored_timer.timer.due_at_ms <= now_ms {
+                    stored_timer.timer.due_at_ms =
+                        stored_timer.timer.due_at_ms.saturating_add(step);
+                }
+                bridge.timers.insert(timer_id.clone(), stored_timer);
+            }
+        }
+
+        Ok(fired)
     }
 
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
         let context = self
             .contexts
             .get(&handle.engine_context_id)
-            .ok_or_else(|| {
-                format!(
-                    "quickjs-ng context not found: {}",
-                    handle.engine_context_id
-                )
-            })?;
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
 
         let mut drained_jobs = 0usize;
         while unsafe { qjs::JS_IsJobPending(context.runtime) } {
@@ -855,7 +987,9 @@ impl QuickJsNativeStore {
                 session
                     .opaque
                     .bridges_by_context
-                    .remove(&handle.engine_context_id);
+                    .remove(&handle.engine_context_id)
+                    .into_iter()
+                    .for_each(drop);
                 if session.opaque.active_context_id.as_deref()
                     == Some(handle.engine_context_id.as_str())
                 {
@@ -942,7 +1076,9 @@ unsafe extern "C" fn quickjs_native_module_normalize(
         .into_owned();
 
     let importer = (!module_base_name.is_null()).then(|| unsafe {
-        CStr::from_ptr(module_base_name).to_string_lossy().into_owned()
+        CStr::from_ptr(module_base_name)
+            .to_string_lossy()
+            .into_owned()
     });
 
     let resolved = if let Some(base_name) = importer.clone() {
@@ -950,7 +1086,11 @@ unsafe extern "C" fn quickjs_native_module_normalize(
             .active_context_id
             .as_ref()
             .and_then(|context_id| runtime.aliases_by_context.get(context_id))
-            .and_then(|aliases| aliases.get(&(base_name.clone(), requested.clone())).cloned())
+            .and_then(|aliases| {
+                aliases
+                    .get(&(base_name.clone(), requested.clone()))
+                    .cloned()
+            })
             .or_else(|| {
                 runtime.active_context_id.as_ref().and_then(|context_id| {
                     quickjs_runtime_resolve_specifier(
@@ -995,9 +1135,7 @@ unsafe extern "C" fn quickjs_native_module_loader(
     let Some(modules) = runtime.modules_by_context.get(&active_context_id) else {
         return quickjs_throw_module_error(
             ctx,
-            &format!(
-                "quickjs-ng module loader has no registry for context {active_context_id}"
-            ),
+            &format!("quickjs-ng module loader has no registry for context {active_context_id}"),
         );
     };
     let Some(source) = modules.get(&module_name) else {
@@ -1105,7 +1243,10 @@ unsafe extern "C" fn quickjs_runtime_invoke(
         return quickjs_throw_value_error(ctx, "quickjs-ng runtime bridge requires a command");
     };
     let Ok(kind) = quickjs_value_to_string(ctx, kind_value) else {
-        return quickjs_throw_value_error(ctx, "quickjs-ng runtime bridge command must be a string");
+        return quickjs_throw_value_error(
+            ctx,
+            "quickjs-ng runtime bridge command must be a string",
+        );
     };
     let payload = arguments.get(1).copied().unwrap_or(qjs::JS_UNDEFINED);
 
@@ -1128,7 +1269,14 @@ unsafe extern "C" fn quickjs_runtime_invoke(
             bridge.cwd = resolved;
             qjs::JS_UNDEFINED
         }
-        "process.exit" => qjs::JS_UNDEFINED,
+        "process.exit" => {
+            let code = quickjs_get_optional_i32_property(ctx, payload, "code").unwrap_or(0);
+            bridge.exit_code = Some(code);
+            bridge
+                .pending_events
+                .push(HostRuntimeEvent::ProcessExit { code });
+            qjs::JS_UNDEFINED
+        }
         "process.argv" => quickjs_new_string_array(ctx, &bridge.argv),
         "process.env" => quickjs_new_string_map(ctx, &bridge.env),
         "fs.exists" => {
@@ -1140,7 +1288,14 @@ unsafe extern "C" fn quickjs_runtime_invoke(
             };
             let resolved = quickjs_bridge_resolve_path(&bridge.cwd, &path);
             let object = quickjs_new_object(ctx);
-            if quickjs_set_property(ctx, object, "exists", quickjs_new_bool(bridge.vfs.exists(&resolved))).is_err() {
+            if quickjs_set_property(
+                ctx,
+                object,
+                "exists",
+                quickjs_new_bool(bridge.vfs.exists(&resolved)),
+            )
+            .is_err()
+            {
                 return qjs::JS_EXCEPTION;
             }
             object
@@ -1212,11 +1367,17 @@ unsafe extern "C" fn quickjs_runtime_invoke(
         }
         "fs.mkdir" => {
             let Ok(path) = quickjs_get_required_string_property(ctx, payload, "path") else {
-                return quickjs_throw_value_error(ctx, "quickjs-ng fs.mkdir requires a string path");
+                return quickjs_throw_value_error(
+                    ctx,
+                    "quickjs-ng fs.mkdir requires a string path",
+                );
             };
             let resolved = quickjs_bridge_resolve_path(&bridge.cwd, &path);
             if let Err(error) = bridge.vfs.create_dir_all(&resolved) {
-                return quickjs_throw_value_error(ctx, &format!("quickjs-ng fs.mkdir failed: {error}"));
+                return quickjs_throw_value_error(
+                    ctx,
+                    &format!("quickjs-ng fs.mkdir failed: {error}"),
+                );
             }
             qjs::JS_UNDEFINED
         }
@@ -1228,7 +1389,8 @@ unsafe extern "C" fn quickjs_runtime_invoke(
                 );
             };
             let resolved = quickjs_bridge_resolve_path(&bridge.cwd, &path);
-            let is_text = quickjs_get_optional_bool_property(ctx, payload, "isText").unwrap_or(false);
+            let is_text =
+                quickjs_get_optional_bool_property(ctx, payload, "isText").unwrap_or(false);
             let bytes_value = unsafe { qjs::JS_GetPropertyStr(ctx, payload, c"bytes".as_ptr()) };
             let bytes = quickjs_extract_bytes(ctx, bytes_value, is_text);
             unsafe {
@@ -1248,10 +1410,7 @@ unsafe extern "C" fn quickjs_runtime_invoke(
             }
             qjs::JS_UNDEFINED
         }
-        "path.resolve" => quickjs_wrap_path_value(
-            ctx,
-            quickjs_path_resolve(ctx, bridge, payload),
-        ),
+        "path.resolve" => quickjs_wrap_path_value(ctx, quickjs_path_resolve(ctx, bridge, payload)),
         "path.join" => quickjs_wrap_path_value(ctx, quickjs_path_join(ctx, payload)),
         "path.dirname" => quickjs_wrap_path_value(
             ctx,
@@ -1259,7 +1418,13 @@ unsafe extern "C" fn quickjs_runtime_invoke(
                 let normalized = normalize_posix_path(&path);
                 normalized
                     .rsplit_once('/')
-                    .map(|(parent, _)| if parent.is_empty() { "/".into() } else { parent.into() })
+                    .map(|(parent, _)| {
+                        if parent.is_empty() {
+                            "/".into()
+                        } else {
+                            parent.into()
+                        }
+                    })
                     .unwrap_or_else(|| ".".into())
             }),
         ),
@@ -1290,18 +1455,41 @@ unsafe extern "C" fn quickjs_runtime_invoke(
             quickjs_get_required_string_property(ctx, payload, "path")
                 .map(|path| normalize_posix_path(&path)),
         ),
-        "console.emit" => qjs::JS_UNDEFINED,
+        "console.emit" => {
+            let level = quickjs_get_optional_console_level_property(ctx, payload, "level")
+                .unwrap_or(HostRuntimeConsoleLevel::Log);
+            let values =
+                quickjs_get_string_array_property(ctx, payload, "values").unwrap_or_default();
+            let line = values.join(" ");
+            bridge.pending_events.push(HostRuntimeEvent::Console {
+                level: level.clone(),
+                line: line.clone(),
+            });
+            bridge.pending_events.push(match level {
+                HostRuntimeConsoleLevel::Warn | HostRuntimeConsoleLevel::Error => {
+                    HostRuntimeEvent::Stderr { chunk: line }
+                }
+                HostRuntimeConsoleLevel::Log | HostRuntimeConsoleLevel::Info => {
+                    HostRuntimeEvent::Stdout { chunk: line }
+                }
+            });
+            qjs::JS_UNDEFINED
+        }
         "timers.schedule" => {
             let delay_ms = quickjs_get_optional_i32_property(ctx, payload, "delayMs")
                 .unwrap_or(0)
                 .max(0) as u64;
-            let repeat = quickjs_get_optional_bool_property(ctx, payload, "repeat").unwrap_or(false);
+            let repeat =
+                quickjs_get_optional_bool_property(ctx, payload, "repeat").unwrap_or(false);
             let timer_id = format!("native-timer-{}", bridge.next_timer_id);
             bridge.next_timer_id += 1;
             if !repeat {
-                let callback = unsafe { qjs::JS_GetPropertyStr(ctx, payload, c"callback".as_ptr()) };
+                let callback =
+                    unsafe { qjs::JS_GetPropertyStr(ctx, payload, c"callback".as_ptr()) };
                 if unsafe { qjs::JS_IsFunction(ctx, callback) } && delay_ms == 0 {
-                    let result = unsafe { qjs::JS_Call(ctx, callback, qjs::JS_UNDEFINED, 0, ptr::null_mut()) };
+                    let result = unsafe {
+                        qjs::JS_Call(ctx, callback, qjs::JS_UNDEFINED, 0, ptr::null_mut())
+                    };
                     unsafe {
                         qjs::JS_FreeValue(ctx, callback);
                     }
@@ -1320,9 +1508,40 @@ unsafe extern "C" fn quickjs_runtime_invoke(
                     }
                 }
             }
+            if repeat || delay_ms > 0 {
+                let Ok(callback_id) =
+                    quickjs_get_required_string_property(ctx, payload, "callbackId")
+                else {
+                    return quickjs_throw_value_error(
+                        ctx,
+                        "quickjs-ng timers.schedule requires a callbackId for delayed timers",
+                    );
+                };
+                bridge.timers.insert(
+                    timer_id.clone(),
+                    QuickJsStoredTimer {
+                        timer: HostRuntimeTimer {
+                            timer_id: timer_id.clone(),
+                            kind: if repeat {
+                                HostRuntimeTimerKind::Interval
+                            } else {
+                                HostRuntimeTimerKind::Timeout
+                            },
+                            delay_ms,
+                            due_at_ms: bridge.clock_ms.saturating_add(delay_ms),
+                        },
+                        callback_id,
+                    },
+                );
+            }
             quickjs_new_string(ctx, &timer_id)
         }
-        "timers.clear" => qjs::JS_UNDEFINED,
+        "timers.clear" => {
+            if let Ok(timer_id) = quickjs_get_required_string_property(ctx, payload, "timerId") {
+                bridge.timers.remove(&timer_id);
+            }
+            qjs::JS_UNDEFINED
+        }
         _ => quickjs_throw_value_error(
             ctx,
             &format!("quickjs-ng runtime bridge does not support {kind}"),
@@ -1332,9 +1551,8 @@ unsafe extern "C" fn quickjs_runtime_invoke(
 
 #[cfg(feature = "quickjs-ng-engine")]
 fn quickjs_throw_module_error(ctx: *mut qjs::JSContext, message: &str) -> *mut qjs::JSModuleDef {
-    let value = unsafe {
-        qjs::JS_NewStringLen(ctx, message.as_ptr().cast(), message.len() as qjs::size_t)
-    };
+    let value =
+        unsafe { qjs::JS_NewStringLen(ctx, message.as_ptr().cast(), message.len() as qjs::size_t) };
     unsafe {
         qjs::JS_Throw(ctx, value);
     }
@@ -1410,11 +1628,7 @@ fn quickjs_new_object(ctx: *mut qjs::JSContext) -> qjs::JSValue {
 
 #[cfg(feature = "quickjs-ng-engine")]
 fn quickjs_new_bool(value: bool) -> qjs::JSValue {
-    if value {
-        qjs::JS_TRUE
-    } else {
-        qjs::JS_FALSE
-    }
+    if value { qjs::JS_TRUE } else { qjs::JS_FALSE }
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
@@ -1460,7 +1674,13 @@ fn quickjs_new_workspace_entry(
     };
     if quickjs_set_property(ctx, object, "path", quickjs_new_string(ctx, &entry.path)).is_err()
         || quickjs_set_property(ctx, object, "kind", quickjs_new_string(ctx, kind)).is_err()
-        || quickjs_set_property(ctx, object, "size", qjs::JS_MKVAL(qjs::JS_TAG_INT, entry.size as i32)).is_err()
+        || quickjs_set_property(
+            ctx,
+            object,
+            "size",
+            qjs::JS_MKVAL(qjs::JS_TAG_INT, entry.size as i32),
+        )
+        .is_err()
         || quickjs_set_property(ctx, object, "isText", quickjs_new_bool(entry.is_text)).is_err()
     {
         return qjs::JS_EXCEPTION;
@@ -1527,12 +1747,17 @@ fn quickjs_throw_value_error(ctx: *mut qjs::JSContext, message: &str) -> qjs::JS
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
-fn quickjs_value_to_string(ctx: *mut qjs::JSContext, value: qjs::JSValue) -> Result<String, String> {
+fn quickjs_value_to_string(
+    ctx: *mut qjs::JSContext,
+    value: qjs::JSValue,
+) -> Result<String, String> {
     let pointer = unsafe { qjs::JS_ToCString(ctx, value) };
     if pointer.is_null() {
         return Err("value is not coercible to string".into());
     }
-    let rendered = unsafe { CStr::from_ptr(pointer) }.to_string_lossy().into_owned();
+    let rendered = unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned();
     unsafe {
         qjs::JS_FreeCString(ctx, pointer);
     }
@@ -1595,6 +1820,22 @@ fn quickjs_get_optional_i32_property(
         qjs::JS_FreeValue(ctx, value);
     }
     result
+}
+
+#[cfg(feature = "quickjs-ng-engine")]
+fn quickjs_get_optional_console_level_property(
+    ctx: *mut qjs::JSContext,
+    payload: qjs::JSValue,
+    key: &str,
+) -> Option<HostRuntimeConsoleLevel> {
+    let rendered = quickjs_get_required_string_property(ctx, payload, key).ok()?;
+    match rendered.as_str() {
+        "info" => Some(HostRuntimeConsoleLevel::Info),
+        "warn" => Some(HostRuntimeConsoleLevel::Warn),
+        "error" => Some(HostRuntimeConsoleLevel::Error),
+        "log" => Some(HostRuntimeConsoleLevel::Log),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "quickjs-ng-engine")]
@@ -1717,7 +1958,9 @@ fn quickjs_materialize_module_source(
 ) -> String {
     match format {
         HostRuntimeModuleFormat::Module => source.to_string(),
-        HostRuntimeModuleFormat::Json => format!("const value = ({source});\nexport default value;\n"),
+        HostRuntimeModuleFormat::Json => {
+            format!("const value = ({source});\nexport default value;\n")
+        }
         HostRuntimeModuleFormat::CommonJs => {
             let escaped_specifier =
                 serde_json::to_string(specifier).expect("module specifier should serialize");
@@ -1813,12 +2056,8 @@ fn quickjs_ensure_module_registered(
         .iter()
         .map(|(request, resolved)| (request.as_str(), resolved.as_str()))
         .collect::<Vec<_>>();
-    let materialized = quickjs_materialize_module_source(
-        resolved_specifier,
-        &source,
-        &format,
-        &child_import_refs,
-    );
+    let materialized =
+        quickjs_materialize_module_source(resolved_specifier, &source, &format, &child_import_refs);
     runtime
         .modules_by_context
         .entry(context_id.to_string())
@@ -1984,7 +2223,9 @@ fn quickjs_resolve_package_module(
             }
         }
 
-        if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &format!("{package_root}/index")) {
+        if let Ok(resolved) =
+            quickjs_resolve_workspace_module(bridge, &format!("{package_root}/index"))
+        {
             return Ok(resolved);
         }
     }
@@ -2184,6 +2425,15 @@ impl EngineAdapter for NullEngineAdapter {
         Ok(None)
     }
 
+    fn fire_timers(
+        &mut self,
+        _handle: &EngineContextHandle,
+        _now_ms: u64,
+        _timer_ids: &[String],
+    ) -> Result<usize, String> {
+        Ok(0)
+    }
+
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
         self.state.interrupt(handle, "null engine")
     }
@@ -2254,8 +2504,7 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
     fn create_context(&mut self, spec: &EngineContextSpec) -> Result<EngineContextHandle, String> {
         let handle = self
             .state
-            .create_context(spec, "quickjs-ng-context", "quickjs-ng")
-            ?;
+            .create_context(spec, "quickjs-ng-context", "quickjs-ng")?;
         #[cfg(feature = "quickjs-ng-engine")]
         self.native.create_context(&handle)?;
         Ok(handle)
@@ -2364,17 +2613,16 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
 
         #[cfg(not(feature = "quickjs-ng-engine"))]
         {
-        let snapshot = self
-            .state
-            .describe_context(handle)
-            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+            let snapshot = self.state.describe_context(handle).ok_or_else(|| {
+                format!("quickjs-ng context not found: {}", handle.engine_context_id)
+            })?;
 
-        Err(format!(
-            "quickjs-ng adapter scaffold registered {} modules across {} loader roots for {} but the VM crate is not linked yet",
-            plan.modules.len(),
-            loader_plan.node_module_search_roots.len(),
-            snapshot.entrypoint
-        ))
+            Err(format!(
+                "quickjs-ng adapter scaffold registered {} modules across {} loader roots for {} but the VM crate is not linked yet",
+                plan.modules.len(),
+                loader_plan.node_module_search_roots.len(),
+                snapshot.entrypoint
+            ))
         }
     }
 
@@ -2450,6 +2698,24 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         {
             let _ = handle;
             Ok(None)
+        }
+    }
+
+    fn fire_timers(
+        &mut self,
+        handle: &EngineContextHandle,
+        now_ms: u64,
+        timer_ids: &[String],
+    ) -> Result<usize, String> {
+        #[cfg(feature = "quickjs-ng-engine")]
+        {
+            return self.native.fire_timers(handle, now_ms, timer_ids);
+        }
+
+        #[cfg(not(feature = "quickjs-ng-engine"))]
+        {
+            let _ = (handle, now_ms, timer_ids);
+            Ok(0)
         }
     }
 
