@@ -1,7 +1,9 @@
 import { guessContentType, type WorkspaceFileRecord } from "./analyze-archive";
-import type { RunRequest, SessionSnapshot } from "./protocol";
+import { normalizePreviewText, withAppBasePath } from "./app-base";
+import type { PreviewModel, RunRequest, SessionSnapshot } from "./protocol";
 import {
   applyWorkspaceEntryToSessionSnapshot,
+  deriveSuggestedRunRequest,
   parsePackageJsonSummary,
 } from "./runtime-session-state";
 
@@ -79,6 +81,7 @@ export type HostEngineContextSnapshot = {
   pendingJobs: number;
   registeredModules: number;
   bootstrapSpecifier: string | null;
+  bridgeReady: boolean;
   moduleLoaderRoots: string[];
   state: HostEngineContextState;
 };
@@ -124,11 +127,7 @@ export type HostRuntimeStartupReport = {
 
 export type HostRuntimePreviewLaunchReport = {
   startup: HostRuntimeStartupReport;
-  server: HostRuntimeHttpServer | null;
-  port: HostRuntimePort | null;
-  rootRequest: HostRuntimeHttpRequest | null;
-  rootRequestHint: HostPreviewRequestHint | null;
-  rootResponseDescriptor: HostPreviewResponseDescriptor | null;
+  rootReport: HostRuntimePreviewRequestReport | null;
 };
 
 export type HostWorkspaceFileIndexSummary = {
@@ -145,15 +144,29 @@ export type HostSessionStateReport = {
   workspaceRoot: string;
   archive: SessionSnapshot["archive"];
   packageJson: SessionSnapshot["packageJson"];
+  suggestedRunRequest: RunRequest | null;
   capabilities: SessionSnapshot["capabilities"];
   hostFiles: HostWorkspaceFileIndexSummary;
 };
 
 export type HostRuntimePreviewStateReport = {
   port: HostRuntimePort;
+  url: string;
+  model: PreviewModel;
   rootRequest: HostRuntimeHttpRequest;
   rootRequestHint: HostPreviewRequestHint;
   rootResponseDescriptor: HostPreviewResponseDescriptor;
+  rootHydratedFiles: HostWorkspaceFileContent[];
+  host: HostBootstrapSummary;
+  run: HostRunPlan;
+  hostFiles: HostWorkspaceFileIndexSummary;
+};
+
+export type HostRuntimePreviewReadyReport = {
+  port: HostRuntimePort;
+  url: string;
+  model: PreviewModel;
+  rootHydratedFiles: HostWorkspaceFileContent[];
   host: HostBootstrapSummary;
   run: HostRunPlan;
   hostFiles: HostWorkspaceFileIndexSummary;
@@ -173,7 +186,8 @@ export type HostRuntimeLaunchReport = {
   bootstrapPlan: HostRuntimeBootstrapPlan;
   previewLaunch: HostRuntimePreviewLaunchReport;
   state: HostRuntimeStateReport;
-  startupLogs: string[];
+  startupStdout: string[];
+  previewReady: HostRuntimePreviewReadyReport | null;
   events: HostRuntimeEvent[];
 };
 
@@ -185,6 +199,24 @@ export type HostRuntimePreviewRequestReport = {
   responseDescriptor: HostPreviewResponseDescriptor;
   hydrationPaths: string[];
   hydratedFiles: HostWorkspaceFileContent[];
+  transformKind: HostRuntimePreviewTransformKind | null;
+  renderPlan: HostRuntimePreviewRenderPlan | null;
+  modulePlan: HostRuntimePreviewModulePlan | null;
+  directResponse: HostRuntimeDirectHttpResponse | null;
+};
+
+export type HostRuntimePreviewTransformKind =
+  | "module"
+  | "html-document"
+  | "stylesheet"
+  | "svg-document"
+  | "plain-text"
+  | "binary";
+
+export type HostRuntimePreviewRenderPlan = {
+  kind: "workspace-file" | "app-shell" | "host-managed-fallback";
+  workspacePath: string | null;
+  documentRoot: string | null;
 };
 
 export type HostRuntimeShutdownReport = {
@@ -230,6 +262,18 @@ export type HostRuntimeModuleImportPlan = {
   loadedModule: HostRuntimeLoadedModule;
 };
 
+export type HostRuntimePreviewModulePlan = {
+  importerPath: string;
+  format: HostRuntimeModuleFormat;
+  importPlans: HostRuntimePreviewImportPlan[];
+};
+
+export type HostRuntimePreviewImportPlan = {
+  requestSpecifier: string;
+  previewSpecifier: string;
+  format: HostRuntimeModuleFormat;
+};
+
 export type HostRuntimeModuleLoaderPlan = {
   contextId: string;
   engineName: string;
@@ -265,11 +309,58 @@ export type HostRuntimePort = {
   protocol: HostRuntimePortProtocol;
 };
 
+export type HostRuntimePreviewClientModule = {
+  specifier: string;
+  url: string;
+};
+
 export type HostRuntimeHttpRequest = {
   port: number;
   method: string;
   relativePath: string;
   search: string;
+  clientModules?: HostRuntimePreviewClientModule[] | null;
+};
+
+export type HostRuntimeDirectHttpResponse = {
+  status: number;
+  headers: Record<string, string>;
+  textBody: string | null;
+  bytes: Uint8Array | null;
+};
+
+type MockPreviewGuestAppShell = {
+  entryUrl: string;
+  stylesheetUrls: string[];
+  reactUrl: string;
+  reactDomClientUrl: string;
+};
+
+function findPreviewClientModuleUrl(
+  modules: HostRuntimePreviewClientModule[] | null | undefined,
+  specifier: string,
+): string | null {
+  return modules?.find((module) => module.specifier === specifier)?.url ?? null;
+}
+
+type PackageExportValue =
+  | string
+  | null
+  | {
+      style?: PackageExportValue | string;
+      browser?: PackageExportValue | string;
+      default?: PackageExportValue | string;
+      import?: PackageExportValue | string;
+      module?: PackageExportValue | string;
+      require?: PackageExportValue | string;
+      [key: string]: PackageExportValue | string | undefined;
+    };
+
+type PackageManifest = {
+  style?: string;
+  exports?: {
+    [key: string]: PackageExportValue | undefined;
+  };
 };
 
 export type HostRuntimeHttpServerKind = "preview";
@@ -523,6 +614,24 @@ function buildMockRuntimeBindings(contextId: string, entrypoint: string): HostRu
         modules: ["console", "node:console"],
         commandPrefixes: ["console"],
       },
+      {
+        name: "perf_hooks",
+        globals: ["performance"],
+        modules: ["node:perf_hooks"],
+        commandPrefixes: [],
+      },
+      {
+        name: "module",
+        globals: [],
+        modules: ["node:module"],
+        commandPrefixes: [],
+      },
+      {
+        name: "inspector",
+        globals: [],
+        modules: ["node:inspector"],
+        commandPrefixes: [],
+      },
     ],
   };
 }
@@ -651,13 +760,59 @@ export default consoleValue;
 `,
       },
       {
+        specifier: "node:perf_hooks",
+        source: `const performanceValue =
+  globalThis.performance ??
+  {
+    now() {
+      return Date.now();
+    },
+  };
+export const performance = performanceValue;
+export default { performance };
+`,
+      },
+      {
+        specifier: "node:module",
+        source: `const moduleValue = {
+  enableCompileCache() {},
+  flushCompileCache() {},
+};
+export const enableCompileCache = (...args) => moduleValue.enableCompileCache(...args);
+export const flushCompileCache = (...args) => moduleValue.flushCompileCache(...args);
+export default moduleValue;
+`,
+      },
+      {
+        specifier: "node:inspector",
+        source: `class Session {
+  connect() {}
+  post(_method, callback) {
+    if (typeof callback === "function") {
+      callback();
+    }
+  }
+  disconnect() {}
+}
+const inspectorValue = { Session };
+export { Session };
+export default inspectorValue;
+`,
+      },
+      ...MOCK_BROWSER_CLI_SHIMS.filter((shim) => shim.specifier === entrypoint).map((shim) => ({
+        specifier: shim.specifier,
+        source: renderMockBrowserCliShimSource(shim),
+      })),
+      {
         specifier: bootstrapSpecifier,
         source: `import process from "node:process";
+import { performance } from "node:perf_hooks";
 import { Buffer } from "node:buffer";
 import consoleValue from "node:console";
 import { setTimeout, clearTimeout, setInterval, clearInterval } from "node:timers";
 
 globalThis.process = process;
+globalThis.performance = performance;
 globalThis.Buffer = Buffer;
 globalThis.console = consoleValue;
 globalThis.setTimeout = setTimeout;
@@ -730,6 +885,7 @@ export type HostPreviewRequestHint =
   | {
       kind:
         | "fallback-root"
+        | "bootstrap-state"
         | "runtime-state"
         | "workspace-state"
         | "file-index"
@@ -771,6 +927,7 @@ export type HostPreviewResponseDescriptor =
   | {
       kind:
         | "host-managed-fallback"
+        | "bootstrap-state"
         | "runtime-state"
         | "workspace-state"
         | "file-index"
@@ -875,7 +1032,44 @@ type WasmRuntimeHostExports = {
   runtime_host_stop_session_json(ptr: number, len: number): number;
 };
 
-const DEFAULT_RUNTIME_HOST_WASM_URL = "/runtime-host.wasm";
+const DEFAULT_RUNTIME_HOST_WASM_URL = withAppBasePath("/runtime-host-qjs.wasm");
+
+type RuntimeHostWasmImportDescriptor = Pick<
+  WebAssembly.ModuleImportDescriptor,
+  "module" | "name" | "kind"
+>;
+
+function createRuntimeHostWasmImportStub(
+  descriptor: RuntimeHostWasmImportDescriptor,
+): (...args: number[]) => never {
+  return (..._args: number[]) => {
+    throw new Error(
+      `runtime-host wasm import ${descriptor.module}.${descriptor.name} is not wired yet`,
+    );
+  };
+}
+
+export function createRuntimeHostWasmImports(
+  descriptors: readonly RuntimeHostWasmImportDescriptor[],
+): WebAssembly.Imports {
+  const imports: Record<string, Record<string, WebAssembly.ImportValue>> = {};
+
+  for (const descriptor of descriptors) {
+    if (descriptor.kind !== "function") {
+      throw new Error(
+        `runtime-host wasm import ${descriptor.module}.${descriptor.name} has unsupported kind ${descriptor.kind}`,
+      );
+    }
+
+    if (!(descriptor.module in imports)) {
+      imports[descriptor.module] = {};
+    }
+
+    imports[descriptor.module]![descriptor.name] = createRuntimeHostWasmImportStub(descriptor);
+  }
+
+  return imports;
+}
 
 type HostSessionRecord = {
   handle: HostSessionHandle;
@@ -895,6 +1089,7 @@ type HostRuntimeContextRecord = {
   engineState: HostEngineContextState;
   registeredModules: number;
   bootstrapSpecifier: string | null;
+  bridgeReady: boolean;
   moduleLoaderRoots: string[];
   clockMs: number;
   nextPort: number;
@@ -904,6 +1099,35 @@ type HostRuntimeContextRecord = {
   events: HostRuntimeEvent[];
   exitCode: number | null;
 };
+
+const MOCK_PREVIEW_APP_ENTRY_CANDIDATES = [
+  "/workspace/src/main.tsx",
+  "/workspace/src/main.jsx",
+  "/workspace/src/main.ts",
+  "/workspace/src/main.js",
+  "/workspace/src/index.tsx",
+  "/workspace/src/index.jsx",
+  "/workspace/src/index.ts",
+  "/workspace/src/index.js",
+  "/workspace/app/routes/home.tsx",
+  "/workspace/app/routes/home.jsx",
+  "/workspace/app/routes/index.tsx",
+  "/workspace/app/routes/index.jsx",
+] as const;
+
+const MOCK_PREVIEW_GUEST_COMPONENT_CANDIDATES = [
+  "/workspace/app/routes/home.tsx",
+  "/workspace/app/routes/home.jsx",
+  "/workspace/app/routes/index.tsx",
+  "/workspace/app/routes/index.jsx",
+] as const;
+
+const MOCK_PREVIEW_GUEST_STYLESHEET_CANDIDATES = [
+  "/workspace/app/app.css",
+  "/workspace/src/index.css",
+  "/workspace/src/App.css",
+  "/workspace/src/app.css",
+] as const;
 
 function describeMockPreviewResponse(
   requestHint: HostPreviewRequestHint,
@@ -958,6 +1182,7 @@ function describeMockPreviewResponse(
         allowMethods: [],
         omitBody,
       };
+    case "bootstrap-state":
     case "runtime-state":
     case "workspace-state":
     case "file-index":
@@ -1094,11 +1319,33 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
   }
 
   async buildProcessInfo(sessionId: string, request: RunRequest): Promise<HostProcessInfo> {
+    const record = this.sessions.get(sessionId);
+    if (!record) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
     const runPlan = await this.planRun(sessionId, request);
-    const argv =
+    const { entrypoint, argv } =
       runPlan.commandKind === "node-entrypoint"
-        ? ["/virtual/node", runPlan.entrypoint, ...request.args.slice(1)]
-        : ["/virtual/node", "npm", "run", runPlan.entrypoint, ...request.args.slice(2)];
+        ? {
+            entrypoint: runPlan.entrypoint,
+            argv: ["/virtual/node", runPlan.entrypoint, ...request.args.slice(1)],
+          }
+        : (() => {
+            const resolved = resolveMockNpmScriptProcessEntrypoint(
+              record.files,
+              runPlan.cwd,
+              runPlan,
+            );
+            return {
+              entrypoint: resolved.entrypoint,
+              argv: [
+                "/virtual/node",
+                resolved.entrypoint,
+                ...resolved.argvTail,
+                ...request.args.slice(2),
+              ],
+            };
+          })();
 
     return {
       cwd: runPlan.cwd,
@@ -1106,7 +1353,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       env: request.env ?? {},
       execPath: "/virtual/node",
       platform: "browser",
-      entrypoint: runPlan.entrypoint,
+      entrypoint,
       commandLine: runPlan.commandLine,
       commandKind: runPlan.commandKind,
     };
@@ -1124,6 +1371,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       engineState: "booted" as HostEngineContextState,
       registeredModules: 0,
       bootstrapSpecifier: null as string | null,
+      bridgeReady: false,
       moduleLoaderRoots: [] as string[],
       clockMs: 0,
       nextPort: 3000,
@@ -1177,27 +1425,79 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
     if (stateResponse.kind !== "runtime-state") {
       throw new Error("launchRuntime expected runtime-state response");
     }
-    const previewState = previewLaunchResponse.report.port
+    const sessionRecord = this.sessions.get(sessionId);
+    if (!sessionRecord) {
+      throw new Error(`Rust host session not found: ${sessionId}`);
+    }
+    const runtimeContextRecord = this.runtimeContexts.get(runtimeContext.contextId);
+    if (!runtimeContextRecord) {
+      throw new Error(`runtime context not found: ${runtimeContext.contextId}`);
+    }
+    const rootReport = previewLaunchResponse.report.rootReport;
+    const rootHydratedFiles = rootReport?.hydratedFiles ?? [];
+    const previewState = rootReport
       ? {
-          ...(stateResponse.report.preview ?? {
-            host: bootSummary,
-            run: runPlan,
-            hostFiles: buildMockHostWorkspaceFileIndexSummary(this.sessions.get(sessionId)!),
-          }),
-          port: previewLaunchResponse.report.port,
-          rootRequest: previewLaunchResponse.report.rootRequest ?? {
-            port: previewLaunchResponse.report.port.port,
+          ...(stateResponse.report.preview ??
+            buildMockPreviewStateReport(
+              runtimeContextRecord,
+              sessionRecord,
+              rootReport?.requestHint ?? {
+                kind: "fallback-root",
+                workspacePath: null,
+                documentRoot: null,
+                hydratePaths: [],
+              },
+              rootReport?.responseDescriptor ?? {
+                kind: "host-managed-fallback",
+                workspacePath: null,
+                documentRoot: null,
+                hydratePaths: [],
+                statusCode: 200,
+                contentType: "text/html; charset=utf-8",
+                allowMethods: [],
+                omitBody: false,
+              },
+              rootHydratedFiles,
+            )),
+          port: rootReport.port,
+          url:
+            stateResponse.report.preview?.url ?? `/preview/${sessionId}/${rootReport.port.port}/`,
+          model:
+            stateResponse.report.preview?.model ??
+            buildMockPreviewStateReport(
+              runtimeContextRecord,
+              sessionRecord,
+              rootReport?.requestHint ?? {
+                kind: "fallback-root",
+                workspacePath: null,
+                documentRoot: null,
+                hydratePaths: [],
+              },
+              rootReport?.responseDescriptor ?? {
+                kind: "host-managed-fallback",
+                workspacePath: null,
+                documentRoot: null,
+                hydratePaths: [],
+                statusCode: 200,
+                contentType: "text/html; charset=utf-8",
+                allowMethods: [],
+                omitBody: false,
+              },
+              rootHydratedFiles,
+            ).model,
+          rootRequest: rootReport.request ?? {
+            port: rootReport.port.port,
             method: "GET",
             relativePath: "/",
             search: "",
           },
-          rootRequestHint: previewLaunchResponse.report.rootRequestHint ?? {
+          rootRequestHint: rootReport.requestHint ?? {
             kind: "fallback-root",
             workspacePath: null,
             documentRoot: null,
             hydratePaths: [],
           },
-          rootResponseDescriptor: previewLaunchResponse.report.rootResponseDescriptor ?? {
+          rootResponseDescriptor: rootReport.responseDescriptor ?? {
             kind: "host-managed-fallback",
             workspacePath: null,
             documentRoot: null,
@@ -1207,11 +1507,53 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
             allowMethods: [],
             omitBody: false,
           },
+          rootHydratedFiles,
           host: bootSummary,
           run: runPlan,
-          hostFiles: buildMockHostWorkspaceFileIndexSummary(this.sessions.get(sessionId)!),
+          hostFiles: buildMockHostWorkspaceFileIndexSummary(sessionRecord),
         }
       : stateResponse.report.preview;
+    const browserCliShim =
+      findMockBrowserCliShimBySpecifier(runPlan.entrypoint) ??
+      findMockBrowserCliShimForResolvedScript(runPlan.resolvedScript);
+    const startupStdout = [
+      `[mount] ${stateResponse.report.session.archive.fileCount} files available at ${stateResponse.report.session.workspaceRoot}`,
+      `[exec] ${runPlan.commandLine}`,
+      ...(runPlan.resolvedScript ? [`[script] ${runPlan.resolvedScript}`] : []),
+      `[host-vfs] files=${stateResponse.report.session.hostFiles.count} sample=${stateResponse.report.session.hostFiles.samplePath ?? "<none>"} size=${stateResponse.report.session.hostFiles.sampleSize ?? 0}`,
+      `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
+      `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
+      `[process] exec=${runtimeContext.process.execPath} cwd=${runtimeContext.process.cwd} argv=${runtimeContext.process.argv.join(" ")}`,
+      `[engine-context] state=${engineContext.state} pending-jobs=${engineContext.pendingJobs} bridge-ready=${String(engineContext.bridgeReady)} entry=${engineContext.entrypoint}`,
+      `[bindings] globals=${bindingsResponse.bindings.globals.join(",")} builtins=${bindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`,
+      `[bootstrap] bootstrap=${bootstrapResponse.plan.bootstrapSpecifier} modules=${bootstrapResponse.plan.modules.map((module) => module.specifier).join(",")}`,
+      ...(browserCliShim
+        ? [
+            `[browser-cli] runtime=${browserCliShim.runtimeKind} preview=${browserCliShim.previewRole} mode=${browserCliShim.mode}`,
+          ]
+        : []),
+      `[context] id=${runtimeContext.contextId}`,
+      `[detect] react=${String(this.sessions.get(sessionId)?.capabilities.detectedReact ?? false)}`,
+      ...(previewLaunchResponse.report.startup.exited
+        ? [
+            `[process] exited before preview code=${previewLaunchResponse.report.startup.exitCode ?? 0}`,
+          ]
+        : previewState
+          ? [`[preview] server-ready ${previewState.url}`]
+          : []),
+    ];
+    const previewReady =
+      previewState == null
+        ? null
+        : {
+            port: previewState.port,
+            url: previewState.url,
+            model: previewState.model,
+            rootHydratedFiles: previewState.rootHydratedFiles,
+            host: previewState.host,
+            run: previewState.run,
+            hostFiles: previewState.hostFiles,
+          };
 
     return {
       bootSummary,
@@ -1225,16 +1567,8 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         ...stateResponse.report,
         preview: previewState,
       },
-      startupLogs: [
-        `[host] engine=${bootSummary.engineName} interrupts=${bootSummary.supportsInterrupts} module-loader=${bootSummary.supportsModuleLoader}`,
-        `[plan] cwd=${runPlan.cwd} entry=${runPlan.entrypoint} env=${runPlan.envCount}`,
-        `[process] exec=${runtimeContext.process.execPath} cwd=${runtimeContext.process.cwd} argv=${runtimeContext.process.argv.join(" ")}`,
-        `[engine-context] state=${engineContext.state} pending-jobs=${engineContext.pendingJobs} entry=${engineContext.entrypoint}`,
-        `[bindings] globals=${bindingsResponse.bindings.globals.join(",")} builtins=${bindingsResponse.bindings.builtins.map((builtin) => builtin.name).join(",")}`,
-        `[bootstrap] bootstrap=${bootstrapResponse.plan.bootstrapSpecifier} modules=${bootstrapResponse.plan.modules.map((module) => module.specifier).join(",")}`,
-        `[context] id=${runtimeContext.contextId}`,
-        `[detect] react=${String(this.sessions.get(sessionId)?.capabilities.detectedReact ?? false)} vite=${String(this.sessions.get(sessionId)?.capabilities.detectedVite ?? false)}`,
-      ],
+      startupStdout,
+      previewReady,
       events: await this.executeRuntimeCommand(runtimeContext.contextId, {
         kind: "runtime.drain-events",
       }).then((response) => (response.kind === "runtime-events" ? response.events : [])),
@@ -1259,6 +1593,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       pendingJobs: 0,
       registeredModules: context.registeredModules,
       bootstrapSpecifier: context.bootstrapSpecifier,
+      bridgeReady: context.bridgeReady,
       moduleLoaderRoots: context.moduleLoaderRoots,
       state: context.engineState,
     };
@@ -1651,6 +1986,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
 
         context.registeredModules = plan.modules.length;
         context.bootstrapSpecifier = plan.bootstrapSpecifier;
+        context.bridgeReady = true;
         context.moduleLoaderRoots = loaderPlan.nodeModuleSearchRoots;
 
         return {
@@ -1711,11 +2047,7 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
             kind: "runtime-preview-launch",
             report: {
               startup: startupResponse.report,
-              server: null,
-              port: null,
-              rootRequest: null,
-              rootRequestHint: null,
-              rootResponseDescriptor: null,
+              rootReport: null,
             },
           };
         }
@@ -1739,15 +2071,18 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         if (resolvedResponse.kind !== "preview-request-resolved") {
           throw new Error("runtime.launch-preview expected preview-request-resolved response");
         }
+        const rootPreviewRequest = await this.executeRuntimeCommand(contextId, {
+          kind: "runtime.preview-request",
+          request: rootRequest,
+        });
+        if (rootPreviewRequest.kind !== "runtime-preview-request") {
+          throw new Error("runtime.launch-preview expected runtime-preview-request response");
+        }
         return {
           kind: "runtime-preview-launch",
           report: {
             startup: startupResponse.report,
-            server: resolvedResponse.server,
-            port: resolvedResponse.port,
-            rootRequest,
-            rootRequestHint: resolvedResponse.requestHint,
-            rootResponseDescriptor: resolvedResponse.responseDescriptor,
+            rootReport: rootPreviewRequest.report,
           },
         };
       }
@@ -1756,18 +2091,29 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
         if (!server) {
           throw new Error(`runtime http server not found: ${command.request.port}`);
         }
+        const record = this.sessions.get(context.sessionId);
+        if (!record) {
+          throw new Error(`Rust host session not found: ${context.sessionId}`);
+        }
         const requestHint = await this.resolvePreviewRequestHint(
           context.sessionId,
           command.request.relativePath,
         );
         const responseDescriptor = describeMockPreviewResponse(requestHint, command.request.method);
+        const modulePlan = buildMockPreviewModulePlan(
+          record,
+          responseDescriptor.workspacePath ?? requestHint.workspacePath ?? null,
+        );
 
         return {
           kind: "runtime-preview-request",
           report: {
             server,
             port: server.port,
-            request: { ...command.request },
+            request: {
+              ...command.request,
+              clientModules: command.request.clientModules ?? [],
+            },
             requestHint,
             responseDescriptor,
             hydrationPaths:
@@ -1779,6 +2125,22 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
               responseDescriptor.hydratePaths.length > 0
                 ? responseDescriptor.hydratePaths
                 : requestHint.hydratePaths,
+            ),
+            transformKind: describeMockPreviewTransformKind(
+              responseDescriptor.workspacePath ?? requestHint.workspacePath ?? null,
+              modulePlan,
+            ),
+            renderPlan: buildMockPreviewRenderPlan(requestHint, responseDescriptor),
+            modulePlan,
+            directResponse: buildMockDirectPreviewResponse(
+              context,
+              this.sessions.get(context.sessionId)!,
+              command.request,
+              responseDescriptor,
+              describeMockPreviewTransformKind(
+                responseDescriptor.workspacePath ?? requestHint.workspacePath ?? null,
+                modulePlan,
+              ),
             ),
           },
         };
@@ -2099,7 +2461,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
           kind: "preview-request-resolved",
           server,
           port: server.port,
-          request: { ...command.request },
+          request: {
+            ...command.request,
+            clientModules: command.request.clientModules ?? [],
+          },
           requestHint,
           responseDescriptor: describeMockPreviewResponse(requestHint, command.request.method),
         };
@@ -2306,6 +2671,10 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       throw new Error(`Rust host session not found: ${sessionId}`);
     }
 
+    const sourceEntryCandidate = MOCK_PREVIEW_APP_ENTRY_CANDIDATES.find((candidate) =>
+      record.files.has(candidate),
+    );
+
     for (const candidate of [
       "/workspace/index.html",
       "/workspace/dist/index.html",
@@ -2315,6 +2684,13 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       const file = record.files.get(candidate);
 
       if (file && file.isText && file.contentType.startsWith("text/html")) {
+        if (candidate === "/workspace/public/index.html" && sourceEntryCandidate) {
+          return {
+            kind: "source-entry",
+            path: sourceEntryCandidate,
+            root: null,
+          };
+        }
         return {
           kind: "workspace-document",
           path: file.path,
@@ -2323,23 +2699,12 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       }
     }
 
-    for (const candidate of [
-      "/workspace/src/main.tsx",
-      "/workspace/src/main.jsx",
-      "/workspace/src/main.ts",
-      "/workspace/src/main.js",
-      "/workspace/src/index.tsx",
-      "/workspace/src/index.jsx",
-      "/workspace/src/index.ts",
-      "/workspace/src/index.js",
-    ]) {
-      if (record.files.has(candidate)) {
-        return {
-          kind: "source-entry",
-          path: candidate,
-          root: null,
-        };
-      }
+    if (sourceEntryCandidate) {
+      return {
+        kind: "source-entry",
+        path: sourceEntryCandidate,
+        root: null,
+      };
     }
 
     return {
@@ -2390,34 +2755,9 @@ export class MockRuntimeHostAdapter implements RuntimeHostAdapter {
       };
     }
 
-    if (relativePath === "/__runtime.json") {
-      return { kind: "runtime-state", workspacePath: null, documentRoot: null, hydratePaths: [] };
-    }
-
-    if (relativePath === "/__workspace.json") {
-      return { kind: "workspace-state", workspacePath: null, documentRoot: null, hydratePaths: [] };
-    }
-
-    if (relativePath === "/__files.json") {
-      return { kind: "file-index", workspacePath: null, documentRoot: null, hydratePaths: [] };
-    }
-
-    if (relativePath === "/__diagnostics.json") {
-      return {
-        kind: "diagnostics-state",
-        workspacePath: null,
-        documentRoot: null,
-        hydratePaths: [],
-      };
-    }
-
-    if (relativePath === "/assets/runtime.css") {
-      return {
-        kind: "runtime-stylesheet",
-        workspacePath: null,
-        documentRoot: null,
-        hydratePaths: [],
-      };
+    const auxiliaryRouteKind = findMockPreviewAuxiliaryRoute(relativePath);
+    if (auxiliaryRouteKind) {
+      return { ...auxiliaryRouteKind };
     }
 
     if (relativePath.startsWith("/files/")) {
@@ -2514,14 +2854,15 @@ function syncMockPackageManifest(
   record.packageScripts = parsed?.scripts ?? {};
   record.handle.packageName = parsed?.name ?? null;
   record.session.packageJson = parsed;
+  record.session.suggestedRunRequest = deriveSuggestedRunRequest(
+    parsed,
+    record.session.workspaceRoot,
+  );
   record.session.capabilities.detectedReact =
     parsed?.dependencies.includes("react") === true ||
     parsed?.dependencies.includes("react-dom") === true ||
     parsed?.devDependencies.includes("react") === true ||
     parsed?.devDependencies.includes("react-dom") === true;
-  record.session.capabilities.detectedVite =
-    parsed?.dependencies.includes("vite") === true ||
-    parsed?.devDependencies.includes("vite") === true;
   record.capabilities = record.session.capabilities;
 }
 
@@ -2567,6 +2908,16 @@ function buildMockSessionStateReport(record: HostSessionRecord): HostSessionStat
           devDependencies: [...record.session.packageJson.devDependencies],
         }
       : null,
+    suggestedRunRequest: record.session.suggestedRunRequest
+      ? {
+          cwd: record.session.suggestedRunRequest.cwd,
+          command: record.session.suggestedRunRequest.command,
+          args: [...record.session.suggestedRunRequest.args],
+          env: record.session.suggestedRunRequest.env
+            ? { ...record.session.suggestedRunRequest.env }
+            : undefined,
+        }
+      : null,
     capabilities: { ...record.session.capabilities },
     hostFiles: buildMockHostWorkspaceFileIndexSummary(record),
   };
@@ -2577,6 +2928,7 @@ function buildMockPreviewStateReport(
   record: HostSessionRecord,
   requestHint: HostPreviewRequestHint,
   responseDescriptor: HostPreviewResponseDescriptor,
+  rootHydratedFiles: HostWorkspaceFileContent[] = [],
 ): HostRuntimePreviewStateReport {
   const previewServer = context.httpServers.values().next().value;
   const port = previewServer?.port ?? {
@@ -2586,6 +2938,24 @@ function buildMockPreviewStateReport(
 
   return {
     port,
+    url: `/preview/${record.session.sessionId}/${port.port}/`,
+    model: {
+      title: `${record.session.packageJson?.name ?? record.session.archive.fileName} guest app`,
+      summary:
+        "Host React から iframe 内 DOM に別 root を生やして描画しています。次の段階でこの生成責務を Service Worker + WASM host へ寄せます。",
+      cwd: context.runPlan.cwd,
+      command: context.runPlan.commandLine,
+      highlights: [
+        `session=${record.session.sessionId}`,
+        `revision=${record.session.revision}`,
+        `files=${record.session.archive.fileCount}`,
+        `run-kind=${context.runPlan.commandKind}`,
+        context.runPlan.resolvedScript
+          ? `resolved-script=${context.runPlan.resolvedScript}`
+          : "resolved-script=<direct>",
+        `react-detected=${String(record.session.capabilities.detectedReact)}`,
+      ],
+    },
     rootRequest: {
       port: port.port,
       method: "GET",
@@ -2594,6 +2964,7 @@ function buildMockPreviewStateReport(
     },
     rootRequestHint: requestHint,
     rootResponseDescriptor: responseDescriptor,
+    rootHydratedFiles,
     host: {
       engineName: "null-engine",
       supportsInterrupts: true,
@@ -2602,6 +2973,821 @@ function buildMockPreviewStateReport(
     },
     run: { ...context.runPlan },
     hostFiles: buildMockHostWorkspaceFileIndexSummary(record),
+  };
+}
+
+function buildMockPreviewUrl(sessionId: string, port: number): string {
+  return `/preview/${sessionId}/${port}/`;
+}
+
+function buildMockPreviewWorkspaceUrl(
+  sessionId: string,
+  port: number,
+  workspacePath: string,
+  documentRoot: string,
+): string {
+  const effectiveRoot = workspacePath.startsWith(`${documentRoot}/`) ? documentRoot : "/workspace";
+  const relative = workspacePath.slice(effectiveRoot.length).replace(/^\/+/, "");
+  const previewUrl = buildMockPreviewUrl(sessionId, port);
+  return relative ? `${previewUrl}${relative}` : previewUrl;
+}
+
+function describeMockPreviewTransformKind(
+  workspacePath: string | null,
+  modulePlan: HostRuntimePreviewModulePlan | null,
+): HostRuntimePreviewTransformKind | null {
+  if (modulePlan) {
+    return "module";
+  }
+
+  if (!workspacePath) {
+    return null;
+  }
+
+  const normalized = workspacePath.toLowerCase();
+  if (normalized.endsWith(".html")) {
+    return "html-document";
+  }
+  if (normalized.endsWith(".css")) {
+    return "stylesheet";
+  }
+  if (normalized.endsWith(".svg")) {
+    return "svg-document";
+  }
+  if (
+    normalized.endsWith(".png") ||
+    normalized.endsWith(".jpg") ||
+    normalized.endsWith(".jpeg") ||
+    normalized.endsWith(".gif") ||
+    normalized.endsWith(".webp") ||
+    normalized.endsWith(".ico") ||
+    normalized.endsWith(".woff") ||
+    normalized.endsWith(".woff2")
+  ) {
+    return "binary";
+  }
+
+  return "plain-text";
+}
+
+function buildMockPreviewRenderPlan(
+  requestHint: HostPreviewRequestHint,
+  responseDescriptor: HostPreviewResponseDescriptor,
+): HostRuntimePreviewRenderPlan | null {
+  switch (responseDescriptor.kind) {
+    case "workspace-document":
+    case "workspace-file":
+    case "workspace-asset":
+      return {
+        kind: "workspace-file",
+        workspacePath: responseDescriptor.workspacePath ?? requestHint.workspacePath,
+        documentRoot: responseDescriptor.documentRoot ?? requestHint.documentRoot,
+      };
+    case "app-shell":
+      return {
+        kind: "app-shell",
+        workspacePath: responseDescriptor.workspacePath ?? requestHint.workspacePath,
+        documentRoot: "/workspace",
+      };
+    case "host-managed-fallback":
+      return {
+        kind: "host-managed-fallback",
+        workspacePath: null,
+        documentRoot: null,
+      };
+    default:
+      return null;
+  }
+}
+
+function decodeRuntimePreviewRequestReport(
+  report: Omit<HostRuntimePreviewRequestReport, "hydratedFiles" | "directResponse"> & {
+    directResponse: {
+      status: number;
+      headers: Record<string, string>;
+      textBody: string | null;
+      bytesHex: string | null;
+    } | null;
+    hydratedFiles: Array<{
+      path: string;
+      size: number;
+      isText: boolean;
+      textContent: string | null;
+      bytesHex: string;
+    }>;
+  },
+): HostRuntimePreviewRequestReport {
+  return {
+    ...report,
+    modulePlan:
+      report.modulePlan == null
+        ? null
+        : {
+            ...report.modulePlan,
+            importPlans: report.modulePlan.importPlans.map((plan) => ({
+              ...plan,
+              previewSpecifier: withAppBasePath(plan.previewSpecifier),
+            })),
+          },
+    directResponse:
+      report.directResponse == null
+        ? null
+        : {
+            status: report.directResponse.status,
+            headers: report.directResponse.headers,
+            textBody:
+              report.directResponse.textBody == null
+                ? null
+                : normalizePreviewText(report.directResponse.textBody),
+            bytes:
+              report.directResponse.bytesHex == null
+                ? null
+                : decodeHex(report.directResponse.bytesHex),
+          },
+    hydratedFiles: report.hydratedFiles.map((file) => ({
+      path: file.path,
+      size: file.size,
+      isText: file.isText,
+      textContent: file.textContent,
+      bytes: decodeHex(file.bytesHex),
+    })),
+  };
+}
+
+function decodeWorkspaceFilePayloads(
+  files: Array<{
+    path: string;
+    size: number;
+    isText: boolean;
+    textContent: string | null;
+    bytesHex: string;
+  }>,
+): HostWorkspaceFileContent[] {
+  return files.map((file) => ({
+    path: file.path,
+    size: file.size,
+    isText: file.isText,
+    textContent: file.textContent,
+    bytes: decodeHex(file.bytesHex),
+  }));
+}
+
+function decodeRuntimePreviewStateReport(
+  report: Omit<HostRuntimePreviewStateReport, "rootHydratedFiles"> & {
+    rootHydratedFiles: Array<{
+      path: string;
+      size: number;
+      isText: boolean;
+      textContent: string | null;
+      bytesHex: string;
+    }>;
+  },
+): HostRuntimePreviewStateReport {
+  return {
+    ...report,
+    url: withAppBasePath(report.url),
+    rootHydratedFiles: decodeWorkspaceFilePayloads(report.rootHydratedFiles),
+  };
+}
+
+function decodeRuntimePreviewReadyReport(
+  report: Omit<HostRuntimePreviewReadyReport, "rootHydratedFiles"> & {
+    rootHydratedFiles: Array<{
+      path: string;
+      size: number;
+      isText: boolean;
+      textContent: string | null;
+      bytesHex: string;
+    }>;
+  },
+): HostRuntimePreviewReadyReport {
+  return {
+    ...report,
+    url: withAppBasePath(report.url),
+    rootHydratedFiles: decodeWorkspaceFilePayloads(report.rootHydratedFiles),
+  };
+}
+
+function buildMockDirectPreviewResponse(
+  context: HostRuntimeContextRecord,
+  record: HostSessionRecord,
+  request: HostRuntimeHttpRequest,
+  responseDescriptor: HostPreviewResponseDescriptor,
+  transformKind: HostRuntimePreviewTransformKind | null,
+): HostRuntimeDirectHttpResponse | null {
+  let previewRequestHint: HostPreviewRequestHint;
+  if (responseDescriptor.kind === "host-managed-fallback") {
+    previewRequestHint = {
+      kind: "fallback-root",
+      workspacePath: null,
+      documentRoot: null,
+      hydratePaths: [],
+    };
+  } else if (responseDescriptor.kind === "workspace-document") {
+    previewRequestHint = {
+      kind: "root-document",
+      workspacePath: responseDescriptor.workspacePath,
+      documentRoot: responseDescriptor.documentRoot,
+      hydratePaths: responseDescriptor.hydratePaths,
+    };
+  } else if (responseDescriptor.kind === "app-shell" && responseDescriptor.workspacePath) {
+    previewRequestHint = {
+      kind: "root-entry",
+      workspacePath: responseDescriptor.workspacePath,
+      documentRoot: null,
+      hydratePaths: responseDescriptor.hydratePaths,
+    };
+  } else if (responseDescriptor.workspacePath && responseDescriptor.documentRoot) {
+    previewRequestHint = {
+      kind: "workspace-file",
+      workspacePath: responseDescriptor.workspacePath,
+      documentRoot: responseDescriptor.documentRoot,
+      hydratePaths: responseDescriptor.hydratePaths,
+    };
+  } else {
+    previewRequestHint = {
+      kind: "fallback-root",
+      workspacePath: null,
+      documentRoot: null,
+      hydratePaths: [],
+    };
+  }
+  const previewState = buildMockPreviewStateReport(
+    context,
+    record,
+    previewRequestHint,
+    responseDescriptor,
+  );
+  const requestPreviewState = {
+    ...previewState,
+    port: {
+      port: request.port,
+      protocol: "http" as const,
+    },
+    url: `/preview/${record.session.sessionId}/${request.port}/`,
+  };
+  const workspacePath = responseDescriptor.workspacePath;
+  const file = workspacePath ? (record.files.get(workspacePath) ?? null) : null;
+
+  switch (responseDescriptor.kind) {
+    case "workspace-document":
+    case "workspace-file":
+    case "workspace-asset":
+      if (!file || transformKind === "module") {
+        return null;
+      }
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": responseDescriptor.contentType ?? file.contentType,
+          "cache-control": "no-store",
+          ...(responseDescriptor.allowMethods.length > 0
+            ? { allow: responseDescriptor.allowMethods.join(", ") }
+            : {}),
+        },
+        textBody: responseDescriptor.omitBody
+          ? ""
+          : file.isText
+            ? rewriteMockPreviewTextContent(
+                file.textContent ?? "",
+                transformKind,
+                requestPreviewState.url,
+                record,
+                workspacePath,
+                request.port,
+              )
+            : null,
+        bytes: responseDescriptor.omitBody || file.isText ? null : file.bytes,
+      };
+    case "app-shell":
+      if (!workspacePath) {
+        return null;
+      }
+      if (isMockPreviewGuestComponentPath(workspacePath)) {
+        const guestAppShell = buildMockPreviewGuestAppShell(record, workspacePath, request.port);
+        return {
+          status: guestAppShell ? responseDescriptor.statusCode : 503,
+          headers: {
+            "content-type": responseDescriptor.contentType ?? "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          },
+          textBody: responseDescriptor.omitBody
+            ? ""
+            : guestAppShell
+              ? `<!doctype html><html lang="ja"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>${requestPreviewState.model.title}</title>${guestAppShell.stylesheetUrls.map((href) => `<link rel="stylesheet" href="${href}" />`).join("")}</head><body><div id="guest-root"></div><script type="module">globalThis.globalThis ??= globalThis; globalThis.global ??= globalThis; globalThis.process ??= { env: { NODE_ENV: "development" }, browser: true }; const React = await import(${JSON.stringify(findPreviewClientModuleUrl(request.clientModules, "react") ?? guestAppShell.reactUrl)}); const ReactDOMClient = await import(${JSON.stringify(findPreviewClientModuleUrl(request.clientModules, "react-dom/client") ?? guestAppShell.reactDomClientUrl)}); const guestModule = await import(${JSON.stringify(guestAppShell.entryUrl)}); const GuestComponent = guestModule.default; const root = document.getElementById("guest-root"); if (root && typeof GuestComponent === "function") { ReactDOMClient.createRoot(root).render(React.createElement(GuestComponent)); }</script></body></html>`
+              : '<!doctype html><html lang="ja"><body><pre>Guest app shell could not be resolved.</pre></body></html>',
+          bytes: null,
+        };
+      }
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": responseDescriptor.contentType ?? "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: responseDescriptor.omitBody
+          ? ""
+          : `<!doctype html><html lang="ja"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>${requestPreviewState.model.title}</title></head><body><div id="root"></div><div id="app"></div><script type="module">globalThis.globalThis ??= globalThis; globalThis.global ??= globalThis; globalThis.process ??= { env: { NODE_ENV: "development" }, browser: true }; await import(${JSON.stringify(buildMockPreviewWorkspaceUrl(record.session.sessionId, request.port, workspacePath, responseDescriptor.documentRoot ?? "/workspace"))});</script></body></html>`,
+        bytes: null,
+      };
+    case "host-managed-fallback": {
+      const clientScriptUrl = findPreviewClientModuleUrl(
+        request.clientModules,
+        "runtime:preview-client",
+      );
+      return {
+        status: clientScriptUrl ? responseDescriptor.statusCode : 503,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: responseDescriptor.omitBody
+          ? ""
+          : clientScriptUrl
+            ? `<!doctype html><html lang="ja"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>${requestPreviewState.model.title}</title><link rel="stylesheet" href="${requestPreviewState.url}assets/runtime.css" /></head><body><div id="guest-root"></div><script>window.__NODE_IN_NODE_PREVIEW__=${JSON.stringify({ sessionId: record.session.sessionId, port: request.port, bootstrapUrl: `${requestPreviewState.url}__bootstrap.json` })};</script><script type="module" src="${clientScriptUrl}"></script></body></html>`
+            : '<!doctype html><html lang="ja"><body><pre>Preview client script is not configured.</pre></body></html>',
+        bytes: null,
+      };
+    }
+    case "runtime-state":
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify({
+          type: "preview.ready",
+          sessionId: record.session.sessionId,
+          pid: 0,
+          port: requestPreviewState.port.port,
+          url: requestPreviewState.url,
+          model: requestPreviewState.model,
+          host: requestPreviewState.host,
+          run: requestPreviewState.run,
+          hostFiles: requestPreviewState.hostFiles,
+        }),
+        bytes: null,
+      };
+    case "bootstrap-state": {
+      const documentRoot =
+        requestPreviewState.rootRequestHint.kind === "root-document"
+          ? (requestPreviewState.rootRequestHint.documentRoot ?? "/workspace")
+          : "/workspace";
+      const files = [...record.files.values()]
+        .filter((file) => file.isText)
+        .sort((left, right) => left.path.localeCompare(right.path))
+        .map((file) => ({
+          path: file.path,
+          size: file.size,
+          contentType: file.contentType,
+          isText: file.isText,
+          url: `${requestPreviewState.url}files${file.path.replace("/workspace", "")}`,
+          previewUrl: buildMockPreviewWorkspaceUrl(
+            record.session.sessionId,
+            request.port,
+            file.path,
+            documentRoot,
+          ),
+        }));
+      const selectedFile =
+        files.find((file) => file.path.endsWith("/package.json")) ??
+        files.find((file) => file.path.includes("/src/")) ??
+        files.find((file) => file.path.includes("/app/")) ??
+        files[0] ??
+        null;
+      const hydratedPaths = Array.from(
+        new Set([
+          ...previewState.rootResponseDescriptor.hydratePaths,
+          ...responseDescriptor.hydratePaths,
+        ]),
+      ).sort((left, right) => left.localeCompare(right));
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify({
+          preview: {
+            type: "preview.ready",
+            sessionId: record.session.sessionId,
+            pid: 0,
+            port: requestPreviewState.port.port,
+            url: requestPreviewState.url,
+            model: requestPreviewState.model,
+            host: requestPreviewState.host,
+            run: requestPreviewState.run,
+            hostFiles: requestPreviewState.hostFiles,
+          },
+          workspace: record.session,
+          files,
+          selectedFile: selectedFile
+            ? {
+                ...selectedFile,
+                content: record.files.get(selectedFile.path)?.textContent ?? "",
+              }
+            : null,
+          diagnostics: {
+            sessionId: record.session.sessionId,
+            pid: 0,
+            port: requestPreviewState.port.port,
+            url: requestPreviewState.url,
+            model: requestPreviewState.model,
+            session: record.session,
+            rootRequestHint: requestPreviewState.rootRequestHint,
+            requestHint: previewRequestHint,
+            fileCount: record.files.size,
+            hydratedFileCount: hydratedPaths.length,
+            hydratedPaths,
+            host: requestPreviewState.host,
+            run: requestPreviewState.run,
+            hostFiles: requestPreviewState.hostFiles,
+          },
+        }),
+        bytes: null,
+      };
+    }
+    case "workspace-state":
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify(record.session),
+        bytes: null,
+      };
+    case "file-index": {
+      const documentRoot =
+        requestPreviewState.rootRequestHint.kind === "root-document"
+          ? (requestPreviewState.rootRequestHint.documentRoot ?? "/workspace")
+          : "/workspace";
+      const files = [...record.files.values()]
+        .filter((file) => file.isText)
+        .sort((left, right) => left.path.localeCompare(right.path))
+        .map((file) => ({
+          path: file.path,
+          size: file.size,
+          contentType: file.contentType,
+          isText: file.isText,
+          url: `${requestPreviewState.url}files${file.path.replace("/workspace", "")}`,
+          previewUrl: buildMockPreviewWorkspaceUrl(
+            record.session.sessionId,
+            request.port,
+            file.path,
+            documentRoot,
+          ),
+        }));
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify(files),
+        bytes: null,
+      };
+    }
+    case "diagnostics-state": {
+      const hydratedPaths = Array.from(
+        new Set([
+          ...previewState.rootResponseDescriptor.hydratePaths,
+          ...responseDescriptor.hydratePaths,
+        ]),
+      ).sort((left, right) => left.localeCompare(right));
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify({
+          sessionId: record.session.sessionId,
+          pid: 0,
+          port: requestPreviewState.port.port,
+          url: requestPreviewState.url,
+          model: requestPreviewState.model,
+          session: record.session,
+          rootRequestHint: requestPreviewState.rootRequestHint,
+          requestHint: previewRequestHint,
+          fileCount: record.files.size,
+          hydratedFileCount: hydratedPaths.length,
+          hydratedPaths,
+          host: requestPreviewState.host,
+          run: requestPreviewState.run,
+          hostFiles: requestPreviewState.hostFiles,
+        }),
+        bytes: null,
+      };
+    }
+    case "runtime-stylesheet":
+      return {
+        status: responseDescriptor.statusCode,
+        headers: {
+          "content-type": "text/css; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: `
+    .guest-shell {
+      position: relative;
+    }
+
+    .guest-shell::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 -40px auto;
+      width: 220px;
+      height: 220px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(249, 115, 22, 0.28), transparent 70%);
+      filter: blur(10px);
+      pointer-events: none;
+    }
+
+    .guest-columns {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 18px;
+    }
+
+    .guest-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin: 20px 0;
+    }
+  `,
+        bytes: null,
+      };
+    case "method-not-allowed":
+      return {
+        status: 405,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          allow: responseDescriptor.allowMethods.join(", "),
+        },
+        textBody: JSON.stringify({
+          error: "Method not allowed",
+          pathname: request.relativePath,
+          method: request.method,
+          allowMethods: responseDescriptor.allowMethods,
+        }),
+        bytes: null,
+      };
+    case "not-found":
+      return {
+        status: 404,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: JSON.stringify({
+          error: "Unsupported preview path",
+          pathname: request.relativePath,
+        }),
+        bytes: null,
+      };
+    default:
+      return null;
+  }
+}
+
+function rewriteMockPreviewTextContent(
+  source: string,
+  transformKind: HostRuntimePreviewTransformKind | null,
+  previewUrl: string,
+  record?: HostSessionRecord,
+  workspacePath?: string | null,
+  requestPort?: number,
+): string {
+  switch (transformKind) {
+    case "html-document":
+      return source.replace(
+        /\b(src|href|action|poster)=("|')\/(?!\/)/g,
+        (_match, attribute: string, quote: string) => `${attribute}=${quote}${previewUrl}`,
+      );
+    case "stylesheet":
+      return rewriteMockStylesheetTextContent(
+        source,
+        previewUrl,
+        record ?? null,
+        workspacePath ?? null,
+        requestPort ?? 0,
+      );
+    case "svg-document":
+      return source.replace(
+        /\b(href|xlink:href)=("|')\/(?!\/)/g,
+        (_match, attribute: string, quote: string) => {
+          return `${attribute}=${quote}${previewUrl}`;
+        },
+      );
+    default:
+      return source;
+  }
+}
+
+function rewriteMockStylesheetTextContent(
+  source: string,
+  previewUrl: string,
+  record: HostSessionRecord | null,
+  workspacePath: string | null,
+  requestPort: number,
+): string {
+  let rewritten = source.replace(/url\((["']?)\/(?!\/)/g, (_match, quote: string) => {
+    return `url(${quote}${previewUrl}`;
+  });
+
+  if (!record || !workspacePath) {
+    return rewritten;
+  }
+
+  rewritten = rewritten.replace(
+    /@import\s+(?:url\(\s*)?["']([^"']+)["']\s*\)?\s*;/g,
+    (statement: string, specifier: string) => {
+      const resolved = resolveMockStylesheetImportSpecifier(
+        record,
+        workspacePath,
+        specifier,
+        requestPort,
+      );
+      return resolved ? statement.replace(specifier, resolved) : statement;
+    },
+  );
+
+  return rewritten;
+}
+
+function resolveMockStylesheetImportSpecifier(
+  record: HostSessionRecord,
+  importerPath: string,
+  specifier: string,
+  requestPort: number,
+): string | null {
+  if (
+    specifier.startsWith("http://") ||
+    specifier.startsWith("https://") ||
+    specifier.startsWith("//") ||
+    specifier.startsWith("data:")
+  ) {
+    return null;
+  }
+
+  const fileLookup = record.files;
+  const resolveWorkspacePath = (basePath: string): string | null => {
+    const normalized = normalizeMockPosixPath(basePath);
+    const candidates = [normalized, `${normalized}.css`, `${normalized}/index.css`];
+    for (const candidate of candidates) {
+      if (fileLookup.has(candidate)) {
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  let workspacePath: string | null = null;
+  if (specifier.startsWith("/")) {
+    workspacePath = resolveWorkspacePath(`/workspace${specifier}`);
+  } else if (specifier.startsWith(".")) {
+    workspacePath = resolveWorkspacePath(
+      normalizeMockPosixPath(`${dirnameMockRuntimePath(importerPath)}/${specifier}`),
+    );
+  } else {
+    workspacePath = resolveMockBarePackageStylesheetImport(record, specifier);
+  }
+
+  return workspacePath
+    ? buildMockPreviewWorkspaceUrl(
+        record.session.sessionId,
+        requestPort,
+        workspacePath,
+        "/workspace",
+      )
+    : null;
+}
+
+function resolveMockBarePackageStylesheetImport(
+  record: HostSessionRecord,
+  specifier: string,
+): string | null {
+  const parts = specifier.split("/");
+  const packageName =
+    specifier.startsWith("@") && parts.length >= 2 ? parts.slice(0, 2).join("/") : parts[0];
+  if (!packageName) {
+    return null;
+  }
+  const remainder = specifier.slice(packageName.length).replace(/^\/+/, "");
+  const packageRoot = normalizeMockPosixPath(`/workspace/node_modules/${packageName}`);
+  const manifest = readMockPackageManifest(record.files, packageRoot);
+  const subpath = remainder.length > 0 ? `./${remainder}` : ".";
+  const exportTarget = resolveMockStylesheetExportTarget(manifest?.exports, subpath);
+  const candidates = [
+    exportTarget,
+    remainder.length === 0 ? manifest?.style : null,
+    remainder.length === 0 ? "index.css" : remainder,
+    remainder.length === 0 ? null : `${remainder}.css`,
+    remainder.length === 0 ? null : `${remainder}/index.css`,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .map((value) => normalizeMockPosixPath(`${packageRoot}/${value}`));
+  for (const candidate of candidates) {
+    if (record.files.has(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveMockStylesheetExportTarget(
+  exportsField: PackageManifest["exports"] | undefined,
+  subpath: string,
+): string | null {
+  if (!exportsField || typeof exportsField !== "object") {
+    return null;
+  }
+  const target =
+    subpath === "."
+      ? resolveMockStylesheetExportValue(exportsField["."] ?? exportsField)
+      : resolveMockStylesheetExportValue(exportsField[subpath]);
+  return typeof target === "string" ? target : null;
+}
+
+function resolveMockStylesheetExportValue(value: PackageExportValue | undefined): string | null {
+  if (typeof value === "string") {
+    return value.endsWith(".css") ? value : null;
+  }
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  for (const key of ["style", "browser", "default", "import", "module", "require"] as const) {
+    const resolved = resolveMockStylesheetExportValue(value[key]);
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+function readMockPackageManifest(
+  files: Map<string, WorkspaceFileRecord>,
+  packageRoot: string,
+): PackageManifest | null {
+  const packageJson = files.get(`${packageRoot}/package.json`);
+  if (!packageJson?.textContent) {
+    return null;
+  }
+  try {
+    return JSON.parse(packageJson.textContent) as PackageManifest;
+  } catch {
+    return null;
+  }
+}
+
+function isMockPreviewGuestComponentPath(workspacePath: string): boolean {
+  return MOCK_PREVIEW_GUEST_COMPONENT_CANDIDATES.includes(
+    workspacePath as (typeof MOCK_PREVIEW_GUEST_COMPONENT_CANDIDATES)[number],
+  );
+}
+
+function buildMockPreviewGuestStylesheetUrls(record: HostSessionRecord, port: number): string[] {
+  return MOCK_PREVIEW_GUEST_STYLESHEET_CANDIDATES.filter((path) => record.files.has(path)).map(
+    (path) => buildMockPreviewWorkspaceUrl(record.session.sessionId, port, path, "/workspace"),
+  );
+}
+
+function buildMockPreviewGuestAppShell(
+  record: HostSessionRecord,
+  entryPath: string,
+  port: number,
+): MockPreviewGuestAppShell | null {
+  if (!record.files.has(entryPath)) {
+    return null;
+  }
+  const importerDir = parentMockPosixPath(entryPath);
+  let reactUrl: string;
+  let reactDomClientUrl: string;
+  try {
+    reactUrl = buildMockPreviewWorkspaceUrl(
+      record.session.sessionId,
+      port,
+      resolveMockRuntimeModule(record, importerDir, "react"),
+      "/workspace",
+    );
+    reactDomClientUrl = buildMockPreviewWorkspaceUrl(
+      record.session.sessionId,
+      port,
+      resolveMockRuntimeModule(record, importerDir, "react-dom/client"),
+      "/workspace",
+    );
+  } catch {
+    return null;
+  }
+  return {
+    entryUrl: buildMockPreviewWorkspaceUrl(record.session.sessionId, port, entryPath, "/workspace"),
+    stylesheetUrls: buildMockPreviewGuestStylesheetUrls(record, port),
+    reactUrl,
+    reactDomClientUrl,
   };
 }
 
@@ -2637,7 +3823,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     }
 
     const bytes = await response.arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const module = await WebAssembly.compile(bytes);
+    const imports = createRuntimeHostWasmImports(WebAssembly.Module.imports(module));
+    const instance = await WebAssembly.instantiate(module, imports);
 
     return new WasmRuntimeHostAdapter(instance.exports as unknown as WasmRuntimeHostExports);
   }
@@ -2661,7 +3849,6 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       `package_scripts=${serializeStringMap(input.session.packageJson?.scripts ?? {})}`,
       `workspace_root=${input.session.workspaceRoot}`,
       `detected_react=${String(input.session.capabilities.detectedReact)}`,
-      `detected_vite=${String(input.session.capabilities.detectedVite)}`,
       `files=${serializeWorkspaceFiles(input.files)}`,
     ]);
   }
@@ -2732,7 +3919,73 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       lines.push(`port=${String(options.port)}`);
     }
 
-    return this.invokeWithInput<HostRuntimeLaunchReport>("runtime_host_launch_runtime_json", lines);
+    const report = await this.invokeWithInput<
+      Omit<HostRuntimeLaunchReport, "state" | "previewReady" | "previewLaunch"> & {
+        state: Omit<HostRuntimeStateReport, "preview"> & {
+          preview:
+            | (Omit<HostRuntimePreviewStateReport, "rootHydratedFiles"> & {
+                rootHydratedFiles: Array<{
+                  path: string;
+                  size: number;
+                  isText: boolean;
+                  textContent: string | null;
+                  bytesHex: string;
+                }>;
+              })
+            | null;
+        };
+        previewReady:
+          | (Omit<HostRuntimePreviewReadyReport, "rootHydratedFiles"> & {
+              rootHydratedFiles: Array<{
+                path: string;
+                size: number;
+                isText: boolean;
+                textContent: string | null;
+                bytesHex: string;
+              }>;
+            })
+          | null;
+        previewLaunch: Omit<HostRuntimePreviewLaunchReport, "rootReport"> & {
+          rootReport:
+            | (Omit<HostRuntimePreviewRequestReport, "hydratedFiles"> & {
+                directResponse: {
+                  status: number;
+                  headers: Record<string, string>;
+                  textBody: string | null;
+                  bytesHex: string | null;
+                } | null;
+                hydratedFiles: Array<{
+                  path: string;
+                  size: number;
+                  isText: boolean;
+                  textContent: string | null;
+                  bytesHex: string;
+                }>;
+              })
+            | null;
+        };
+      }
+    >("runtime_host_launch_runtime_json", lines);
+
+    return {
+      ...report,
+      state: {
+        ...report.state,
+        preview:
+          report.state.preview == null
+            ? null
+            : decodeRuntimePreviewStateReport(report.state.preview),
+      },
+      previewReady:
+        report.previewReady == null ? null : decodeRuntimePreviewReadyReport(report.previewReady),
+      previewLaunch: {
+        ...report.previewLaunch,
+        rootReport:
+          report.previewLaunch.rootReport == null
+            ? null
+            : decodeRuntimePreviewRequestReport(report.previewLaunch.rootReport),
+      },
+    };
   }
 
   async describeEngineContext(contextId: string): Promise<HostEngineContextSnapshot> {
@@ -2973,6 +4226,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         lines.push(`method=${command.request.method}`);
         lines.push(`relative_path=${encodeHex(command.request.relativePath)}`);
         lines.push(`search=${encodeHex(command.request.search)}`);
+        if (command.request.clientModules != null) {
+          lines.push(`client_modules=${encodeHex(JSON.stringify(command.request.clientModules))}`);
+        }
         break;
       case "runtime.shutdown":
         lines.push("command=runtime-shutdown");
@@ -3056,6 +4312,9 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
         lines.push(`method=${command.request.method}`);
         lines.push(`relative_path=${encodeHex(command.request.relativePath)}`);
         lines.push(`search=${encodeHex(command.request.search)}`);
+        if (command.request.clientModules != null) {
+          lines.push(`client_modules=${encodeHex(JSON.stringify(command.request.clientModules))}`);
+        }
         break;
       case "timers.schedule":
         lines.push("command=timers-schedule");
@@ -3145,11 +4404,38 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
       | { kind: "runtime-state"; report: HostRuntimeStateReport }
       | { kind: "runtime-engine-boot"; report: HostRuntimeEngineBoot }
       | { kind: "runtime-startup"; report: HostRuntimeStartupReport }
-      | { kind: "runtime-preview-launch"; report: HostRuntimePreviewLaunchReport }
+      | {
+          kind: "runtime-preview-launch";
+          report: Omit<HostRuntimePreviewLaunchReport, "rootReport"> & {
+            rootReport:
+              | (Omit<HostRuntimePreviewRequestReport, "hydratedFiles"> & {
+                  directResponse: {
+                    status: number;
+                    headers: Record<string, string>;
+                    textBody: string | null;
+                    bytesHex: string | null;
+                  } | null;
+                  hydratedFiles: Array<{
+                    path: string;
+                    size: number;
+                    isText: boolean;
+                    textContent: string | null;
+                    bytesHex: string;
+                  }>;
+                })
+              | null;
+          };
+        }
       | { kind: "runtime-shutdown"; report: HostRuntimeShutdownReport }
       | {
           kind: "runtime-preview-request";
           report: Omit<HostRuntimePreviewRequestReport, "hydratedFiles"> & {
+            directResponse: {
+              status: number;
+              headers: Record<string, string>;
+              textBody: string | null;
+              bytesHex: string | null;
+            } | null;
             hydratedFiles: Array<{
               path: string;
               size: number;
@@ -3242,15 +4528,36 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     if (response.kind === "runtime-preview-request") {
       return {
         kind: "runtime-preview-request",
+        report: decodeRuntimePreviewRequestReport(response.report),
+      };
+    }
+
+    if (response.kind === "runtime-preview-launch") {
+      return {
+        kind: "runtime-preview-launch",
         report: {
           ...response.report,
-          hydratedFiles: response.report.hydratedFiles.map((file) => ({
-            path: file.path,
-            size: file.size,
-            isText: file.isText,
-            textContent: file.textContent,
-            bytes: decodeHex(file.bytesHex),
-          })),
+          rootReport:
+            response.report.rootReport == null
+              ? null
+              : decodeRuntimePreviewRequestReport(response.report.rootReport),
+        },
+      };
+    }
+
+    if (response.kind === "runtime-state") {
+      return {
+        kind: "runtime-state",
+        report: {
+          ...response.report,
+          preview:
+            response.report.preview == null
+              ? null
+              : decodeRuntimePreviewStateReport(
+                  response.report.preview as unknown as Parameters<
+                    typeof decodeRuntimePreviewStateReport
+                  >[0],
+                ),
         },
       };
     }
@@ -3371,7 +4678,38 @@ export class WasmRuntimeHostAdapter implements RuntimeHostAdapter {
     const len = this.exports.runtime_host_last_result_len();
     const bytes = new Uint8Array(this.exports.memory.buffer, ptr, len);
     const text = this.decoder.decode(bytes);
-    const parsed = JSON.parse(text) as T & { error?: string };
+    let parsed: (T & { error?: string }) | null = null;
+
+    try {
+      parsed = JSON.parse(text) as T & { error?: string };
+    } catch (error) {
+      const positionMatch = error instanceof Error ? /position (\d+)/.exec(error.message) : null;
+      const parsePosition = positionMatch ? Number(positionMatch[1]) : -1;
+      let controlIndex = -1;
+      for (let index = 0; index < text.length; index += 1) {
+        const character = text[index];
+        if (!character) {
+          continue;
+        }
+        const code = character.charCodeAt(0);
+        if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+          controlIndex = index;
+          break;
+        }
+      }
+      const focusIndex =
+        parsePosition >= 0 ? parsePosition : controlIndex === -1 ? 0 : controlIndex;
+      const snippetStart = Math.max(0, focusIndex - 96);
+      const snippetEnd = Math.min(text.length, focusIndex + 96);
+      const snippet = text.slice(snippetStart, snippetEnd);
+      throw new Error(
+        `Failed to parse runtime-host JSON result: ${
+          error instanceof Error ? error.message : String(error)
+        }; parsePosition=${parsePosition}; controlIndex=${controlIndex}; snippet=${JSON.stringify(
+          snippet,
+        )}`,
+      );
+    }
 
     if ("error" in parsed && typeof parsed.error === "string") {
       throw new Error(parsed.error);
@@ -3502,6 +4840,272 @@ function resolveMockNodeEntrypoint(
   }
 
   throw new Error(`entrypoint not found: ${requested}`);
+}
+
+function splitMockCommandTokens(command: string): string[] {
+  return command
+    .split(/\s+/u)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+type MockBrowserCliShimSpec = {
+  packageName: string;
+  specifier: string;
+  mode: string;
+  runtimeKind: string;
+  previewRole: string;
+};
+
+const MOCK_BROWSER_CLI_SHIMS: MockBrowserCliShimSpec[] = [
+  {
+    packageName: "vite",
+    specifier: "runtime:browser-cli/vite",
+    mode: "dev",
+    runtimeKind: "browser-dev-server",
+    previewRole: "http-server",
+  },
+  {
+    packageName: "acme-dev",
+    specifier: "runtime:browser-cli/acme-dev",
+    mode: "dev",
+    runtimeKind: "browser-dev-server",
+    previewRole: "http-server",
+  },
+];
+
+function renderMockBrowserCliShimSource(shim: MockBrowserCliShimSpec): string {
+  return `const runtimeValue = {
+  mode: ${JSON.stringify(shim.mode)},
+  runtimeKind: ${JSON.stringify(shim.runtimeKind)},
+  previewRole: ${JSON.stringify(shim.previewRole)},
+  ready: true,
+};
+globalThis.__browserCliRuntime = runtimeValue;
+export default runtimeValue;
+`;
+}
+
+type MockPackageBinManifest = {
+  name?: string;
+  bin?: string | Record<string, string>;
+};
+
+const MOCK_PREVIEW_AUXILIARY_ROUTES = new Map<string, MockAuxiliaryPreviewRequestHint>([
+  [
+    "/__runtime.json",
+    { kind: "runtime-state", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+  [
+    "/__bootstrap.json",
+    { kind: "bootstrap-state", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+  [
+    "/__workspace.json",
+    { kind: "workspace-state", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+  [
+    "/__files.json",
+    { kind: "file-index", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+  [
+    "/__diagnostics.json",
+    { kind: "diagnostics-state", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+  [
+    "/assets/runtime.css",
+    { kind: "runtime-stylesheet", workspacePath: null, documentRoot: null, hydratePaths: [] },
+  ],
+]);
+
+type MockAuxiliaryPreviewRequestHint = {
+  kind:
+    | "runtime-state"
+    | "bootstrap-state"
+    | "workspace-state"
+    | "file-index"
+    | "diagnostics-state"
+    | "runtime-stylesheet";
+  workspacePath: null;
+  documentRoot: null;
+  hydratePaths: [];
+};
+
+function mockManifestDeclaresBinCommand(
+  manifest: MockPackageBinManifest,
+  commandName: string,
+): boolean {
+  if (typeof manifest.bin === "string") {
+    return manifest.name === commandName;
+  }
+  if (typeof manifest.bin === "object" && manifest.bin !== null) {
+    return commandName in manifest.bin;
+  }
+  return false;
+}
+
+function resolveMockBrowserCliShimForManifest(
+  manifest: MockPackageBinManifest,
+  commandName: string,
+  argvTail: string[],
+): string | null {
+  if (argvTail.length > 0 || !mockManifestDeclaresBinCommand(manifest, commandName)) {
+    return null;
+  }
+
+  return (
+    MOCK_BROWSER_CLI_SHIMS.find((shim) => shim.packageName === manifest.name)?.specifier ?? null
+  );
+}
+
+function findMockBrowserCliShimBySpecifier(specifier: string): MockBrowserCliShimSpec | undefined {
+  return MOCK_BROWSER_CLI_SHIMS.find((shim) => shim.specifier === specifier);
+}
+
+function findMockBrowserCliShimForResolvedScript(
+  resolvedScript: string | null,
+): MockBrowserCliShimSpec | undefined {
+  const commandName = resolvedScript?.trim().split(/\s+/u)[0];
+  if (!commandName) {
+    return undefined;
+  }
+  return MOCK_BROWSER_CLI_SHIMS.find((shim) => shim.packageName === commandName);
+}
+
+function findMockPreviewAuxiliaryRoute(
+  relativePath: string,
+): MockAuxiliaryPreviewRequestHint | undefined {
+  return MOCK_PREVIEW_AUXILIARY_ROUTES.get(relativePath);
+}
+
+function mockNodeModuleDirectoryRoots(cwd: string): string[] {
+  const roots: string[] = [];
+  let current = normalizeMockPosixPath(cwd);
+
+  while (true) {
+    const candidate = current === "/" ? "/node_modules" : `${current}/node_modules`;
+    roots.push(normalizeMockPosixPath(candidate));
+
+    if (current === "/workspace") {
+      break;
+    }
+
+    const next = dirnameMockRuntimePath(current);
+    if (next === current) {
+      break;
+    }
+    current = next;
+  }
+
+  return roots;
+}
+
+function resolveMockNpmScriptProcessEntrypoint(
+  files: Map<string, WorkspaceFileRecord>,
+  cwd: string,
+  runPlan: HostRunPlan,
+): {
+  entrypoint: string;
+  argvTail: string[];
+} {
+  const tokens = runPlan.resolvedScript ? splitMockCommandTokens(runPlan.resolvedScript) : [];
+  if (tokens.length > 0) {
+    const [requestedEntrypoint, ...argvTail] = tokens;
+    if (
+      requestedEntrypoint.startsWith("./") ||
+      requestedEntrypoint.startsWith("../") ||
+      requestedEntrypoint.startsWith("/")
+    ) {
+      return {
+        entrypoint: resolveMockNodeEntrypoint(files, cwd, requestedEntrypoint),
+        argvTail,
+      };
+    }
+
+    for (const root of mockNodeModuleDirectoryRoots(cwd)) {
+      const packageRoot = normalizeMockPosixPath(`${root}/${requestedEntrypoint}`);
+      const manifest = readMockPackageBinManifest(files, packageRoot);
+      const browserCliShim = manifest
+        ? resolveMockBrowserCliShimForManifest(manifest, requestedEntrypoint, argvTail)
+        : null;
+      if (browserCliShim) {
+        return {
+          entrypoint: browserCliShim,
+          argvTail: [],
+        };
+      }
+      const packageBinEntrypoint = resolveMockPackageBinEntrypoint(
+        files,
+        packageRoot,
+        requestedEntrypoint,
+        manifest,
+      );
+      if (packageBinEntrypoint) {
+        return {
+          entrypoint: packageBinEntrypoint,
+          argvTail,
+        };
+      }
+
+      const candidate = normalizeMockPosixPath(`${root}/.bin/${requestedEntrypoint}`);
+      if (files.has(candidate)) {
+        return {
+          entrypoint: candidate,
+          argvTail,
+        };
+      }
+    }
+
+    return {
+      entrypoint: requestedEntrypoint,
+      argvTail,
+    };
+  }
+
+  return {
+    entrypoint: runPlan.entrypoint,
+    argvTail: [],
+  };
+}
+
+function resolveMockPackageBinEntrypoint(
+  files: Map<string, WorkspaceFileRecord>,
+  packageRoot: string,
+  commandName: string,
+  manifest = readMockPackageBinManifest(files, packageRoot),
+): string | null {
+  if (!manifest) {
+    return null;
+  }
+
+  const target =
+    typeof manifest.bin === "string"
+      ? manifest.bin
+      : typeof manifest.bin === "object" && manifest.bin !== null
+        ? manifest.bin[commandName]
+        : null;
+  if (!target) {
+    return null;
+  }
+  return resolveMockWorkspaceModuleCandidate(
+    files,
+    normalizeMockPosixPath(`${packageRoot}/${target}`),
+  );
+}
+
+function readMockPackageBinManifest(
+  files: Map<string, WorkspaceFileRecord>,
+  packageRoot: string,
+): MockPackageBinManifest | null {
+  const manifestText = files.get(`${packageRoot}/package.json`)?.textContent;
+  if (!manifestText) {
+    return null;
+  }
+  try {
+    return JSON.parse(manifestText) as MockPackageBinManifest;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeMockPosixPath(input: string): string {
@@ -3795,6 +5399,123 @@ function detectMockRuntimeModuleFormat(path: string): HostRuntimeModuleFormat {
     return "json";
   }
   return "module";
+}
+
+function buildMockPreviewModulePlan(
+  record: HostSessionRecord,
+  workspacePath: string | null,
+): HostRuntimePreviewModulePlan | null {
+  if (
+    !workspacePath ||
+    ![".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts", ".cts"].some((extension) =>
+      workspacePath.endsWith(extension),
+    )
+  ) {
+    return null;
+  }
+
+  const file = record.files.get(workspacePath);
+  if (!file?.textContent) {
+    return null;
+  }
+
+  const format = detectMockRuntimeModuleFormat(workspacePath);
+  const importerDir = parentMockPosixPath(workspacePath);
+  const importPlans: HostRuntimePreviewImportPlan[] = [];
+
+  for (const specifier of collectMockRuntimeModuleDependencySpecifiers(file.textContent, format)) {
+    try {
+      const resolved = resolveMockRuntimeModule(record, importerDir, specifier);
+      importPlans.push({
+        requestSpecifier: specifier,
+        previewSpecifier: resolved.startsWith("/workspace")
+          ? `/preview/session-1/3000/${resolved.replace(/^\/workspace\/?/, "")}`
+          : resolved,
+        format: detectMockRuntimeModuleFormat(resolved),
+      });
+    } catch {}
+  }
+
+  return {
+    importerPath: workspacePath,
+    format,
+    importPlans,
+  };
+}
+
+function collectMockRuntimeModuleDependencySpecifiers(
+  source: string,
+  format: HostRuntimeModuleFormat,
+): string[] {
+  const specifiers: string[] = [];
+  if (format === "module") {
+    for (const marker of [
+      ' from "',
+      " from '",
+      'import("',
+      "import('",
+      'export * from "',
+      "export * from '",
+    ]) {
+      collectMockStringLiteralsAfterMarker(source, marker, specifiers);
+    }
+    for (const marker of ['import "', "import '"]) {
+      collectMockLinePrefixedImports(source, marker, specifiers);
+    }
+  } else if (format === "commonjs") {
+    for (const marker of ['require("', "require('"]) {
+      collectMockStringLiteralsAfterMarker(source, marker, specifiers);
+    }
+  }
+
+  return [...new Set(specifiers)].sort();
+}
+
+function collectMockStringLiteralsAfterMarker(
+  source: string,
+  marker: string,
+  output: string[],
+): void {
+  let searchStart = 0;
+  while (searchStart < source.length) {
+    const offset = source.indexOf(marker, searchStart);
+    if (offset === -1) {
+      break;
+    }
+
+    const start = offset + marker.length;
+    const quote = marker.at(-1) ?? '"';
+    const end = source.indexOf(quote, start);
+    if (end === -1) {
+      break;
+    }
+
+    const candidate = source.slice(start, end);
+    if (candidate.length > 0) {
+      output.push(candidate);
+    }
+    searchStart = end + 1;
+  }
+}
+
+function collectMockLinePrefixedImports(source: string, marker: string, output: string[]): void {
+  const quote = marker.at(-1) ?? '"';
+  for (const line of source.split("\n").map((value) => value.trimStart())) {
+    if (!line.startsWith(marker)) {
+      continue;
+    }
+
+    const rest = line.slice(marker.length);
+    const end = rest.indexOf(quote);
+    if (end === -1) {
+      continue;
+    }
+
+    const candidate = rest.slice(0, end);
+    if (candidate.length > 0) {
+      output.push(candidate);
+    }
+  }
 }
 
 export async function createRuntimeHostAdapter(): Promise<RuntimeHostAdapter> {

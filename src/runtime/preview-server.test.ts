@@ -63,25 +63,25 @@ function createPreviewState(files: PreviewState["files"] = new Map()): PreviewSt
       packageJson: null,
       capabilities: {
         detectedReact: true,
-        detectedVite: true,
       },
     },
     files,
   };
 }
 
-test("buildPreviewResponse returns preview metadata when state endpoint is requested", () => {
+test("buildPreviewResponse does not build preview metadata locally", () => {
   const response = buildPreviewResponse(request, createPreviewState());
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("application/json");
-  expect(response.body).toContain('"type":"preview.ready"');
-  expect(response.body).toContain('"engineName":"null-engine"');
-  expect(response.body).toContain('"commandKind":"npm-script"');
-  expect(response.body).toContain('"samplePath":"/workspace/package.json"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/__runtime.json",
+    }),
+  );
 });
 
-test("buildPreviewResponse returns HTML for the preview root", () => {
+test("buildPreviewResponse does not synthesize preview root HTML locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -93,15 +93,16 @@ test("buildPreviewResponse returns HTML for the preview root", () => {
     createPreviewState(),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain("/assets/preview-client.js");
-  expect(response.body).toContain("__runtime.json");
-  expect(response.body).toContain("__workspace.json");
-  expect(response.body).toContain("__diagnostics.json");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
-test("buildPreviewResponse prefers host-provided preview root hints", () => {
+test("buildPreviewResponse does not synthesize app shell from root hints locally", () => {
   const state = createPreviewState(
     new Map([
       [
@@ -131,15 +132,29 @@ test("buildPreviewResponse prefers host-provided preview root hints", () => {
         documentRoot: null,
         hydratePaths: ["/workspace/src/main.tsx"],
       },
+      rootResponseDescriptor: {
+        kind: "app-shell",
+        workspacePath: "/workspace/src/main.tsx",
+        documentRoot: null,
+        hydratePaths: ["/workspace/src/main.tsx"],
+        statusCode: 200,
+        contentType: "text/html; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
     },
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain('src="/preview/session-1/3000/src/main.tsx"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
-test("buildPreviewResponse prefers host-provided request hints", () => {
+test("buildPreviewResponse does not render document roots from request hints locally", () => {
   const state = createPreviewState(
     new Map([
       [
@@ -172,12 +187,16 @@ test("buildPreviewResponse prefers host-provided request hints", () => {
     },
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
-test("buildPreviewResponse prefers host-provided response descriptors", () => {
+test("buildPreviewResponse does not render document roots from response descriptors locally", () => {
   const state = createPreviewState(
     new Map([
       [
@@ -214,9 +233,13 @@ test("buildPreviewResponse prefers host-provided response descriptors", () => {
     },
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
 test("buildPreviewResponse respects host-provided HEAD descriptors without hydrating body", () => {
@@ -330,7 +353,7 @@ test("buildPreviewResponse returns 404 from host-provided not-found request hint
   expect(response.body).toContain('"error":"Unsupported preview path"');
 });
 
-test("buildPreviewResponse returns runtime CSS for asset route", () => {
+test("buildPreviewResponse does not build runtime stylesheet locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -339,12 +362,16 @@ test("buildPreviewResponse returns runtime CSS for asset route", () => {
     createPreviewState(),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/css");
-  expect(response.body).toContain(".guest-columns");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/assets/runtime.css",
+    }),
+  );
 });
 
-test("buildPreviewResponse returns preview file index", () => {
+test("buildPreviewResponse does not build preview file index locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -367,13 +394,16 @@ test("buildPreviewResponse returns preview file index", () => {
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.body).toContain('"path":"/workspace/package.json"');
-  expect(response.body).toContain('"url":"/preview/session-1/3000/files/package.json"');
-  expect(response.body).toContain('"previewUrl":"/preview/session-1/3000/package.json"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/__files.json",
+    }),
+  );
 });
 
-test("buildPreviewResponse returns preview diagnostics", () => {
+test("buildPreviewResponse does not build preview diagnostics locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -410,15 +440,13 @@ test("buildPreviewResponse returns preview diagnostics", () => {
     },
   );
 
-  expect(response.status).toBe(200);
-  expect(response.body).toContain('"sessionId":"session-1"');
-  expect(response.body).toContain('"requestHint":{"kind":"diagnostics-state"');
-  expect(response.body).toContain('"rootRequestHint":{"kind":"fallback-root"');
-  expect(response.body).toContain('"hydratedPaths":["/workspace/package.json"]');
-  expect(response.body).toContain('"engineName":"null-engine"');
-  expect(response.body).toContain('"commandKind":"npm-script"');
-  expect(response.body).toContain('"resolvedScript":"vite"');
-  expect(response.body).toContain('"samplePath":"/workspace/package.json"');
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/__diagnostics.json",
+    }),
+  );
 });
 
 test("buildPreviewResponse returns workspace file contents", () => {
@@ -449,7 +477,7 @@ test("buildPreviewResponse returns workspace file contents", () => {
   expect(response.body).toContain("console.log");
 });
 
-test("buildPreviewResponse serves workspace index.html at the preview root when present", () => {
+test("buildPreviewResponse does not serve workspace index.html locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -475,13 +503,16 @@ test("buildPreviewResponse serves workspace index.html at the preview root when 
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain('src="/preview/session-1/3000/assets/app.js"');
-  expect(response.body).not.toContain("__NODE_IN_NODE_PREVIEW__");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
-test("buildPreviewResponse synthesizes an app shell when only a source entry is present", () => {
+test("buildPreviewResponse does not synthesize app shell from source entry locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -504,15 +535,16 @@ test("buildPreviewResponse synthesizes an app shell when only a source entry is 
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/html");
-  expect(response.body).toContain('id="root"');
-  expect(response.body).toContain('id="app"');
-  expect(response.body).toContain('src="/preview/session-1/3000/src/main.tsx"');
-  expect(response.body).not.toContain("__NODE_IN_NODE_PREVIEW__");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
 });
 
-test("buildPreviewResponse resolves document-root assets from dist/index.html", () => {
+test("buildPreviewResponse does not infer document-root assets locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -546,9 +578,13 @@ test("buildPreviewResponse resolves document-root assets from dist/index.html", 
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toContain("text/javascript");
-  expect(response.body).toContain("console.log('dist')");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/assets/app.js",
+    }),
+  );
 });
 
 test("buildPreviewResponse prefers host-provided asset hints for document-root assets", () => {
@@ -587,7 +623,7 @@ test("buildPreviewResponse prefers host-provided asset hints for document-root a
   expect(response.body).toContain("console.log('hint')");
 });
 
-test("buildPreviewResponse rewrites root-relative urls inside stylesheets", () => {
+test("buildPreviewResponse does not rewrite stylesheet bodies locally", () => {
   const response = buildPreviewResponse(
     {
       ...request,
@@ -610,11 +646,16 @@ test("buildPreviewResponse rewrites root-relative urls inside stylesheets", () =
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.body).toContain("url('/preview/session-1/3000/hero.png')");
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/styles/site.css",
+    }),
+  );
 });
 
-test("buildPreviewResponse returns binary workspace assets", () => {
+test("buildPreviewResponse does not return binary assets locally", () => {
   const bytes = new Uint8Array([137, 80, 78, 71]);
   const response = buildPreviewResponse(
     {
@@ -649,10 +690,13 @@ test("buildPreviewResponse returns binary workspace assets", () => {
     ),
   );
 
-  expect(response.status).toBe(200);
-  expect(response.headers["content-type"]).toBe("image/png");
-  expect(response.body).toBeInstanceOf(Uint8Array);
-  expect(response.body).toEqual(bytes);
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/assets/logo.png",
+    }),
+  );
 });
 
 test("buildPreviewResponse transpiles TSX modules and rewrites React and CSS imports", () => {
@@ -840,6 +884,643 @@ test("buildPreviewResponse resolves simple node_modules package entrypoints", ()
   expect(response.status).toBe(200);
   expect(typeof response.body).toBe("string");
   expect(response.body).toContain("/preview/session-1/3000/node_modules/demo-lib/dist/index.js");
+});
+
+test("buildPreviewResponse prefers backend module plans over local package resolution", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/src/main.tsx",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/main.tsx",
+            {
+              path: "/workspace/src/main.tsx",
+              size: 55,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('import demo from "demo-lib";\nconsole.log(demo);'),
+              textContent: 'import demo from "demo-lib";\nconsole.log(demo);',
+            },
+          ],
+          [
+            "/workspace/node_modules/demo-lib/dist/index.js",
+            {
+              path: "/workspace/node_modules/demo-lib/dist/index.js",
+              size: 22,
+              contentType: "text/javascript; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("export default 'demo';"),
+              textContent: "export default 'demo';",
+            },
+          ],
+        ]),
+      ),
+      modulePlan: {
+        importerPath: "/workspace/src/main.tsx",
+        format: "module",
+        importPlans: [
+          {
+            requestSpecifier: "demo-lib",
+            previewSpecifier: "/preview/session-1/3000/node_modules/demo-lib/dist/index.js",
+            format: "module",
+          },
+        ],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain("/preview/session-1/3000/node_modules/demo-lib/dist/index.js");
+});
+
+test("buildPreviewResponse does not fall back to local package resolution when backend module plan is present", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/src/main.tsx",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/main.tsx",
+            {
+              path: "/workspace/src/main.tsx",
+              size: 61,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode(
+                'import demo from "browser-lib";\nconsole.log(demo);',
+              ),
+              textContent: 'import demo from "browser-lib";\nconsole.log(demo);',
+            },
+          ],
+          [
+            "/workspace/node_modules/browser-lib/package.json",
+            {
+              path: "/workspace/node_modules/browser-lib/package.json",
+              size: 65,
+              contentType: "application/json; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode(
+                '{"browser":"./browser/index.js","main":"./server/index.js"}',
+              ),
+              textContent: '{"browser":"./browser/index.js","main":"./server/index.js"}',
+            },
+          ],
+          [
+            "/workspace/node_modules/browser-lib/browser/index.js",
+            {
+              path: "/workspace/node_modules/browser-lib/browser/index.js",
+              size: 27,
+              contentType: "text/javascript; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("export default 'browser';"),
+              textContent: "export default 'browser';",
+            },
+          ],
+        ]),
+      ),
+      modulePlan: {
+        importerPath: "/workspace/src/main.tsx",
+        format: "module",
+        importPlans: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain('from "browser-lib"');
+  expect(response.body).not.toContain("/preview/session-1/3000/node_modules/browser-lib/");
+});
+
+test("buildPreviewResponse does not rewrite imports from local resolver when backend-owned request lacks module plan", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/generated/entry",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/generated/entry",
+            {
+              path: "/workspace/generated/entry",
+              size: 84,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode(
+                'import demo from "demo-lib";\nimport local from "./local";\nconsole.log(demo, local);',
+              ),
+              textContent:
+                'import demo from "demo-lib";\nimport local from "./local";\nconsole.log(demo, local);',
+            },
+          ],
+          [
+            "/workspace/generated/local.ts",
+            {
+              path: "/workspace/generated/local.ts",
+              size: 21,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("export default 'local';"),
+              textContent: "export default 'local';",
+            },
+          ],
+          [
+            "/workspace/node_modules/demo-lib/package.json",
+            {
+              path: "/workspace/node_modules/demo-lib/package.json",
+              size: 36,
+              contentType: "application/json; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('{"main":"dist/index.js"}'),
+              textContent: '{"main":"dist/index.js"}',
+            },
+          ],
+          [
+            "/workspace/node_modules/demo-lib/dist/index.js",
+            {
+              path: "/workspace/node_modules/demo-lib/dist/index.js",
+              size: 22,
+              contentType: "text/javascript; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("export default 'demo';"),
+              textContent: "export default 'demo';",
+            },
+          ],
+        ]),
+      ),
+      requestHint: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/generated/entry"],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/generated/entry"],
+        statusCode: 200,
+        contentType: "text/plain; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      transformKind: "module",
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain('from "demo-lib"');
+  expect(response.body).toContain('from "./local"');
+  expect(response.body).not.toContain("/preview/session-1/3000/node_modules/demo-lib/");
+  expect(response.body).not.toContain("/preview/session-1/3000/generated/local");
+});
+
+test("buildPreviewResponse rewrites static asset imports to preview URLs for backend-owned modules", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/src/App.tsx",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/App.tsx",
+            {
+              path: "/workspace/src/App.tsx",
+              size: 59,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode(
+                'import heroImg from "./assets/hero.png";\nexport default heroImg;\n',
+              ),
+              textContent: 'import heroImg from "./assets/hero.png";\nexport default heroImg;\n',
+            },
+          ],
+          [
+            "/workspace/src/assets/hero.png",
+            {
+              path: "/workspace/src/assets/hero.png",
+              size: 4,
+              contentType: "image/png",
+              isText: false,
+              bytes: new Uint8Array([137, 80, 78, 71]),
+              textContent: null,
+            },
+          ],
+        ]),
+      ),
+      requestHint: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/App.tsx",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/src/App.tsx"],
+      },
+      responseDescriptor: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/App.tsx",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/src/App.tsx"],
+        statusCode: 200,
+        contentType: "text/javascript; charset=utf-8",
+        allowMethods: ["GET", "HEAD"],
+        omitBody: false,
+      },
+      transformKind: "module",
+      modulePlan: {
+        importerPath: "/workspace/src/App.tsx",
+        format: "module",
+        importPlans: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain('const heroImg = "/preview/session-1/3000/src/assets/hero.png";');
+  expect(response.body).not.toContain('from "./assets/hero.png"');
+});
+
+test("buildPreviewResponse uses backend transform kind for extensionless module requests", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/generated/entry",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/generated/entry",
+            {
+              path: "/workspace/generated/entry",
+              size: 58,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('import demo from "demo-lib";\nconsole.log(demo);'),
+              textContent: 'import demo from "demo-lib";\nconsole.log(demo);',
+            },
+          ],
+          [
+            "/workspace/node_modules/demo-lib/dist/index.js",
+            {
+              path: "/workspace/node_modules/demo-lib/dist/index.js",
+              size: 22,
+              contentType: "text/javascript; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("export default 'demo';"),
+              textContent: "export default 'demo';",
+            },
+          ],
+        ]),
+      ),
+      requestHint: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/generated/entry"],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/generated/entry"],
+        statusCode: 200,
+        contentType: "text/plain; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      transformKind: "module",
+      modulePlan: {
+        importerPath: "/workspace/generated/entry",
+        format: "module",
+        importPlans: [
+          {
+            requestSpecifier: "demo-lib",
+            previewSpecifier: "/preview/session-1/3000/node_modules/demo-lib/dist/index.js",
+            format: "module",
+          },
+        ],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toBe("text/javascript; charset=utf-8");
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain("/preview/session-1/3000/node_modules/demo-lib/dist/index.js");
+});
+
+test("buildPreviewResponse executes backend render plan before local descriptor routing", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/generated/entry",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/generated/entry",
+            {
+              path: "/workspace/generated/entry",
+              size: 21,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("console.log('render');"),
+              textContent: "console.log('render');",
+            },
+          ],
+        ]),
+      ),
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+      },
+      requestHint: {
+        kind: "not-found",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/generated/entry",
+        documentRoot: "/workspace",
+        hydratePaths: ["/workspace/generated/entry"],
+        statusCode: 200,
+        contentType: "text/plain; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      transformKind: "module",
+      modulePlan: {
+        importerPath: "/workspace/generated/entry",
+        format: "module",
+        importPlans: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(response.headers["content-type"]).toBe("text/javascript; charset=utf-8");
+  expect(typeof response.body).toBe("string");
+  expect(response.body).toContain("console.log('render');");
+});
+
+test("buildPreviewResponse does not fall back to URL-derived files when backend render plan points elsewhere", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/src/actual.ts",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/actual.ts",
+            {
+              path: "/workspace/src/actual.ts",
+              size: 20,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("console.log('actual')"),
+              textContent: "console.log('actual')",
+            },
+          ],
+        ]),
+      ),
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/missing.ts",
+        documentRoot: "/workspace",
+      },
+      requestHint: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/src/missing.ts",
+        documentRoot: "/workspace",
+        hydratePaths: [],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/src/missing.ts",
+        documentRoot: "/workspace",
+        hydratePaths: [],
+        statusCode: 200,
+        contentType: "text/plain; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      transformKind: "module",
+      modulePlan: {
+        importerPath: "/workspace/src/missing.ts",
+        format: "module",
+        importPlans: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/src/actual.ts",
+    }),
+  );
+});
+
+test("buildPreviewResponse does not fall back to local root routing when backend preview state is present", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/index.html",
+            {
+              path: "/workspace/index.html",
+              size: 58,
+              contentType: "text/html; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('<img src="/assets/logo.png" alt="logo" />'),
+              textContent: '<img src="/assets/logo.png" alt="logo" />',
+            },
+          ],
+        ]),
+      ),
+      rootRequestHint: {
+        kind: "not-found",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/",
+    }),
+  );
+});
+
+test("buildPreviewResponse does not fall back to local workspace files when backend preview state is present", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/files/src/main.tsx",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/src/main.tsx",
+            {
+              path: "/workspace/src/main.tsx",
+              size: 18,
+              contentType: "text/plain; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode("console.log('hi')"),
+              textContent: "console.log('hi')",
+            },
+          ],
+        ]),
+      ),
+      rootRequestHint: {
+        kind: "fallback-root",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/files/src/main.tsx",
+    }),
+  );
+});
+
+test("buildPreviewResponse does not fall back to local assets when backend preview state is present", () => {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/assets/logo.png",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/assets/logo.png",
+            {
+              path: "/workspace/assets/logo.png",
+              size: bytes.byteLength,
+              contentType: "image/png",
+              isText: false,
+              bytes,
+              textContent: null,
+            },
+          ],
+        ]),
+      ),
+      rootRequestHint: {
+        kind: "fallback-root",
+        workspacePath: null,
+        documentRoot: null,
+        hydratePaths: [],
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/assets/logo.png",
+    }),
+  );
+});
+
+test("buildPreviewResponse does not fall back to URL-derived assets when backend descriptor points elsewhere", () => {
+  const response = buildPreviewResponse(
+    {
+      ...request,
+      pathname: "/preview/session-1/3000/images/logo.svg",
+    },
+    {
+      ...createPreviewState(
+        new Map([
+          [
+            "/workspace/images/logo.svg",
+            {
+              path: "/workspace/images/logo.svg",
+              size: 18,
+              contentType: "image/svg+xml; charset=utf-8",
+              isText: true,
+              bytes: new TextEncoder().encode('<svg href="/x" />'),
+              textContent: '<svg href="/x" />',
+            },
+          ],
+        ]),
+      ),
+      requestHint: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/images/missing.svg",
+        documentRoot: "/workspace",
+        hydratePaths: [],
+      },
+      responseDescriptor: {
+        kind: "workspace-asset",
+        workspacePath: "/workspace/images/missing.svg",
+        documentRoot: "/workspace",
+        hydratePaths: [],
+        statusCode: 200,
+        contentType: "image/svg+xml; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      },
+      transformKind: "svg-document",
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/images/missing.svg",
+        documentRoot: "/workspace",
+      },
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(response.body).toEqual(
+    JSON.stringify({
+      error: "Unsupported preview path",
+      pathname: "/preview/session-1/3000/images/logo.svg",
+    }),
+  );
 });
 
 test("buildPreviewResponse prefers browser field for legacy package entrypoints", () => {

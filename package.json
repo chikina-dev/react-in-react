@@ -7,6 +7,7 @@
     "dev": "vp dev",
     "build": "tsc && vp build",
     "preview": "vp preview",
+    "test:playwright": "playwright test",
     "e2e": "vp exec playwright test",
     "prepare": "vp config"
   },

@@ -8,9 +8,9 @@ use crate::protocol::{
     HostRuntimeBindings, HostRuntimeBootstrapModule, HostRuntimeBootstrapPlan,
     HostRuntimeBuiltinSpec, HostRuntimeCommand, HostRuntimeConsoleLevel, HostRuntimeContext,
     HostRuntimeEvent, HostRuntimeHttpRequest, HostRuntimeHttpServer, HostRuntimeHttpServerKind,
-    HostRuntimePort, HostRuntimePortProtocol, HostRuntimeResponse, HostRuntimeStdioStream,
-    HostRuntimeTimer, HostRuntimeTimerKind, PreviewResponseDescriptor, PreviewResponseKind,
-    RunRequest,
+    HostRuntimePort, HostRuntimePortProtocol, HostRuntimePreviewClientModule,
+    HostRuntimeResponse, HostRuntimeStdioStream, HostRuntimeTimer, HostRuntimeTimerKind,
+    PreviewResponseDescriptor, PreviewResponseKind, RunRequest,
 };
 use crate::vfs::VirtualFile;
 use crate::{EngineContextSnapshot, EngineContextState, EngineEvalOutcome, EngineJobDrain};
@@ -1001,6 +1001,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                     .map(|encoded| decode_hex(&encoded))
                     .transpose()?
                     .unwrap_or_default(),
+                client_modules: parse_runtime_http_client_modules(fields)?,
             },
         }),
         "runtime-shutdown" => Ok(HostRuntimeCommand::Shutdown {
@@ -1109,6 +1110,7 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
                     Some(encoded) => decode_hex(&encoded)?,
                     None => String::new(),
                 },
+                client_modules: parse_runtime_http_client_modules(fields)?,
             },
         }),
         "timers-schedule" => Ok(HostRuntimeCommand::TimerSchedule {
@@ -1231,6 +1233,18 @@ fn parse_runtime_command(fields: &BTreeMap<String, String>) -> Result<HostRuntim
 fn decode_hex(input: &str) -> Result<String, String> {
     let bytes = decode_hex_bytes(input)?;
     String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
+fn parse_runtime_http_client_modules(
+    fields: &BTreeMap<String, String>,
+) -> Result<Vec<HostRuntimePreviewClientModule>, String> {
+    let Some(encoded) = required_field(fields, "client_modules") else {
+        return Ok(Vec::new());
+    };
+
+    let json = decode_hex(&encoded)?;
+    serde_json::from_str::<Vec<HostRuntimePreviewClientModule>>(&json)
+        .map_err(|error| format!("invalid client_modules json: {error}"))
 }
 
 fn parse_hex_path_list(input: &str) -> Result<Vec<String>, String> {
@@ -1399,7 +1413,7 @@ fn render_process_info_json(process_info: &HostProcessInfo) -> String {
 
 fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> String {
     format!(
-        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"registeredModules\":{},\"bootstrapSpecifier\":{},\"moduleLoaderRoots\":{},\"state\":\"{}\"}}",
+        "{{\"engineSessionId\":\"{}\",\"engineContextId\":\"{}\",\"sessionId\":\"{}\",\"cwd\":\"{}\",\"entrypoint\":\"{}\",\"argvLen\":{},\"envCount\":{},\"pendingJobs\":{},\"registeredModules\":{},\"bootstrapSpecifier\":{},\"bridgeReady\":{},\"moduleLoaderRoots\":{},\"state\":\"{}\"}}",
         escape_json(&snapshot.engine_session_id),
         escape_json(&snapshot.engine_context_id),
         escape_json(&snapshot.session_id),
@@ -1414,6 +1428,7 @@ fn render_engine_context_snapshot_json(snapshot: &EngineContextSnapshot) -> Stri
             .as_ref()
             .map(|value| format!("\"{}\"", escape_json(value)))
             .unwrap_or_else(|| "null".into()),
+        if snapshot.bridge_ready { "true" } else { "false" },
         render_string_array_json(&snapshot.module_loader_roots),
         render_engine_context_state(snapshot.state.clone())
     )
@@ -1652,7 +1667,7 @@ fn render_runtime_engine_boot_json(report: &crate::protocol::HostRuntimeEngineBo
 
 fn render_runtime_launch_report_json(report: &crate::protocol::HostRuntimeLaunchReport) -> String {
     format!(
-        "{{\"bootSummary\":{},\"runPlan\":{},\"runtimeContext\":{},\"engineContext\":{},\"bindings\":{},\"bootstrapPlan\":{},\"previewLaunch\":{},\"state\":{},\"startupLogs\":{},\"events\":{}}}",
+        "{{\"bootSummary\":{},\"runPlan\":{},\"runtimeContext\":{},\"engineContext\":{},\"bindings\":{},\"bootstrapPlan\":{},\"previewLaunch\":{},\"state\":{},\"startupStdout\":{},\"previewReady\":{},\"events\":{}}}",
         render_boot_summary_json(&report.boot_summary),
         render_run_plan_json(&report.run_plan),
         render_runtime_context_json(&report.runtime_context),
@@ -1661,7 +1676,12 @@ fn render_runtime_launch_report_json(report: &crate::protocol::HostRuntimeLaunch
         render_runtime_bootstrap_plan_json(&report.bootstrap_plan),
         render_runtime_preview_launch_report_json(&report.preview_launch),
         render_runtime_state_report_json(&report.state),
-        render_string_array_json(&report.startup_logs),
+        render_string_array_json(&report.startup_stdout),
+        report
+            .preview_ready
+            .as_ref()
+            .map(render_runtime_preview_ready_report_json)
+            .unwrap_or_else(|| "null".into()),
         render_runtime_events_json(&report.events),
     )
 }
@@ -1686,32 +1706,12 @@ fn render_runtime_preview_launch_report_json(
     report: &crate::protocol::HostRuntimePreviewLaunchReport,
 ) -> String {
     format!(
-        "{{\"startup\":{},\"server\":{},\"port\":{},\"rootRequest\":{},\"rootRequestHint\":{},\"rootResponseDescriptor\":{}}}",
+        "{{\"startup\":{},\"rootReport\":{}}}",
         render_runtime_startup_report_json(&report.startup),
         report
-            .server
+            .root_report
             .as_ref()
-            .map(render_runtime_http_server_json)
-            .unwrap_or_else(|| "null".into()),
-        report
-            .port
-            .as_ref()
-            .map(render_runtime_port_json)
-            .unwrap_or_else(|| "null".into()),
-        report
-            .root_request
-            .as_ref()
-            .map(render_runtime_http_request_json)
-            .unwrap_or_else(|| "null".into()),
-        report
-            .root_request_hint
-            .as_ref()
-            .map(render_preview_request_hint_json)
-            .unwrap_or_else(|| "null".into()),
-        report
-            .root_response_descriptor
-            .as_ref()
-            .map(render_preview_response_descriptor_json)
+            .map(|root_report| render_runtime_preview_request_report_json(root_report))
             .unwrap_or_else(|| "null".into()),
     )
 }
@@ -1720,7 +1720,7 @@ fn render_runtime_preview_request_report_json(
     report: &crate::protocol::HostRuntimePreviewRequestReport,
 ) -> String {
     format!(
-        "{{\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{},\"responseDescriptor\":{},\"hydrationPaths\":{},\"hydratedFiles\":{}}}",
+        "{{\"server\":{},\"port\":{},\"request\":{},\"requestHint\":{},\"responseDescriptor\":{},\"hydrationPaths\":{},\"hydratedFiles\":{},\"transformKind\":{},\"renderPlan\":{},\"modulePlan\":{},\"directResponse\":{}}}",
         render_runtime_http_server_json(&report.server),
         render_runtime_port_json(&report.port),
         render_runtime_http_request_json(&report.request),
@@ -1728,6 +1728,98 @@ fn render_runtime_preview_request_report_json(
         render_preview_response_descriptor_json(&report.response_descriptor),
         render_string_array_json(&report.hydration_paths),
         render_workspace_file_payloads_json(&report.hydrated_files),
+        report
+            .transform_kind
+            .as_ref()
+            .map(render_runtime_preview_transform_kind_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .render_plan
+            .as_ref()
+            .map(render_runtime_preview_render_plan_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .module_plan
+            .as_ref()
+            .map(render_runtime_preview_module_plan_json)
+            .unwrap_or_else(|| "null".into()),
+        report
+            .direct_response
+            .as_ref()
+            .map(render_runtime_direct_http_response_json)
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_runtime_preview_transform_kind_json(
+    kind: &crate::protocol::HostRuntimePreviewTransformKind,
+) -> String {
+    format!("\"{}\"", render_runtime_preview_transform_kind(kind))
+}
+
+fn render_runtime_preview_transform_kind(
+    kind: &crate::protocol::HostRuntimePreviewTransformKind,
+) -> &'static str {
+    match kind {
+        crate::protocol::HostRuntimePreviewTransformKind::Module => "module",
+        crate::protocol::HostRuntimePreviewTransformKind::HtmlDocument => "html-document",
+        crate::protocol::HostRuntimePreviewTransformKind::Stylesheet => "stylesheet",
+        crate::protocol::HostRuntimePreviewTransformKind::SvgDocument => "svg-document",
+        crate::protocol::HostRuntimePreviewTransformKind::PlainText => "plain-text",
+        crate::protocol::HostRuntimePreviewTransformKind::Binary => "binary",
+    }
+}
+
+fn render_runtime_preview_render_plan_json(
+    plan: &crate::protocol::HostRuntimePreviewRenderPlan,
+) -> String {
+    format!(
+        "{{\"kind\":\"{}\",\"workspacePath\":{},\"documentRoot\":{}}}",
+        render_runtime_preview_render_kind(&plan.kind),
+        plan.workspace_path
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+        plan.document_root
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+    )
+}
+
+fn render_runtime_preview_render_kind(
+    kind: &crate::protocol::HostRuntimePreviewRenderKind,
+) -> &'static str {
+    match kind {
+        crate::protocol::HostRuntimePreviewRenderKind::WorkspaceFile => "workspace-file",
+        crate::protocol::HostRuntimePreviewRenderKind::AppShell => "app-shell",
+        crate::protocol::HostRuntimePreviewRenderKind::HostManagedFallback => "host-managed-fallback",
+    }
+}
+
+fn render_runtime_preview_module_plan_json(
+    plan: &crate::protocol::HostRuntimePreviewModulePlan,
+) -> String {
+    format!(
+        "{{\"importerPath\":{},\"format\":\"{}\",\"importPlans\":[{}]}}",
+        format!("\"{}\"", escape_json(&plan.importer_path)),
+        render_runtime_module_format(&plan.format),
+        plan.import_plans
+            .iter()
+            .map(render_runtime_preview_import_plan_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn render_runtime_preview_import_plan_json(
+    plan: &crate::protocol::HostRuntimePreviewImportPlan,
+) -> String {
+    format!(
+        "{{\"requestSpecifier\":{},\"previewSpecifier\":{},\"format\":\"{}\"}}",
+        format!("\"{}\"", escape_json(&plan.request_specifier)),
+        format!("\"{}\"", escape_json(&plan.preview_specifier)),
+        render_runtime_module_format(&plan.format),
     )
 }
 
@@ -1759,7 +1851,7 @@ fn render_runtime_state_report_json(report: &crate::protocol::HostRuntimeStateRe
 
 fn render_session_state_report_json(report: &crate::protocol::HostSessionStateReport) -> String {
     format!(
-        "{{\"sessionId\":\"{}\",\"state\":\"{}\",\"revision\":{},\"workspaceRoot\":\"{}\",\"archive\":{},\"packageJson\":{},\"capabilities\":{},\"hostFiles\":{}}}",
+        "{{\"sessionId\":\"{}\",\"state\":\"{}\",\"revision\":{},\"workspaceRoot\":\"{}\",\"archive\":{},\"packageJson\":{},\"suggestedRunRequest\":{},\"capabilities\":{},\"hostFiles\":{}}}",
         escape_json(&report.session_id),
         render_session_state_json(&report.state),
         report.revision,
@@ -1770,8 +1862,23 @@ fn render_session_state_report_json(report: &crate::protocol::HostSessionStateRe
             .as_ref()
             .map(render_package_json_summary_json)
             .unwrap_or_else(|| "null".into()),
+        report
+            .suggested_run_request
+            .as_ref()
+            .map(render_run_request_json)
+            .unwrap_or_else(|| "null".into()),
         render_capability_matrix_json(&report.capabilities),
         render_workspace_file_index_summary_json(&report.host_files),
+    )
+}
+
+fn render_run_request_json(request: &RunRequest) -> String {
+    format!(
+        "{{\"cwd\":\"{}\",\"command\":\"{}\",\"args\":{},\"env\":{}}}",
+        escape_json(&request.cwd),
+        escape_json(&request.command),
+        render_string_array_json(&request.args),
+        render_string_map_json(&request.env),
     )
 }
 
@@ -1779,14 +1886,45 @@ fn render_runtime_preview_state_report_json(
     report: &crate::protocol::HostRuntimePreviewStateReport,
 ) -> String {
     format!(
-        "{{\"port\":{},\"rootRequest\":{},\"rootRequestHint\":{},\"rootResponseDescriptor\":{},\"host\":{},\"run\":{},\"hostFiles\":{}}}",
+        "{{\"port\":{},\"url\":\"{}\",\"model\":{},\"rootRequest\":{},\"rootRequestHint\":{},\"rootResponseDescriptor\":{},\"rootHydratedFiles\":{},\"host\":{},\"run\":{},\"hostFiles\":{}}}",
         render_runtime_port_json(&report.port),
+        escape_json(&report.url),
+        render_runtime_preview_model_json(&report.model),
         render_runtime_http_request_json(&report.root_request),
         render_preview_request_hint_json(&report.root_request_hint),
         render_preview_response_descriptor_json(&report.root_response_descriptor),
+        render_workspace_file_payloads_json(&report.root_hydrated_files),
         render_boot_summary_json(&report.host),
         render_run_plan_json(&report.run),
         render_workspace_file_index_summary_json(&report.host_files),
+    )
+}
+
+fn render_runtime_preview_ready_report_json(
+    report: &crate::protocol::HostRuntimePreviewReadyReport,
+) -> String {
+    format!(
+        "{{\"port\":{},\"url\":\"{}\",\"model\":{},\"rootHydratedFiles\":{},\"host\":{},\"run\":{},\"hostFiles\":{}}}",
+        render_runtime_port_json(&report.port),
+        escape_json(&report.url),
+        render_runtime_preview_model_json(&report.model),
+        render_workspace_file_payloads_json(&report.root_hydrated_files),
+        render_boot_summary_json(&report.host),
+        render_run_plan_json(&report.run),
+        render_workspace_file_index_summary_json(&report.host_files),
+    )
+}
+
+fn render_runtime_preview_model_json(
+    model: &crate::protocol::HostRuntimePreviewModel,
+) -> String {
+    format!(
+        "{{\"title\":\"{}\",\"summary\":\"{}\",\"cwd\":\"{}\",\"command\":\"{}\",\"highlights\":{}}}",
+        escape_json(&model.title),
+        escape_json(&model.summary),
+        escape_json(&model.cwd),
+        escape_json(&model.command),
+        render_string_array_json(&model.highlights),
     )
 }
 
@@ -1844,10 +1982,7 @@ fn render_package_json_summary_json(summary: &crate::protocol::PackageJsonSummar
 }
 
 fn render_capability_matrix_json(capabilities: &crate::protocol::CapabilityMatrix) -> String {
-    format!(
-        "{{\"detectedReact\":{},\"detectedVite\":{}}}",
-        capabilities.detected_react, capabilities.detected_vite,
-    )
+    format!("{{\"detectedReact\":{}}}", capabilities.detected_react)
 }
 
 fn render_workspace_file_index_summary_json(
@@ -2124,13 +2259,54 @@ fn render_runtime_port_json(port: &HostRuntimePort) -> String {
     format!("{{\"port\":{},\"protocol\":\"{}\"}}", port.port, protocol,)
 }
 
-fn render_runtime_http_request_json(request: &HostRuntimeHttpRequest) -> String {
+fn render_runtime_preview_client_module_json(module: &HostRuntimePreviewClientModule) -> String {
     format!(
-        "{{\"port\":{},\"method\":\"{}\",\"relativePath\":\"{}\",\"search\":\"{}\"}}",
+        "{{\"specifier\":\"{}\",\"url\":\"{}\"}}",
+        escape_json(&module.specifier),
+        escape_json(&module.url)
+    )
+}
+
+fn render_runtime_http_request_json(request: &HostRuntimeHttpRequest) -> String {
+    let client_modules = request
+        .client_modules
+        .iter()
+        .map(render_runtime_preview_client_module_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"port\":{},\"method\":\"{}\",\"relativePath\":\"{}\",\"search\":\"{}\",\"clientModules\":[{}]}}",
         request.port,
         escape_json(&request.method),
         escape_json(&request.relative_path),
         escape_json(&request.search),
+        client_modules,
+    )
+}
+
+fn render_runtime_direct_http_response_json(
+    response: &crate::protocol::HostRuntimeDirectHttpResponse,
+) -> String {
+    let headers = response
+        .headers
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", escape_json(key), escape_json(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"status\":{},\"headers\":{{{}}},\"textBody\":{},\"bytesHex\":{}}}",
+        response.status,
+        headers,
+        response
+            .text_body
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".into()),
+        response
+            .bytes_body
+            .as_ref()
+            .map(|value| format!("\"{}\"", encode_hex(value)))
+            .unwrap_or_else(|| "null".into()),
     )
 }
 
@@ -2322,6 +2498,7 @@ fn render_preview_request_hint_json(hint: &crate::protocol::PreviewRequestHint) 
         crate::protocol::PreviewRequestKind::RootDocument => "root-document",
         crate::protocol::PreviewRequestKind::RootEntry => "root-entry",
         crate::protocol::PreviewRequestKind::FallbackRoot => "fallback-root",
+        crate::protocol::PreviewRequestKind::BootstrapState => "bootstrap-state",
         crate::protocol::PreviewRequestKind::RuntimeState => "runtime-state",
         crate::protocol::PreviewRequestKind::WorkspaceState => "workspace-state",
         crate::protocol::PreviewRequestKind::FileIndex => "file-index",
@@ -2353,6 +2530,7 @@ fn render_preview_response_descriptor_json(descriptor: &PreviewResponseDescripto
         PreviewResponseKind::WorkspaceDocument => "workspace-document",
         PreviewResponseKind::AppShell => "app-shell",
         PreviewResponseKind::HostManagedFallback => "host-managed-fallback",
+        PreviewResponseKind::BootstrapState => "bootstrap-state",
         PreviewResponseKind::RuntimeState => "runtime-state",
         PreviewResponseKind::WorkspaceState => "workspace-state",
         PreviewResponseKind::FileIndex => "file-index",
@@ -2415,8 +2593,24 @@ fn hex_nibble(value: u8) -> char {
 }
 
 fn escape_json(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    let mut escaped = String::with_capacity(input.len());
+
+    for character in input.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            control if control.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{:04x}", control as u32);
+            }
+            other => escaped.push(other),
+        }
+    }
+
+    escaped
 }

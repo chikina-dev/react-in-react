@@ -1,4 +1,7 @@
 import type { PackageJsonSummary, SessionSnapshot } from "./protocol";
+import type { RunRequest } from "./protocol";
+
+const SUGGESTED_RUN_SCRIPT_NAMES = ["dev", "start"] as const;
 
 export type WorkspaceEntryLike = {
   path: string;
@@ -32,6 +35,7 @@ export function applyPackageJsonTextToSessionSnapshot(
 ): void {
   const packageJson = parsePackageJsonSummary(packageJsonText);
   session.packageJson = packageJson;
+  session.suggestedRunRequest = deriveSuggestedRunRequest(packageJson, session.workspaceRoot);
 
   const dependencies = [
     ...(packageJson?.dependencies ?? []),
@@ -39,7 +43,37 @@ export function applyPackageJsonTextToSessionSnapshot(
   ];
   session.capabilities.detectedReact =
     dependencies.includes("react") || dependencies.includes("react-dom");
-  session.capabilities.detectedVite = dependencies.includes("vite");
+}
+
+export function deriveSuggestedRunRequest(
+  packageJson: PackageJsonSummary | null,
+  workspaceRoot = "/workspace",
+): RunRequest | null {
+  const scriptName = deriveSuggestedRunScriptName(packageJson);
+  if (scriptName == null) {
+    return null;
+  }
+
+  return {
+    cwd: workspaceRoot,
+    command: "npm",
+    args: ["run", scriptName],
+  };
+}
+
+export function deriveSuggestedRunScriptName(
+  packageJson: PackageJsonSummary | null,
+): (typeof SUGGESTED_RUN_SCRIPT_NAMES)[number] | null {
+  const scripts = packageJson?.scripts ?? {};
+
+  for (const scriptName of SUGGESTED_RUN_SCRIPT_NAMES) {
+    const candidate = scripts[scriptName];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return scriptName;
+    }
+  }
+
+  return null;
 }
 
 export function parsePackageJsonSummary(packageJsonText: string | null): PackageJsonSummary | null {

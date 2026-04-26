@@ -8,8 +8,10 @@ pub mod vfs;
 pub use engine::{
     EngineAdapter, EngineContextHandle, EngineContextSnapshot, EngineContextState,
     EngineDescriptor, EngineEvalMode, EngineEvalOutcome, EngineJobDrain, EngineRegisteredModule,
-    EngineSessionHandle, NullEngineAdapter, QuickJsNgEngineAdapter,
+    EngineSessionHandle, NullEngineAdapter, QuickJsNgBrowserEngineAdapter, QuickJsNgEngineAdapter,
 };
+#[cfg(quickjs_ng_native)]
+pub use engine::QuickJsNgNativeEngineAdapter;
 pub use error::{RuntimeHostError, RuntimeHostResult};
 pub use host::RuntimeHostCore;
 pub use protocol::{
@@ -34,8 +36,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    #[cfg(not(feature = "quickjs-ng-engine"))]
-    use crate::protocol::HostRuntimeModuleFormat;
 
     #[test]
     fn host_boot_summary_uses_engine_descriptor() {
@@ -163,29 +163,88 @@ mod tests {
         };
         assert!(!report.startup.exited);
         assert_eq!(report.startup.exit_code, None);
+        let root_report = report.root_report.as_ref().expect("expected root report");
         assert_eq!(
-            report.server.as_ref().map(|server| server.port.port),
+            Some(root_report.server.port.port),
             Some(3100)
         );
-        assert_eq!(report.port.as_ref().map(|port| port.port), Some(3100));
         assert_eq!(
-            report
-                .root_request
-                .as_ref()
-                .map(|request| request.relative_path.as_str()),
+            Some(root_report.request.relative_path.as_str()),
             Some("/")
         );
         assert_eq!(
-            report.root_request_hint.as_ref().map(|hint| &hint.kind),
+            Some(&root_report.request_hint.kind),
             Some(&PreviewRequestKind::RootEntry)
         );
         assert_eq!(
-            report
-                .root_response_descriptor
-                .as_ref()
-                .map(|descriptor| &descriptor.kind),
+            Some(&root_report.response_descriptor.kind),
             Some(&PreviewResponseKind::AppShell)
         );
+    }
+
+    #[test]
+    fn runtime_launch_preview_classifies_guest_component_entries_as_app_shell() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "sample3.zip".into(),
+                    file_count: 3,
+                    directory_count: 2,
+                    root_prefix: None,
+                },
+                Some("sample3-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"sample3-app","dependencies":["react","react-dom"]}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/app/routes/home.tsx",
+                        "export default function Home() { return <section>sample3</section>; }",
+                    ),
+                    VirtualFile::text("/workspace/app/app.css", "body { margin: 0; }"),
+                ],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new(
+                    "/workspace",
+                    "node",
+                    vec![String::from("app/routes/home.tsx")],
+                ),
+            )
+            .expect("runtime context should be created");
+
+        let launched = host
+            .execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::LaunchPreview {
+                    max_turns: 16,
+                    port: Some(3100),
+                },
+            )
+            .expect("launch preview should succeed");
+
+        let report = match launched {
+            HostRuntimeResponse::PreviewLaunchReport(report) => report,
+            other => panic!("expected preview launch report, got {other:?}"),
+        };
+        let root_report = report.root_report.as_ref().expect("expected root report");
+        assert_eq!(root_report.request_hint.kind, PreviewRequestKind::RootEntry);
+        assert_eq!(root_report.response_descriptor.kind, PreviewResponseKind::AppShell);
+        let direct_response = root_report
+            .direct_response
+            .as_ref()
+            .expect("app-shell should produce a direct response");
+        let html = direct_response
+            .text_body
+            .as_deref()
+            .expect("app-shell should include html");
+        assert!(html.contains("<!doctype html>"));
     }
 
     #[test]
@@ -227,7 +286,7 @@ mod tests {
         );
         assert_eq!(launched.run_plan.entrypoint, "/workspace/src/server.js");
         assert_eq!(launched.runtime_context.process.cwd, "/workspace/src");
-        assert_eq!(launched.engine_context.state, EngineContextState::Booted);
+        assert_eq!(launched.engine_context.state, EngineContextState::Ready);
         assert!(
             launched
                 .bindings
@@ -248,31 +307,70 @@ mod tests {
         );
         assert!(
             launched
-                .startup_logs
+                .startup_stdout
+                .iter()
+                .any(|line| line.starts_with("[mount] ") && line.ends_with(" files available at /workspace"))
+        );
+        assert!(
+            launched
+                .startup_stdout
                 .iter()
                 .any(|line| line.contains("[host] engine=null-engine"))
         );
         assert!(
             launched
-                .startup_logs
+                .startup_stdout
                 .iter()
                 .any(|line| line.contains("[context] id="))
+        );
+        assert!(
+            launched
+                .preview_ready
+                .as_ref()
+                .is_some_and(|preview| preview.url.contains("/preview/"))
+        );
+        assert_eq!(
+            launched
+                .preview_ready
+                .as_ref()
+                .map(|preview| preview.root_hydrated_files.len()),
+            Some(1)
+        );
+        assert_eq!(
+            launched
+                .preview_ready
+                .as_ref()
+                .and_then(|preview| preview.root_hydrated_files.first())
+                .map(|file| file.path.as_str()),
+            Some("/workspace/package.json")
         );
         assert_eq!(
             launched
                 .preview_launch
-                .server
+                .root_report
                 .as_ref()
-                .map(|server| server.port.port),
+                .map(|report| report.server.port.port),
             Some(3200)
         );
         assert_eq!(
             launched
                 .preview_launch
-                .root_request_hint
+                .root_report
                 .as_ref()
-                .map(|hint| &hint.kind),
+                .map(|report| &report.request_hint.kind),
             Some(&PreviewRequestKind::FallbackRoot)
+        );
+        assert_eq!(
+            launched
+                .state
+                .preview
+                .as_ref()
+                .map(|preview| preview.root_hydrated_files.as_slice()),
+            launched
+                .preview_launch
+                .root_report
+                .as_ref()
+                .map(|report| report.hydrated_files.as_slice())
         );
         assert_eq!(launched.state.session.state, SessionState::Running);
         assert_eq!(
@@ -296,6 +394,67 @@ mod tests {
             event,
             HostRuntimeEvent::PortListen { port } if port.port == 3200
         )));
+    }
+
+    #[test]
+    fn browser_cli_registry_accepts_second_package_without_resolver_changes() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "acme-dev.zip".into(),
+                    file_count: 4,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("acme-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"acme-app","scripts":{"dev":"acme-dev"}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/.bin/acme-dev",
+                        "acme-dev.js",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/acme-dev/package.json",
+                        r#"{"name":"acme-dev","bin":{"acme-dev":"bin/acme-dev.js"}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/acme-dev/bin/acme-dev.js",
+                        "console.log('acme-dev');",
+                    ),
+                ],
+            )
+            .expect("session should be created");
+
+        let launched = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new(
+                    "/workspace",
+                    "npm",
+                    vec![String::from("run"), String::from("dev")],
+                ),
+                16,
+                Some(3400),
+            )
+            .expect("launch runtime should succeed for second browser cli package");
+
+        assert_eq!(
+            launched.run_plan.command_kind,
+            crate::protocol::RunCommandKind::NpmScript
+        );
+        assert_eq!(launched.run_plan.resolved_script.as_deref(), Some("acme-dev"));
+        assert!(launched.startup_stdout.iter().any(|line| {
+            line == "[browser-cli] runtime=browser-dev-server preview=http-server mode=dev"
+        }));
+        assert_eq!(
+            launched.preview_ready.as_ref().map(|preview| preview.url.as_str()),
+            Some("/preview/rust-session-1/3400/")
+        );
     }
 
     #[test]
@@ -369,48 +528,159 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "quickjs-ng-engine"))]
+    #[cfg(not(quickjs_ng_native))]
     #[test]
-    fn quickjs_ng_engine_scaffold_reports_unlinked_vm() {
-        let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
+    fn quickjs_ng_browser_engine_requires_bootstrap_ready_state_for_preview_requests() {
+        let mut host = RuntimeHostCore::new(QuickJsNgBrowserEngineAdapter::default());
         let session = host
             .create_session(
                 ArchiveStats {
-                    file_name: "quickjs.zip".into(),
-                    file_count: 1,
+                    file_name: "quickjs-browser-preview.zip".into(),
+                    file_count: 2,
                     directory_count: 1,
                     root_prefix: None,
                 },
-                Some("quickjs-app".into()),
+                Some("quickjs-browser-app".into()),
                 BTreeMap::new(),
-                vec![VirtualFile::text(
-                    "/workspace/src/main.js",
-                    "console.log('quickjs');",
-                )],
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"quickjs-browser-app"}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/src/main.js",
+                        "console.log('quickjs browser runtime');",
+                    ),
+                ],
             )
             .expect("session should be created");
         let runtime_context = host
             .create_runtime_context(
                 &session.session_id,
-                &RunRequest::new("/workspace/src", "node", vec![String::from("main")]),
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.js")]),
             )
             .expect("runtime context should be created");
 
-        assert_eq!(host.boot_summary().engine_name, "quickjs-ng-stub");
-        let snapshot = host
-            .describe_engine_context(&runtime_context.context_id)
-            .expect("engine context should exist");
-        assert_eq!(snapshot.state, EngineContextState::Booted);
-        assert_eq!(snapshot.registered_modules, 0);
-        assert!(snapshot.module_loader_roots.is_empty());
+        let listening = host
+            .execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::HttpServePreview { port: Some(3300) },
+            )
+            .expect("preview server should be registered");
         assert!(matches!(
-            host.execute_runtime_command(&runtime_context.context_id, HostRuntimeCommand::BootEngine),
-            Err(RuntimeHostError::EngineFailure(message))
-                if message.contains("quickjs-ng adapter scaffold registered")
+            listening,
+            HostRuntimeResponse::HttpServerListening { ref server } if server.port.port == 3300
         ));
+
+        match host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::PreviewRequest {
+                request: HostRuntimeHttpRequest {
+                    port: 3300,
+                    method: String::from("GET"),
+                    relative_path: String::from("/"),
+                    search: String::new(),
+                    client_modules: Vec::new(),
+                },
+            },
+        ) {
+            Err(RuntimeHostError::EngineFailure(message)) => {
+                assert!(message.contains("browser preview request requires bootstrap-ready engine context"));
+                assert!(message.contains("bridge_ready=false"));
+            }
+            other => panic!("expected bootstrap-ready preview failure, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(quickjs_ng_native))]
+    #[test]
+    fn quickjs_ng_browser_engine_launches_runtime_and_preview_reports() {
+        let mut host = RuntimeHostCore::new(QuickJsNgBrowserEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "quickjs-browser.zip".into(),
+                    file_count: 2,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("quickjs-browser-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"quickjs-browser-app"}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/src/main.js",
+                        "console.log('quickjs browser runtime');",
+                    ),
+                ],
+            )
+            .expect("session should be created");
+
+        let launched = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.js")]),
+                16,
+                Some(3300),
+            )
+            .expect("browser adapter launch_runtime should succeed");
+
+        assert_eq!(
+            launched.boot_summary.engine_name,
+            "quickjs-ng-browser-vm-harness"
+        );
+        assert!(
+            launched
+                .preview_launch
+                .startup
+                .boot
+                .result_summary
+                .contains("quickjs-ng browser vm harness bootstrapped")
+        );
+        assert!(!launched.preview_launch.startup.exited);
+        assert_eq!(launched.preview_launch.startup.exit_code, None);
+        assert_eq!(
+            launched.preview_ready.as_ref().map(|preview| preview.port.port),
+            Some(3300)
+        );
+        assert!(
+            launched
+                .preview_ready
+                .as_ref()
+                .is_some_and(|preview| preview.url.ends_with("/3300/"))
+        );
+        assert_eq!(
+            launched.state.preview.as_ref().map(|preview| preview.port.port),
+            Some(3300)
+        );
+        assert!(launched.events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::PortListen { port } if port.port == 3300
+            )
+        }));
+        assert_eq!(launched.engine_context.state, EngineContextState::Ready);
+        assert!(launched.engine_context.bridge_ready);
+        assert!(launched
+            .startup_stdout
+            .iter()
+            .any(|line| line.contains("[engine-context] state=ready pending-jobs=0 bridge-ready=true")));
+        assert!(launched.events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Console { level: HostRuntimeConsoleLevel::Info, line }
+                    if line.contains("[browser-bootstrap] bridge-ready")
+            )
+        }));
+
         let snapshot = host
-            .describe_engine_context(&runtime_context.context_id)
-            .expect("engine context should exist");
+            .describe_engine_context(&launched.runtime_context.context_id)
+            .expect("engine context should exist after browser launch");
+        assert_eq!(snapshot.state, EngineContextState::Ready);
+        assert!(snapshot.bridge_ready);
         assert_eq!(snapshot.registered_modules, 8);
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
@@ -423,53 +693,138 @@ mod tests {
                 String::from("/workspace/src/node_modules"),
             ]
         );
-        assert_eq!(
-            host.list_engine_modules(&runtime_context.context_id)
-                .expect("engine modules should be listed")
-                .len(),
-            8
-        );
-        assert_eq!(
-            host.read_engine_module(&runtime_context.context_id, "runtime:bootstrap")
-                .expect("bootstrap module should resolve")
-                .specifier,
-            "runtime:bootstrap"
-        );
-        assert_eq!(
-            host.resolve_runtime_module(&runtime_context.context_id, None, "node:process")
-                .expect("registered module should resolve")
-                .resolved_specifier,
-            "node:process"
-        );
-        let loader_plan = host
-            .describe_runtime_module_loader(&runtime_context.context_id)
-            .expect("module loader plan should resolve");
-        assert_eq!(loader_plan.context_id, runtime_context.context_id);
-        assert_eq!(loader_plan.cwd, "/workspace/src");
-        assert_eq!(loader_plan.workspace_root, "/workspace");
-        assert_eq!(
-            loader_plan.entry_module.resolved_specifier,
-            "/workspace/src/main.js"
-        );
-        assert_eq!(
-            loader_plan.entry_module.format,
-            HostRuntimeModuleFormat::Module
-        );
-        assert!(
-            loader_plan
-                .registered_specifiers
-                .contains(&String::from("runtime:bootstrap"))
-        );
-        assert_eq!(
-            loader_plan.node_module_search_roots,
-            vec![
-                String::from("/workspace/node_modules"),
-                String::from("/workspace/src/node_modules"),
-            ]
-        );
+
+        assert!(matches!(
+            host.execute_runtime_command(
+                &launched.runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 3300,
+                        method: String::from("GET"),
+                        relative_path: String::from("/"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.port.port == 3300
+                    && report.request.relative_path == "/"
+                    && report.response_descriptor.kind == PreviewResponseKind::AppShell
+        ));
     }
 
-    #[cfg(feature = "quickjs-ng-engine")]
+    #[cfg(quickjs_ng_native)]
+    #[test]
+    fn quickjs_ng_browser_c_vm_launches_runtime_and_preview_reports() {
+        let mut host = RuntimeHostCore::new(QuickJsNgBrowserEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "quickjs-browser-c-vm.zip".into(),
+                    file_count: 2,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("quickjs-browser-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"quickjs-browser-app"}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/src/main.js",
+                        "console.log('quickjs browser runtime');",
+                    ),
+                ],
+            )
+            .expect("session should be created");
+        let runtime_context = host
+            .create_runtime_context(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.js")]),
+            )
+            .expect("runtime context should be created");
+
+        host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::HttpServePreview { port: Some(3300) },
+        )
+        .expect("preview server should be registered before launch");
+
+        match host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::PreviewRequest {
+                request: HostRuntimeHttpRequest {
+                    port: 3300,
+                    method: String::from("GET"),
+                    relative_path: String::from("/"),
+                    search: String::new(),
+                    client_modules: Vec::new(),
+                },
+            },
+        ) {
+            Err(RuntimeHostError::EngineFailure(message)) => {
+                assert!(message.contains("browser preview request requires bootstrap-ready engine context"));
+                assert!(message.contains("bridge_ready=false"));
+            }
+            other => panic!("expected bootstrap-ready preview failure, got {other:?}"),
+        }
+
+        let launched = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.js")]),
+                16,
+                Some(3300),
+            )
+            .expect("browser c-vm launch_runtime should succeed");
+
+        assert_eq!(launched.boot_summary.engine_name, "quickjs-ng-browser-c-vm");
+        assert!(
+            launched
+                .preview_launch
+                .startup
+                .boot
+                .result_summary
+                .contains("quickjs-ng browser c-vm bootstrapped")
+        );
+        assert!(launched.engine_context.bridge_ready);
+        assert_eq!(launched.engine_context.state, EngineContextState::Ready);
+
+        let snapshot = host
+            .describe_engine_context(&launched.runtime_context.context_id)
+            .expect("engine context should exist after browser launch");
+        assert_eq!(snapshot.state, EngineContextState::Ready);
+        assert!(snapshot.bridge_ready);
+        assert_eq!(
+            snapshot.bootstrap_specifier.as_deref(),
+            Some("runtime:bootstrap")
+        );
+        assert!(snapshot.registered_modules >= 8);
+
+        assert!(matches!(
+            host.execute_runtime_command(
+                &launched.runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 3300,
+                        method: String::from("GET"),
+                        relative_path: String::from("/"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.port.port == 3300
+                    && report.request.relative_path == "/"
+                    && report.response_descriptor.kind == PreviewResponseKind::AppShell
+        ));
+    }
+
+    #[cfg(quickjs_ng_native)]
     #[test]
     fn quickjs_ng_engine_evaluates_scripts_and_bootstraps_registered_modules() {
         let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
@@ -492,6 +847,7 @@ import path from "node:path";
 import { answer as localAnswer } from "./boot.js";
 import packageAnswer from "demo-pkg";
 import packageFeature from "demo-pkg/feature";
+import hybridRoot from "hybrid-pkg";
 console.log("quickjs native bootstrap");
 globalThis.cwdValue = process.cwd();
 globalThis.argvCount = process.argv.length;
@@ -523,6 +879,7 @@ setTimeout(() => {
   globalThis.timerHit = 1;
 }, 0);
 globalThis.answer = localAnswer + packageAnswer + packageFeature;
+globalThis.hybridRoot = hybridRoot;
 globalThis.answer;"#,
                     ),
                     VirtualFile::text("/workspace/src/boot.js", "export const answer = 40 + 2;"),
@@ -571,6 +928,49 @@ module.exports = payload.offset + 4;"#,
                         "/workspace/node_modules/late-pkg/value.json",
                         r#"{"offset":5}"#,
                     ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/package.json",
+                        r##"{"name":"hybrid-pkg","exports":{".":{"browser":"./browser/root.js","import":"./esm/root.js","default":"./cjs/root.cjs"},"./feature/*":{"browser":"./browser/feature-*.js","default":"./features/*.js"},"./self-check":{"default":"./self-check.js"}},"imports":{"#internal":"./internal.js"},"browser":{"./server-only.js":"./browser-only.js"}}"##,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser/root.js",
+                        r##"import internal from "#internal";
+import selfCheck from "hybrid-pkg/self-check";
+export default `${internal}:${selfCheck}`;"##,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/esm/root.js",
+                        r#"export default "hybrid-esm-root";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/cjs/root.cjs",
+                        r#"module.exports = "hybrid-cjs-root";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/internal.js",
+                        r#"export default "hybrid-internal";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/self-check.js",
+                        r#"import browserValue from "./server-only.js";
+export default browserValue;"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/server-only.js",
+                        r#"export default "server-only";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser-only.js",
+                        r#"export default "browser-only";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser/feature-demo.js",
+                        r#"export default "hybrid-feature-browser";"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/features/demo.js",
+                        r#"export default "hybrid-feature-default";"#,
+                    ),
                 ],
             )
             .expect("session should be created");
@@ -614,7 +1014,7 @@ module.exports = payload.offset + 4;"#,
             other => panic!("expected runtime startup report, got {other:?}"),
         };
         assert_eq!(report.boot.plan.bootstrap_specifier, "runtime:bootstrap");
-        assert_eq!(report.boot.plan.modules.len(), 7);
+        assert_eq!(report.boot.plan.modules.len(), 10);
         assert_eq!(
             report.boot.loader_plan.node_module_search_roots,
             vec![
@@ -626,7 +1026,7 @@ module.exports = payload.offset + 4;"#,
             report
                 .boot
                 .result_summary
-                .contains("quickjs-ng booted 7 bootstrap modules")
+                .contains("quickjs-ng booted 10 bootstrap modules")
         );
         assert_eq!(
             report.entry_import_plan.resolved_module.resolved_specifier,
@@ -647,9 +1047,22 @@ module.exports = payload.offset + 4;"#,
                 "/workspace/answer.js",
                 "globalThis.answer",
                 false,
-            )
-            .expect("entry module side effects should run during bootstrap");
+        )
+        .expect("entry module side effects should run during bootstrap");
         assert!(imported_answer.result_summary.contains("46"));
+        let hybrid_root = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/hybrid-root.js",
+                "globalThis.hybridRoot",
+                false,
+            )
+            .expect("hybrid package root should resolve during bootstrap");
+        assert!(
+            hybrid_root
+                .result_summary
+                .contains("hybrid-internal:browser-only")
+        );
 
         let globals = host
             .eval_engine_context(
@@ -751,8 +1164,8 @@ module.exports = payload.offset + 4;"#,
             .session_snapshot(&session.session_id)
             .expect("session snapshot should exist");
         assert_eq!(session_snapshot.revision, 1);
-        assert_eq!(session_snapshot.archive.file_count, 13);
-        assert_eq!(session_snapshot.archive.directory_count, 7);
+        assert_eq!(session_snapshot.archive.file_count, 23);
+        assert_eq!(session_snapshot.archive.directory_count, 12);
         let runtime_state = host
             .eval_engine_context(
                 &runtime_context.context_id,
@@ -843,8 +1256,10 @@ module.exports = payload.offset + 4;"#,
             &runtime_context.context_id,
             "/workspace/src/later-check.mjs",
             r#"import laterAnswer from "./later.js";
+import hybridFeature from "hybrid-pkg/feature/demo";
 globalThis.lateAnswer = laterAnswer;
-export default laterAnswer;"#,
+globalThis.hybridFeatureAnswer = hybridFeature;
+export default `${laterAnswer}:${hybridFeature}`;"#,
             true,
         )
         .expect("native loader should resolve workspace and node_modules modules on demand");
@@ -855,14 +1270,27 @@ export default laterAnswer;"#,
                 "/workspace/late-state.js",
                 "globalThis.lateAnswer",
                 false,
-            )
-            .expect("late import side effect should persist");
+        )
+        .expect("late import side effect should persist");
         assert!(late_state.result_summary.contains("12"));
+        let hybrid_feature = host
+            .eval_engine_context(
+                &runtime_context.context_id,
+                "/workspace/hybrid-feature-state.js",
+                "globalThis.hybridFeatureAnswer",
+                false,
+            )
+            .expect("hybrid package feature wildcard should resolve on demand");
+        assert!(
+            hybrid_feature
+                .result_summary
+                .contains("hybrid-feature-browser")
+        );
 
         let snapshot = host
             .describe_engine_context(&runtime_context.context_id)
             .expect("engine context should exist");
-        assert_eq!(snapshot.registered_modules, 15);
+        assert_eq!(snapshot.registered_modules, 23);
         assert_eq!(
             snapshot.bootstrap_specifier.as_deref(),
             Some("runtime:bootstrap")
@@ -874,6 +1302,170 @@ export default laterAnswer;"#,
                 String::from("/workspace/src/node_modules"),
             ]
         );
+    }
+
+    #[cfg(quickjs_ng_native)]
+    #[test]
+    fn quickjs_ng_engine_stays_usable_across_repeated_idle_runs_and_shutdown() {
+        let mut host = RuntimeHostCore::new(QuickJsNgEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "long-lived.zip".into(),
+                    file_count: 2,
+                    directory_count: 2,
+                    root_prefix: None,
+                },
+                Some("loop-app".into()),
+                BTreeMap::new(),
+                vec![
+                    VirtualFile::text("/workspace/package.json", r#"{"name":"loop-app"}"#),
+                    VirtualFile::text("/workspace/src/main.js", "globalThis.started = 1;"),
+                ],
+            )
+            .expect("session should be created");
+
+        let launch = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new("/workspace/src", "node", vec![String::from("main.js")]),
+                32,
+                Some(3300),
+            )
+            .expect("launch_runtime should succeed");
+
+        let context_id = launch.runtime_context.context_id.clone();
+        assert_eq!(
+            launch
+                .state
+                .preview
+                .as_ref()
+                .map(|preview| preview.port.port),
+            Some(3300)
+        );
+
+        let post_launch = host
+            .eval_engine_context(
+                &context_id,
+                "/workspace/src/post-launch.js",
+                r#"console.log("loop-phase-1");
+Promise.resolve().then(() => {
+  globalThis.phaseMicrotask = (globalThis.phaseMicrotask ?? 0) + 1;
+  setTimeout(() => {
+    globalThis.phaseTimeout = (globalThis.phaseTimeout ?? 0) + 1;
+    console.log("loop-timeout");
+  }, 7);
+});
+globalThis.phaseIntervalTicks = 0;
+globalThis.phaseInterval = setInterval(() => {
+  globalThis.phaseIntervalTicks += 1;
+  if (globalThis.phaseIntervalTicks >= 2) {
+    clearInterval(globalThis.phaseInterval);
+  }
+}, 5);
+"scheduled";"#,
+                false,
+            )
+            .expect("post-launch script should evaluate");
+        assert_eq!(post_launch.state, EngineContextState::Ready);
+        assert!(post_launch.result_summary.contains("scheduled"));
+
+        let idle_after_eval = host
+            .run_runtime_until_idle(&context_id, 16)
+            .expect("run_runtime_until_idle should drain post-launch work");
+        assert!(!idle_after_eval.reached_turn_limit);
+        assert_eq!(idle_after_eval.pending_jobs, 0);
+        assert_eq!(idle_after_eval.pending_timers, 0);
+        assert_eq!(idle_after_eval.fired_timers, 3);
+        assert!(idle_after_eval.turns >= 3);
+        assert!(!idle_after_eval.exited);
+
+        let state_after_idle = host
+            .eval_engine_context(
+                &context_id,
+                "/workspace/state-after-idle.js",
+                r#"JSON.stringify({
+  started: globalThis.started,
+  phaseMicrotask: globalThis.phaseMicrotask,
+  phaseTimeout: globalThis.phaseTimeout,
+  phaseIntervalTicks: globalThis.phaseIntervalTicks,
+})"#,
+                false,
+            )
+            .expect("post-idle state should be readable");
+        assert!(state_after_idle.result_summary.contains(r#""started":1"#));
+        assert!(state_after_idle.result_summary.contains(r#""phaseMicrotask":1"#));
+        assert!(state_after_idle.result_summary.contains(r#""phaseTimeout":1"#));
+        assert!(state_after_idle.result_summary.contains(r#""phaseIntervalTicks":2"#));
+
+        let runtime_events = host
+            .execute_runtime_command(&context_id, HostRuntimeCommand::DrainEvents)
+            .expect("runtime events should drain after repeated idle");
+        let HostRuntimeResponse::RuntimeEvents { events } = runtime_events else {
+            panic!("expected runtime events after repeated idle");
+        };
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Console { line, .. } if line == "loop-phase-1"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Stdout { chunk } if chunk == "loop-phase-1"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostRuntimeEvent::Console { line, .. } if line == "loop-timeout"
+            )
+        }));
+
+        let idle_again = host
+            .run_runtime_until_idle(&context_id, 8)
+            .expect("second idle run should be stable");
+        assert_eq!(idle_again.turns, 0);
+        assert_eq!(idle_again.fired_timers, 0);
+        assert_eq!(idle_again.pending_jobs, 0);
+        assert_eq!(idle_again.pending_timers, 0);
+
+        let preview_request = host
+            .execute_runtime_command(
+                &context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 3300,
+                        method: String::from("GET"),
+                        relative_path: String::from("/"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            )
+            .expect("preview request should still work after repeated idle runs");
+        let HostRuntimeResponse::PreviewRequestReport(report) = preview_request else {
+            panic!("expected preview request report after repeated idle runs");
+        };
+        assert_eq!(report.port.port, 3300);
+        assert_eq!(report.request_hint.kind, PreviewRequestKind::RootEntry);
+
+        let shutdown = host
+            .execute_runtime_command(
+                &context_id,
+                HostRuntimeCommand::Shutdown { code: 0 },
+            )
+            .expect("runtime shutdown should succeed after repeated idle runs");
+        let HostRuntimeResponse::ShutdownReport(report) = shutdown else {
+            panic!("expected shutdown report after repeated idle runs");
+        };
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.closed_servers.len(), 1);
+        assert_eq!(report.closed_servers[0].port.port, 3300);
+        assert!(report.events.iter().any(|event| {
+            matches!(event, HostRuntimeEvent::ProcessExit { code } if *code == 0)
+        }));
     }
 
     #[test]
@@ -929,6 +1521,47 @@ export default laterAnswer;"#,
                         "/workspace/node_modules/browser-pkg/feature-browser.js",
                         "export default 'browser-feature';",
                     ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/package.json",
+                        r##"{"name":"hybrid-pkg","exports":{".":{"browser":"./browser/root.js","import":"./esm/root.js","default":"./cjs/root.cjs"},"./feature/*":{"browser":"./browser/feature-*.js","default":"./features/*.js"},"./self":{"default":"./self-check.js"}},"imports":{"#internal":"./internal.js"},"browser":{"./server-only.js":"./browser-only.js"}}"##,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser/root.js",
+                        "import internal from '#internal'; import selfCheck from 'hybrid-pkg/self'; export default `${internal}:${selfCheck}`;",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/esm/root.js",
+                        "export default 'hybrid-root-esm';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/cjs/root.cjs",
+                        "module.exports = 'hybrid-root-cjs';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/internal.js",
+                        "export default 'hybrid-internal';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/self-check.js",
+                        "import browserValue from './server-only.js'; export default browserValue;",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/server-only.js",
+                        "export default 'server-only';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser-only.js",
+                        "export default 'browser-only';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/browser/feature-demo.js",
+                        "export default 'hybrid-feature-browser';",
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/hybrid-pkg/features/demo.js",
+                        "export default 'hybrid-feature-default';",
+                    ),
+                    VirtualFile::text("/workspace/node_modules/.bin/vite", "vite.js"),
                 ],
             )
             .expect("session should be created");
@@ -940,7 +1573,7 @@ export default laterAnswer;"#,
             host.workspace_file_summaries(&session.session_id)
                 .expect("workspace files should be listed")
                 .len(),
-            10
+            21
         );
         assert_eq!(
             host.read_workspace_file(&session.session_id, "/workspace/src/main.tsx")
@@ -962,6 +1595,7 @@ export default laterAnswer;"#,
             vec![
                 "/workspace/node_modules/browser-pkg/package.json".to_string(),
                 "/workspace/node_modules/exports-pkg/package.json".to_string(),
+                "/workspace/node_modules/hybrid-pkg/package.json".to_string(),
                 "/workspace/package.json".to_string(),
                 "/workspace/src/main.tsx".to_string(),
             ]
@@ -979,6 +1613,7 @@ export default laterAnswer;"#,
             vec![
                 "/workspace/node_modules/browser-pkg/package.json".to_string(),
                 "/workspace/node_modules/exports-pkg/package.json".to_string(),
+                "/workspace/node_modules/hybrid-pkg/package.json".to_string(),
                 "/workspace/package.json".to_string(),
                 "/workspace/src/main.tsx".to_string(),
             ]
@@ -1137,6 +1772,68 @@ export default laterAnswer;"#,
             browser_relative.resolved_specifier,
             "/workspace/node_modules/browser-pkg/feature-browser.js"
         );
+        let hybrid_root = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "hybrid-pkg",
+            )
+            .expect("hybrid package root should resolve");
+        assert_eq!(
+            hybrid_root.resolved_specifier,
+            "/workspace/node_modules/hybrid-pkg/browser/root.js"
+        );
+        let hybrid_imports = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/node_modules/hybrid-pkg/browser/root.js"),
+                "#internal",
+            )
+            .expect("hybrid package imports alias should resolve");
+        assert_eq!(
+            hybrid_imports.resolved_specifier,
+            "/workspace/node_modules/hybrid-pkg/internal.js"
+        );
+        let hybrid_self = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/node_modules/hybrid-pkg/browser/root.js"),
+                "hybrid-pkg/self",
+            )
+            .expect("hybrid package self import should resolve");
+        assert_eq!(
+            hybrid_self.resolved_specifier,
+            "/workspace/node_modules/hybrid-pkg/self-check.js"
+        );
+        let hybrid_browser = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/node_modules/hybrid-pkg/self-check.js"),
+                "./server-only.js",
+            )
+            .expect("hybrid package browser remap should resolve");
+        assert_eq!(
+            hybrid_browser.resolved_specifier,
+            "/workspace/node_modules/hybrid-pkg/browser-only.js"
+        );
+        let hybrid_feature = host
+            .resolve_runtime_module(
+                &runtime_context.context_id,
+                Some("/workspace/src/main.tsx"),
+                "hybrid-pkg/feature/demo",
+            )
+            .expect("hybrid package wildcard feature should resolve");
+        assert_eq!(
+            hybrid_feature.resolved_specifier,
+            "/workspace/node_modules/hybrid-pkg/browser/feature-demo.js"
+        );
+        let hybrid_feature_source = host
+            .load_runtime_module(
+                &runtime_context.context_id,
+                &hybrid_feature.resolved_specifier,
+            )
+            .expect("hybrid feature module should load");
+        assert!(hybrid_feature_source.source.contains("hybrid-feature-browser"));
         let loader_plan = host
             .describe_runtime_module_loader(&runtime_context.context_id)
             .expect("module loader plan should resolve");
@@ -1222,6 +1919,29 @@ export default laterAnswer;"#,
                 "/virtual/node".to_string(),
                 "/workspace/src/main.tsx".to_string(),
                 "--watch".to_string(),
+            ]
+        );
+        let mut npm_request = RunRequest::new(
+            "/workspace",
+            "npm",
+            vec![
+                String::from("run"),
+                String::from("preview"),
+                String::from("--host"),
+            ],
+        );
+        npm_request
+            .env
+            .insert(String::from("NODE_ENV"), String::from("development"));
+        assert_eq!(
+            host.build_process_info(&session.session_id, &npm_request)
+                .expect("npm process info should resolve")
+                .argv,
+            vec![
+                "/virtual/node".to_string(),
+                "/workspace/node_modules/.bin/vite".to_string(),
+                "preview".to_string(),
+                "--host".to_string(),
             ]
         );
         let runtime_context = host
@@ -1404,6 +2124,7 @@ export default laterAnswer;"#,
                         method: String::from("GET"),
                         relative_path: String::from("/src/main.tsx"),
                         search: String::from("?v=1"),
+                        client_modules: Vec::new(),
                     },
                 },
             ),
@@ -1437,6 +2158,7 @@ export default laterAnswer;"#,
                     == vec![
                         String::from("/workspace/node_modules/browser-pkg/package.json"),
                         String::from("/workspace/node_modules/exports-pkg/package.json"),
+                        String::from("/workspace/node_modules/hybrid-pkg/package.json"),
                         String::from("/workspace/package.json"),
                         String::from("/workspace/src/main.tsx"),
                     ]
@@ -1448,6 +2170,7 @@ export default laterAnswer;"#,
                         hydrate_paths: vec![
                             String::from("/workspace/node_modules/browser-pkg/package.json"),
                             String::from("/workspace/node_modules/exports-pkg/package.json"),
+                            String::from("/workspace/node_modules/hybrid-pkg/package.json"),
                             String::from("/workspace/package.json"),
                             String::from("/workspace/src/main.tsx"),
                         ],
@@ -1466,6 +2189,7 @@ export default laterAnswer;"#,
                         method: String::from("HEAD"),
                         relative_path: String::from("/src/main.tsx"),
                         search: String::new(),
+                        client_modules: Vec::new(),
                     },
                 },
             ),
@@ -1491,6 +2215,7 @@ export default laterAnswer;"#,
                         method: String::from("POST"),
                         relative_path: String::from("/src/main.tsx"),
                         search: String::new(),
+                        client_modules: Vec::new(),
                     },
                 },
             ),
@@ -1506,6 +2231,218 @@ export default laterAnswer;"#,
                         allow_methods: vec![String::from("GET"), String::from("HEAD")],
                         omit_body: false,
                     }
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("GET"),
+                        relative_path: String::from("/src/main.tsx"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report
+                    .transform_kind
+                    .as_ref()
+                    .is_some_and(|kind| kind == &crate::protocol::HostRuntimePreviewTransformKind::Module)
+                    && report
+                    .render_plan
+                    .as_ref()
+                    .is_some_and(|plan|
+                        plan.kind == crate::protocol::HostRuntimePreviewRenderKind::WorkspaceFile
+                            && plan.workspace_path.as_deref() == Some("/workspace/src/main.tsx")
+                            && plan.document_root.as_deref() == Some("/workspace")
+                    )
+                    && report
+                    .module_plan
+                    .as_ref()
+                    .is_some_and(|plan|
+                        plan.importer_path == "/workspace/src/main.tsx"
+                            && plan.format == crate::protocol::HostRuntimeModuleFormat::Module
+                            && plan.import_plans.is_empty()
+                    )
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("GET"),
+                        relative_path: String::from("/files/package.json"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.direct_response.as_ref().is_some_and(|response|
+                    response.status == 200
+                        && response
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|value| value == "application/json; charset=utf-8")
+                        && response
+                            .text_body
+                            .as_ref()
+                            .is_some_and(|body| body.contains("\"scripts\""))
+                )
+        ));
+        assert_eq!(
+            host.write_workspace_file(
+                &session.session_id,
+                "/workspace/src/app.css",
+                br#"body{background:url("/bg.png")}"#.to_vec(),
+                true,
+            )
+            .expect("stylesheet should be writable")
+            .path,
+            "/workspace/src/app.css"
+        );
+        let stylesheet_report = match host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::PreviewRequest {
+                request: HostRuntimeHttpRequest {
+                    port: 4200,
+                    method: String::from("GET"),
+                    relative_path: String::from("/files/src/app.css"),
+                    search: String::new(),
+                    client_modules: Vec::new(),
+                },
+            },
+        ) {
+            Ok(HostRuntimeResponse::PreviewRequestReport(report)) => report,
+            other => panic!("unexpected stylesheet preview response: {other:?}"),
+        };
+        assert_eq!(
+            stylesheet_report.transform_kind,
+            Some(crate::protocol::HostRuntimePreviewTransformKind::Stylesheet)
+        );
+        let stylesheet_response = stylesheet_report
+            .direct_response
+            .expect("stylesheet preview should be returned directly");
+        assert_eq!(stylesheet_response.status, 200);
+        assert_eq!(
+            stylesheet_response.headers.get("content-type").map(String::as_str),
+            Some("text/css; charset=utf-8")
+        );
+        assert!(stylesheet_response
+            .text_body
+            .as_ref()
+            .is_some_and(|body| body.contains("bg.png")));
+        let stylesheet_runtime_report = match host.execute_runtime_command(
+            &runtime_context.context_id,
+            HostRuntimeCommand::PreviewRequest {
+                request: HostRuntimeHttpRequest {
+                    port: 4200,
+                    method: String::from("GET"),
+                    relative_path: String::from("/src/app.css"),
+                    search: String::new(),
+                    client_modules: Vec::new(),
+                },
+            },
+        ) {
+            Ok(HostRuntimeResponse::PreviewRequestReport(report)) => report,
+            other => panic!("unexpected stylesheet runtime preview response: {other:?}"),
+        };
+        assert_eq!(
+            stylesheet_runtime_report.transform_kind,
+            Some(crate::protocol::HostRuntimePreviewTransformKind::Stylesheet)
+        );
+        assert!(stylesheet_runtime_report.module_plan.is_none());
+        let stylesheet_runtime_response = stylesheet_runtime_report
+            .direct_response
+            .expect("runtime stylesheet preview should be returned directly");
+        assert_eq!(stylesheet_runtime_response.status, 200);
+        assert_eq!(
+            stylesheet_runtime_response
+                .headers
+                .get("content-type")
+                .map(String::as_str),
+            Some("text/css; charset=utf-8")
+        );
+        assert!(stylesheet_runtime_response
+            .text_body
+            .as_ref()
+            .is_some_and(|body| body.contains("bg.png")));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("GET"),
+                        relative_path: String::from("/__bootstrap.json"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.direct_response.as_ref().is_some_and(|response|
+                    response.status == 200
+                        && response
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|value| value == "application/json; charset=utf-8")
+                )
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("GET"),
+                        relative_path: String::from("/__workspace.json"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.direct_response.as_ref().is_some_and(|response|
+                    response.status == 200
+                        && response
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|value| value == "application/json; charset=utf-8")
+                        && response
+                            .text_body
+                            .as_ref()
+                            .is_some_and(|body| body.contains("\"workspaceRoot\":\"/workspace\""))
+                )
+        ));
+        assert!(matches!(
+            host.execute_runtime_command(
+                &runtime_context.context_id,
+                HostRuntimeCommand::PreviewRequest {
+                    request: HostRuntimeHttpRequest {
+                        port: 4200,
+                        method: String::from("GET"),
+                        relative_path: String::from("/assets/runtime.css"),
+                        search: String::new(),
+                        client_modules: Vec::new(),
+                    },
+                },
+            ),
+            Ok(HostRuntimeResponse::PreviewRequestReport(report))
+                if report.direct_response.as_ref().is_some_and(|response|
+                    response.status == 200
+                        && response
+                            .headers
+                            .get("content-type")
+                            .is_some_and(|value| value == "text/css; charset=utf-8")
+                        && response
+                            .text_body
+                            .as_ref()
+                            .is_some_and(|body| body.contains(".guest-shell"))
+                )
         ));
         assert!(matches!(
             host.execute_runtime_command(
@@ -1802,5 +2739,63 @@ export default laterAnswer;"#,
             ),
             Err(RuntimeHostError::EntrypointNotFound(path)) if path == "/workspace/missing"
         ));
+    }
+
+    #[test]
+    fn create_session_prefers_dev_over_start_for_suggested_run_request() {
+        let mut host = RuntimeHostCore::new(NullEngineAdapter::default());
+        let session = host
+            .create_session(
+                ArchiveStats {
+                    file_name: "suggested-run.zip".into(),
+                    file_count: 1,
+                    directory_count: 1,
+                    root_prefix: None,
+                },
+                Some("suggested-run-app".into()),
+                BTreeMap::from([
+                    (String::from("start"), String::from("node server.js")),
+                    (String::from("dev"), String::from("acme-dev")),
+                ]),
+                vec![
+                    VirtualFile::text(
+                        "/workspace/package.json",
+                        r#"{"name":"suggested-run-app","scripts":{"start":"node server.js","dev":"acme-dev"}}"#,
+                    ),
+                    VirtualFile::text("/workspace/server.js", "console.log('suggested run');"),
+                    VirtualFile::text("/workspace/node_modules/.bin/acme-dev", "acme-dev.js"),
+                    VirtualFile::text(
+                        "/workspace/node_modules/acme-dev/package.json",
+                        r#"{"name":"acme-dev","bin":{"acme-dev":"bin/acme-dev.js"}}"#,
+                    ),
+                    VirtualFile::text(
+                        "/workspace/node_modules/acme-dev/bin/acme-dev.js",
+                        "console.log('acme-dev');",
+                    ),
+                ],
+            )
+            .expect("session should be created");
+
+        let launched = host
+            .launch_runtime(
+                &session.session_id,
+                &RunRequest::new("/workspace", "npm", vec![String::from("run"), String::from("dev")]),
+                4,
+                None,
+            )
+            .expect("launch runtime should succeed");
+
+        let suggested = launched
+            .state
+            .session
+            .suggested_run_request
+            .as_ref()
+            .expect("suggested run request should be derived");
+        assert_eq!(suggested.cwd, "/workspace");
+        assert_eq!(suggested.command, "npm");
+        assert_eq!(
+            suggested.args,
+            vec![String::from("run"), String::from("dev")]
+        );
     }
 }

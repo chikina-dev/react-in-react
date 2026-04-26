@@ -129,16 +129,20 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
+    let browser_wasm = target_arch == "wasm32" && target_os == "unknown";
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("No OUT_DIR env var is set by cargo"));
 
-    if target_arch == "wasm32" && target_os == "unknown" {
-        panic!(
-            "quickjs-ng-sys does not yet support browser target wasm32-unknown-unknown: \
-             QuickJS-NG needs a browser-wasm specific libc/sysroot strategy instead of the \
-             WASI-only headers shipped by current bindings"
-        );
+    if browser_wasm {
+        fs::write(
+            out_dir.join("bindings_target.rs"),
+            r#"macro_rules! bindings_env {
+                ("TARGET") => { "wasm32-wasip1" };
+            }"#,
+        )
+        .expect("Unable to write browser bindings_target.rs");
+        return;
     }
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("No OUT_DIR env var is set by cargo"));
     let mut defines: Vec<(String, Option<&str>)> = vec![("_GNU_SOURCE".into(), None)];
 
     #[cfg(feature = "disable-assertions")]

@@ -7,21 +7,24 @@ import previewReactDomClientUrl from "../preview/shims/react-dom-client.js?url";
 import previewReactUrl from "../preview/shims/react.js?url";
 import previewStylesheetShimUrl from "../preview/shims/stylesheet.js?url";
 import type {
-  PreviewDiagnostics,
   PreviewHostFileSummary,
   PreviewHostSummary,
   PreviewModel,
-  PreviewReadyEvent,
   PreviewRunPlan,
-  PreviewWorkspaceFile,
   SessionId,
   SessionSnapshot,
   VirtualHttpRequest,
   VirtualHttpResponse,
 } from "./protocol";
 import type { WorkspaceFileRecord } from "./analyze-archive";
-import type { HostPreviewRequestHint, HostPreviewResponseDescriptor } from "./host-adapter";
-import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
+import type {
+  HostPreviewRequestHint,
+  HostPreviewResponseDescriptor,
+  HostRuntimeModuleFormat,
+  HostRuntimePreviewModulePlan,
+  HostRuntimePreviewRenderPlan,
+  HostRuntimePreviewTransformKind,
+} from "./host-adapter";
 
 type PreviewServerState = {
   sessionId: SessionId;
@@ -33,6 +36,9 @@ type PreviewServerState = {
   rootResponseDescriptor?: HostPreviewResponseDescriptor;
   requestHint?: HostPreviewRequestHint;
   responseDescriptor?: HostPreviewResponseDescriptor;
+  transformKind?: HostRuntimePreviewTransformKind;
+  renderPlan?: HostRuntimePreviewRenderPlan;
+  modulePlan?: HostRuntimePreviewModulePlan;
   host: PreviewHostSummary;
   run: PreviewRunPlan;
   hostFiles: PreviewHostFileSummary;
@@ -40,9 +46,18 @@ type PreviewServerState = {
   files: Map<string, WorkspaceFileRecord>;
 };
 
+const PREVIEW_AUXILIARY_ROUTE_KINDS = new Map<string, HostPreviewRequestHint["kind"]>([
+  ["/__runtime.json", "not-found"],
+  ["/__bootstrap.json", "not-found"],
+  ["/__workspace.json", "not-found"],
+  ["/__files.json", "not-found"],
+  ["/__diagnostics.json", "not-found"],
+  ["/assets/runtime.css", "runtime-stylesheet"],
+]);
+
 type PreviewResponseMetadata = Pick<
   HostPreviewResponseDescriptor,
-  "statusCode" | "contentType" | "allowMethods" | "omitBody"
+  "statusCode" | "contentType" | "allowMethods" | "omitBody" | "workspacePath"
 >;
 
 type PackageExportValue =
@@ -70,24 +85,6 @@ type PackageManifest = {
 
 type PackageTargetResolution = string | null | undefined;
 
-export const PREVIEW_DOCUMENT_CANDIDATES = [
-  "/workspace/index.html",
-  "/workspace/dist/index.html",
-  "/workspace/build/index.html",
-  "/workspace/public/index.html",
-] as const;
-
-export const PREVIEW_APP_ENTRY_CANDIDATES = [
-  "/workspace/src/main.tsx",
-  "/workspace/src/main.jsx",
-  "/workspace/src/main.ts",
-  "/workspace/src/main.js",
-  "/workspace/src/index.tsx",
-  "/workspace/src/index.jsx",
-  "/workspace/src/index.ts",
-  "/workspace/src/index.js",
-] as const;
-
 export function buildPreviewResponse(
   request: VirtualHttpRequest,
   preview: PreviewServerState | null,
@@ -101,24 +98,20 @@ export function buildPreviewResponse(
   }
 
   const relativePath = getPreviewRelativePath(request, preview);
+  if (preview.renderPlan) {
+    return buildPreviewResponseFromRenderPlan(request, preview, preview.renderPlan);
+  }
   if (preview.responseDescriptor) {
-    return buildPreviewResponseFromDescriptor(
-      request,
-      preview,
-      relativePath,
-      preview.responseDescriptor,
-    );
+    return buildPreviewResponseFromDescriptor(request, preview, preview.responseDescriptor);
   }
   if ((relativePath === "/" || relativePath === "/index.html") && preview.rootResponseDescriptor) {
-    return buildPreviewResponseFromDescriptor(
-      request,
-      preview,
-      relativePath,
-      preview.rootResponseDescriptor,
-    );
+    return buildPreviewResponseFromDescriptor(request, preview, preview.rootResponseDescriptor);
   }
   if (preview.requestHint) {
-    return buildPreviewResponseFromHint(request, preview, relativePath, preview.requestHint);
+    return buildPreviewResponseFromHint(request, preview, preview.requestHint);
+  }
+  if (hasBackendOwnedPreviewState(preview)) {
+    return unsupportedPreviewPathResponse(request.pathname);
   }
 
   return buildPreviewResponseFromFallback(request, preview, relativePath);
@@ -139,51 +132,14 @@ function jsonResponse(status: number, body: unknown): VirtualHttpResponse {
   };
 }
 
-function htmlResponse(status: number, body: string): VirtualHttpResponse {
-  return {
-    status,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store",
-    },
-    body,
-  };
-}
-
-function cssResponse(status: number, body: string): VirtualHttpResponse {
-  return {
-    status,
-    headers: {
-      "content-type": "text/css; charset=utf-8",
-      "cache-control": "no-store",
-    },
-    body,
-  };
-}
-
 function inferPreviewRequestKind(relativePath: string): HostPreviewRequestHint["kind"] {
   if (relativePath === "/" || relativePath === "/index.html") {
     return "fallback-root";
   }
 
-  if (relativePath === "/__runtime.json") {
-    return "runtime-state";
-  }
-
-  if (relativePath === "/__workspace.json") {
-    return "workspace-state";
-  }
-
-  if (relativePath === "/__files.json") {
-    return "file-index";
-  }
-
-  if (relativePath === "/__diagnostics.json") {
-    return "diagnostics-state";
-  }
-
-  if (relativePath === "/assets/runtime.css") {
-    return "runtime-stylesheet";
+  const auxiliaryRouteKind = PREVIEW_AUXILIARY_ROUTE_KINDS.get(relativePath);
+  if (auxiliaryRouteKind) {
+    return auxiliaryRouteKind;
   }
 
   if (relativePath.startsWith("/files/")) {
@@ -196,62 +152,32 @@ function inferPreviewRequestKind(relativePath: string): HostPreviewRequestHint["
 function buildPreviewResponseFromHint(
   request: VirtualHttpRequest,
   preview: PreviewServerState,
-  relativePath: string,
   requestHint: HostPreviewRequestHint,
 ): VirtualHttpResponse {
   switch (requestHint.kind) {
-    case "root-document": {
-      const response = buildHintedWorkspaceFileResponse(
+    case "root-document":
+      return unsupportedPreviewPathResponse(request.pathname);
+    case "workspace-file":
+    case "workspace-asset": {
+      const response = buildHintedWorkspaceModuleResponse(
         preview,
         requestHint.workspacePath,
         requestHint.documentRoot,
       );
-      return response ?? buildPreviewRootResponse(preview, request);
+      if (!response && preview.responseDescriptor?.omitBody) {
+        return emptyPreviewResponse();
+      }
+      return response ?? unsupportedPreviewPathResponse(request.pathname);
     }
     case "root-entry":
-      return htmlResponse(
-        200,
-        renderPreviewAppShell({
-          title: preview.model.title,
-          entryUrl: buildPreviewUrlForWorkspaceFile(
-            requestHint.workspacePath,
-            preview,
-            "/workspace",
-          ),
-        }),
-      );
     case "fallback-root":
-      return buildPreviewRootResponse(preview, request);
+    case "bootstrap-state":
     case "runtime-state":
-      return previewReadyResponse(preview);
     case "workspace-state":
-      return jsonResponse(200, preview.session);
     case "file-index":
-      return jsonResponse(200, buildPreviewFileIndex(preview));
     case "diagnostics-state":
-      return jsonResponse(200, buildPreviewDiagnostics(preview));
     case "runtime-stylesheet":
-      return cssResponse(200, renderRuntimeStylesheet());
-    case "workspace-file": {
-      const response = buildHintedWorkspaceFileResponse(
-        preview,
-        requestHint.workspacePath,
-        requestHint.documentRoot,
-      );
-      return response ?? buildPreviewFileResponse(relativePath, preview);
-    }
-    case "workspace-asset": {
-      const response = buildHintedWorkspaceFileResponse(
-        preview,
-        requestHint.workspacePath,
-        requestHint.documentRoot,
-      );
-      return (
-        response ??
-        buildWorkspaceAssetResponse(relativePath, preview) ??
-        unsupportedPreviewPathResponse(request.pathname)
-      );
-    }
+      return unsupportedPreviewPathResponse(request.pathname);
     case "not-found":
       return unsupportedPreviewPathResponse(request.pathname);
   }
@@ -260,63 +186,34 @@ function buildPreviewResponseFromHint(
 function buildPreviewResponseFromDescriptor(
   request: VirtualHttpRequest,
   preview: PreviewServerState,
-  relativePath: string,
   descriptor: HostPreviewResponseDescriptor,
 ): VirtualHttpResponse {
   const response = (() => {
     switch (descriptor.kind) {
-      case "workspace-document": {
-        const hintedResponse = buildHintedWorkspaceFileResponse(
+      case "workspace-document":
+        return unsupportedPreviewPathResponse(request.pathname);
+      case "workspace-file":
+      case "workspace-asset": {
+        const hintedResponse = buildHintedWorkspaceModuleResponse(
           preview,
           descriptor.workspacePath,
           descriptor.documentRoot,
         );
-        return hintedResponse ?? buildPreviewRootResponse(preview, request);
+        if (!hintedResponse && descriptor.omitBody) {
+          return emptyPreviewResponse();
+        }
+        return hintedResponse ?? unsupportedPreviewPathResponse(request.pathname);
       }
       case "app-shell":
-        return htmlResponse(
-          200,
-          renderPreviewAppShell({
-            title: preview.model.title,
-            entryUrl: buildPreviewUrlForWorkspaceFile(
-              descriptor.workspacePath,
-              preview,
-              "/workspace",
-            ),
-          }),
-        );
+        return unsupportedPreviewPathResponse(request.pathname);
       case "host-managed-fallback":
-        return buildPreviewRootResponse(preview, request);
+      case "bootstrap-state":
       case "runtime-state":
-        return previewReadyResponse(preview);
       case "workspace-state":
-        return jsonResponse(200, preview.session);
       case "file-index":
-        return jsonResponse(200, buildPreviewFileIndex(preview));
       case "diagnostics-state":
-        return jsonResponse(200, buildPreviewDiagnostics(preview));
       case "runtime-stylesheet":
-        return cssResponse(200, renderRuntimeStylesheet());
-      case "workspace-file": {
-        const hintedResponse = buildHintedWorkspaceFileResponse(
-          preview,
-          descriptor.workspacePath,
-          descriptor.documentRoot,
-        );
-        return hintedResponse ?? buildPreviewFileResponse(relativePath, preview);
-      }
-      case "workspace-asset": {
-        const hintedResponse = buildHintedWorkspaceFileResponse(
-          preview,
-          descriptor.workspacePath,
-          descriptor.documentRoot,
-        );
-        return (
-          hintedResponse ??
-          buildWorkspaceAssetResponse(relativePath, preview) ??
-          unsupportedPreviewPathResponse(request.pathname)
-        );
-      }
+        return unsupportedPreviewPathResponse(request.pathname);
       case "method-not-allowed":
         return jsonResponse(405, {
           error: "Method not allowed",
@@ -329,7 +226,39 @@ function buildPreviewResponseFromDescriptor(
     }
   })();
 
-  return applyDescriptorMetadata(response, descriptor);
+  return response.status === 404
+    ? response
+    : applyDescriptorMetadata(response, descriptor, preview);
+}
+
+function buildPreviewResponseFromRenderPlan(
+  request: VirtualHttpRequest,
+  preview: PreviewServerState,
+  renderPlan: HostRuntimePreviewRenderPlan,
+): VirtualHttpResponse {
+  switch (renderPlan.kind) {
+    case "workspace-file": {
+      if (!renderPlan.workspacePath || !renderPlan.documentRoot) {
+        return unsupportedPreviewPathResponse(request.pathname);
+      }
+      const hintedResponse = buildHintedWorkspaceModuleResponse(
+        preview,
+        renderPlan.workspacePath,
+        renderPlan.documentRoot,
+      );
+      if (!hintedResponse && preview.responseDescriptor?.omitBody) {
+        return applyDescriptorMetadata(emptyPreviewResponse(), preview.responseDescriptor, preview);
+      }
+      const response = hintedResponse ?? unsupportedPreviewPathResponse(request.pathname);
+      return preview.responseDescriptor && response.status !== 404
+        ? applyDescriptorMetadata(response, preview.responseDescriptor, preview)
+        : response;
+    }
+    case "app-shell":
+      return unsupportedPreviewPathResponse(request.pathname);
+    case "host-managed-fallback":
+      return unsupportedPreviewPathResponse(request.pathname);
+  }
 }
 
 function buildPreviewResponseFromFallback(
@@ -338,33 +267,28 @@ function buildPreviewResponseFromFallback(
   relativePath: string,
 ): VirtualHttpResponse {
   switch (inferPreviewRequestKind(relativePath)) {
-    case "fallback-root":
-      return buildPreviewRootResponse(preview, request);
-    case "runtime-state":
-      return previewReadyResponse(preview);
-    case "workspace-state":
-      return jsonResponse(200, preview.session);
-    case "file-index":
-      return jsonResponse(200, buildPreviewFileIndex(preview));
-    case "diagnostics-state":
-      return jsonResponse(200, buildPreviewDiagnostics(preview));
-    case "runtime-stylesheet":
-      return cssResponse(200, renderRuntimeStylesheet());
     case "workspace-file":
-      return buildPreviewFileResponse(relativePath, preview);
+      return buildPreviewModuleFileResponse(relativePath, preview);
     case "workspace-asset": {
-      const response = buildWorkspaceAssetResponse(relativePath, preview);
+      const response = buildPreviewModuleAssetResponse(relativePath, preview);
       return response ?? unsupportedPreviewPathResponse(request.pathname);
     }
+    case "fallback-root":
+    case "bootstrap-state":
+    case "runtime-state":
+    case "workspace-state":
+    case "file-index":
+    case "diagnostics-state":
+    case "runtime-stylesheet":
     case "root-document":
     case "root-entry":
-      return buildPreviewRootResponse(preview, request);
+      return unsupportedPreviewPathResponse(request.pathname);
     case "not-found":
       return unsupportedPreviewPathResponse(request.pathname);
   }
 }
 
-function buildHintedWorkspaceFileResponse(
+function buildHintedWorkspaceModuleResponse(
   preview: PreviewServerState,
   workspacePath: string,
   documentRoot: string,
@@ -374,16 +298,24 @@ function buildHintedWorkspaceFileResponse(
     return null;
   }
 
-  return buildWorkspaceFileResponse(file, preview, documentRoot);
+  return buildWorkspaceModuleResponse(file, preview, documentRoot);
 }
 
 function applyDescriptorMetadata(
   response: VirtualHttpResponse,
   descriptor: PreviewResponseMetadata,
+  preview: PreviewServerState,
 ): VirtualHttpResponse {
   const headers = { ...response.headers };
-  if (descriptor.contentType) {
-    headers["content-type"] = descriptor.contentType;
+  const contentType =
+    preview.transformKind === "module" &&
+    descriptor.workspacePath !== null &&
+    descriptor.workspacePath ===
+      (preview.responseDescriptor?.workspacePath ?? preview.requestHint?.workspacePath ?? null)
+      ? "text/javascript; charset=utf-8"
+      : descriptor.contentType;
+  if (contentType) {
+    headers["content-type"] = contentType;
   }
   if (descriptor.allowMethods.length > 0) {
     headers.allow = descriptor.allowMethods.join(", ");
@@ -397,20 +329,6 @@ function applyDescriptorMetadata(
   };
 }
 
-function previewReadyResponse(preview: PreviewServerState): VirtualHttpResponse {
-  return jsonResponse(200, {
-    type: "preview.ready",
-    sessionId: preview.sessionId,
-    pid: preview.pid,
-    port: preview.port,
-    url: preview.url,
-    model: preview.model,
-    host: preview.host,
-    run: preview.run,
-    hostFiles: preview.hostFiles,
-  } satisfies PreviewReadyEvent);
-}
-
 function unsupportedPreviewPathResponse(pathname: string): VirtualHttpResponse {
   return jsonResponse(404, {
     error: "Unsupported preview path",
@@ -418,297 +336,27 @@ function unsupportedPreviewPathResponse(pathname: string): VirtualHttpResponse {
   });
 }
 
-function buildPreviewRootResponse(
-  preview: PreviewServerState,
-  request: VirtualHttpRequest,
-): VirtualHttpResponse {
-  const workspaceDocument = resolvePreviewDocument(preview);
-
-  if (workspaceDocument) {
-    return buildWorkspaceFileResponse(workspaceDocument.file, preview, workspaceDocument.root);
-  }
-
-  const workspaceEntry = resolvePreviewAppEntry(preview);
-
-  if (workspaceEntry) {
-    return htmlResponse(
-      200,
-      renderPreviewAppShell({
-        title: preview.model.title,
-        entryUrl: buildPreviewUrlForWorkspaceFile(workspaceEntry.path, preview, "/workspace"),
-      }),
-    );
-  }
-
-  const clientScriptUrl = request.headers[PREVIEW_CLIENT_HEADER];
-
-  if (!clientScriptUrl) {
-    return htmlResponse(503, renderPreviewError("Preview client script is not configured."));
-  }
-
-  return htmlResponse(
-    200,
-    renderPreviewHtml({
-      preview,
-      clientScriptUrl,
-      stateUrl: `${preview.url}__runtime.json`,
-      workspaceUrl: `${preview.url}__workspace.json`,
-      filesUrl: `${preview.url}__files.json`,
-      diagnosticsUrl: `${preview.url}__diagnostics.json`,
-      stylesheetUrl: `${preview.url}assets/runtime.css`,
-    }),
-  );
-}
-
-function renderPreviewHtml(input: {
-  preview: PreviewServerState;
-  clientScriptUrl: string;
-  stateUrl: string;
-  workspaceUrl: string;
-  filesUrl: string;
-  diagnosticsUrl: string;
-  stylesheetUrl: string;
-}): string {
-  return `<!doctype html>
-  <html lang="ja">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>${escapeHtml(input.preview.model.title)}</title>
-      <link rel="stylesheet" href="${input.stylesheetUrl}" />
-      <style>
-        :root {
-          color-scheme: dark;
-          font-family: "Iowan Old Style", "Palatino Linotype", serif;
-          background:
-            radial-gradient(circle at top, rgba(245, 158, 11, 0.18), transparent 35%),
-            linear-gradient(160deg, #08111f 0%, #101b2f 50%, #1c2940 100%);
-          color: #f5f7fb;
-        }
-
-        * {
-          box-sizing: border-box;
-        }
-
-        html,
-        body,
-        #guest-root {
-          min-height: 100%;
-        }
-
-        body {
-          margin: 0;
-        }
-      </style>
-    </head>
-    <body>
-      <div id="guest-root"></div>
-      <script>
-        window.__NODE_IN_NODE_PREVIEW__ = {
-          sessionId: ${JSON.stringify(input.preview.sessionId)},
-          port: ${JSON.stringify(input.preview.port)},
-          stateUrl: ${JSON.stringify(input.stateUrl)},
-          workspaceUrl: ${JSON.stringify(input.workspaceUrl)},
-          filesUrl: ${JSON.stringify(input.filesUrl)},
-          diagnosticsUrl: ${JSON.stringify(input.diagnosticsUrl)}
-        };
-      </script>
-      <script type="module" src="${input.clientScriptUrl}"></script>
-    </body>
-  </html>`;
-}
-
-function renderPreviewAppShell(input: { title: string; entryUrl: string }): string {
-  return `<!doctype html>
-  <html lang="ja">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>${escapeHtml(input.title)}</title>
-      <style>
-        :root {
-          color-scheme: dark;
-          background:
-            radial-gradient(circle at top, rgba(16, 185, 129, 0.12), transparent 35%),
-            linear-gradient(180deg, #071018 0%, #0b1522 100%);
-        }
-
-        * {
-          box-sizing: border-box;
-        }
-
-        html,
-        body {
-          min-height: 100%;
-        }
-
-        body {
-          margin: 0;
-        }
-
-        #root,
-        #app {
-          min-height: 100vh;
-        }
-      </style>
-    </head>
-    <body>
-      <div id="root"></div>
-      <div id="app"></div>
-      <script type="module" src="${input.entryUrl}"></script>
-    </body>
-  </html>`;
-}
-
-function renderPreviewError(message: string): string {
-  return `<!doctype html>
-  <html lang="en">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Preview unavailable</title>
-      <style>
-        body {
-          margin: 0;
-          min-height: 100vh;
-          display: grid;
-          place-items: center;
-          background: #0f172a;
-          color: #e2e8f0;
-          font-family: system-ui, sans-serif;
-        }
-
-        article {
-          width: min(560px, calc(100% - 32px));
-          padding: 24px;
-          border-radius: 24px;
-          background: rgba(15, 23, 42, 0.78);
-          border: 1px solid rgba(148, 163, 184, 0.2);
-        }
-      </style>
-    </head>
-    <body>
-      <article>
-        <h1>Preview unavailable</h1>
-        <p>${escapeHtml(message)}</p>
-      </article>
-    </body>
-  </html>`;
-}
-
-function renderRuntimeStylesheet(): string {
-  return `
-    .guest-shell {
-      position: relative;
-    }
-
-    .guest-shell::after {
-      content: "";
-      position: absolute;
-      inset: auto 0 -40px auto;
-      width: 220px;
-      height: 220px;
-      border-radius: 999px;
-      background: radial-gradient(circle, rgba(249, 115, 22, 0.28), transparent 70%);
-      filter: blur(10px);
-      pointer-events: none;
-    }
-
-    .guest-columns {
-      display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 18px;
-      align-items: start;
-    }
-
-    .guest-card {
-      padding: 18px;
-      border-radius: 18px;
-      background: rgba(6, 12, 22, 0.56);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-    }
-
-    .guest-card h4 {
-      margin: 0 0 12px;
-      font-size: 0.95rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: rgba(245, 247, 251, 0.7);
-    }
-
-    .guest-list {
-      list-style: none;
-      margin: 0;
-      padding: 0;
-      display: grid;
-      gap: 10px;
-    }
-
-    .guest-list li {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      font-family: "SFMono-Regular", "SF Mono", monospace;
-      font-size: 0.85rem;
-      color: rgba(245, 247, 251, 0.9);
-    }
-
-    .guest-list span {
-      color: rgba(245, 247, 251, 0.55);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      font-size: 0.7rem;
-    }
-
-    @media (max-width: 760px) {
-      .guest-columns {
-        grid-template-columns: 1fr;
-      }
-    }
-  `;
-}
-
-function buildPreviewFileIndex(preview: PreviewServerState): PreviewWorkspaceFile[] {
-  const documentRoot = resolvePreviewDocumentRoot(preview);
-
-  return [...preview.files.values()]
-    .filter((file) => file.isText)
-    .sort((left, right) => left.path.localeCompare(right.path))
-    .map((file) => ({
-      path: file.path,
-      size: file.size,
-      contentType: file.contentType,
-      isText: file.isText,
-      url: `${preview.url}files${file.path.replace("/workspace", "")}`,
-      previewUrl: buildPreviewUrlForWorkspaceFile(file.path, preview, documentRoot),
-    }));
-}
-
-function buildPreviewDiagnostics(preview: PreviewServerState): PreviewDiagnostics {
-  const hydratedPaths = [...preview.files.values()]
-    .filter((file) => file.textContent !== null || file.bytes.length > 0 || file.size === 0)
-    .map((file) => file.path)
-    .sort((left, right) => left.localeCompare(right));
-
+function emptyPreviewResponse(): VirtualHttpResponse {
   return {
-    sessionId: preview.sessionId,
-    pid: preview.pid,
-    port: preview.port,
-    url: preview.url,
-    model: preview.model,
-    session: preview.session,
-    rootRequestHint: preview.rootRequestHint ?? null,
-    requestHint: preview.requestHint ?? null,
-    fileCount: preview.files.size,
-    hydratedFileCount: hydratedPaths.length,
-    hydratedPaths,
-    host: preview.host,
-    run: preview.run,
-    hostFiles: preview.hostFiles,
+    status: 200,
+    headers: {
+      "cache-control": "no-store",
+    },
+    body: "",
   };
 }
 
-function buildPreviewFileResponse(
+function hasBackendOwnedPreviewState(preview: PreviewServerState): boolean {
+  return Boolean(
+    preview.rootRequestHint ??
+    preview.rootResponseDescriptor ??
+    preview.requestHint ??
+    preview.responseDescriptor ??
+    preview.renderPlan,
+  );
+}
+
+function buildPreviewModuleFileResponse(
   relativePath: string,
   preview: PreviewServerState,
 ): VirtualHttpResponse {
@@ -722,10 +370,10 @@ function buildPreviewFileResponse(
     });
   }
 
-  return buildWorkspaceFileResponse(file, preview, "/workspace");
+  return buildWorkspaceModuleResponse(file, preview, resolvePreviewDocumentRoot(preview));
 }
 
-function buildWorkspaceAssetResponse(
+function buildPreviewModuleAssetResponse(
   relativePath: string,
   preview: PreviewServerState,
 ): VirtualHttpResponse | null {
@@ -742,7 +390,7 @@ function buildWorkspaceAssetResponse(
     const hintedFile = preview.files.get(preview.requestHint.workspacePath);
 
     if (hintedFile) {
-      return buildWorkspaceFileResponse(hintedFile, preview, documentRoot);
+      return buildWorkspaceModuleResponse(hintedFile, preview, documentRoot);
     }
   }
 
@@ -755,68 +403,33 @@ function buildWorkspaceAssetResponse(
       continue;
     }
 
-    return buildWorkspaceFileResponse(file, preview, documentRoot);
+    return buildWorkspaceModuleResponse(file, preview, documentRoot);
   }
 
   return null;
 }
 
-function buildWorkspaceFileResponse(
+function buildWorkspaceModuleResponse(
   file: WorkspaceFileRecord,
   preview: PreviewServerState,
   documentRoot: string,
 ): VirtualHttpResponse {
-  if (shouldTransformWorkspaceModule(file)) {
-    return {
-      status: 200,
-      headers: {
-        "content-type": "text/javascript; charset=utf-8",
-        "cache-control": "no-store",
-      },
-      body: transformWorkspaceModule(file.textContent ?? "", file.path, preview),
-    };
-  }
+  const transformKind = resolvePreviewTransformKind(file, preview);
 
-  if (!file.isText || file.textContent === null) {
-    return binaryResponse(file.contentType, file.bytes);
+  if (transformKind !== "module" || file.textContent === null) {
+    return unsupportedPreviewPathResponse(
+      buildPreviewUrlForWorkspaceFile(file.path, preview, documentRoot),
+    );
   }
 
   return {
     status: 200,
     headers: {
-      "content-type": file.contentType,
+      "content-type": "text/javascript; charset=utf-8",
       "cache-control": "no-store",
     },
-    body: rewriteWorkspaceTextContent(file, preview, documentRoot),
+    body: transformWorkspaceModule(file.textContent, file.path, preview),
   };
-}
-
-function binaryResponse(contentType: string, body: Uint8Array): VirtualHttpResponse {
-  return {
-    status: 200,
-    headers: {
-      "content-type": contentType,
-      "cache-control": "no-store",
-    },
-    body,
-  };
-}
-
-function shouldTransformWorkspaceModule(file: WorkspaceFileRecord): boolean {
-  if (!file.isText || file.textContent === null) {
-    return false;
-  }
-
-  return (
-    file.path.endsWith(".js") ||
-    file.path.endsWith(".mjs") ||
-    file.path.endsWith(".cjs") ||
-    file.path.endsWith(".ts") ||
-    file.path.endsWith(".tsx") ||
-    file.path.endsWith(".jsx") ||
-    file.path.endsWith(".mts") ||
-    file.path.endsWith(".cts")
-  );
 }
 
 function transformWorkspaceModule(
@@ -824,10 +437,21 @@ function transformWorkspaceModule(
   filePath: string,
   preview: PreviewServerState,
 ): string {
-  if (looksLikeCommonJsModule(filePath, source)) {
+  const moduleFormat = resolvePreviewModuleFormat(filePath, source, preview.modulePlan);
+
+  if (moduleFormat === "json") {
+    return `export default ${source.trim()};\n`;
+  }
+
+  if (moduleFormat === "commonjs") {
     const transformed = transformCommonJsModule(source);
     const withStylesheetImports = rewriteStylesheetImports(transformed, filePath, preview);
-    return rewriteModuleSpecifiers(withStylesheetImports, filePath, preview);
+    const withStaticAssetImports = rewriteStaticAssetImports(
+      withStylesheetImports,
+      filePath,
+      preview,
+    );
+    return rewriteModuleSpecifiers(withStaticAssetImports, filePath, preview);
   }
 
   const transpiled = ts.transpileModule(source, {
@@ -844,7 +468,12 @@ function transformWorkspaceModule(
   }).outputText;
 
   const withStylesheetImports = rewriteStylesheetImports(transpiled, filePath, preview);
-  return rewriteModuleSpecifiers(withStylesheetImports, filePath, preview);
+  const withStaticAssetImports = rewriteStaticAssetImports(
+    withStylesheetImports,
+    filePath,
+    preview,
+  );
+  return rewriteModuleSpecifiers(withStaticAssetImports, filePath, preview);
 }
 
 function looksLikeCommonJsModule(filePath: string, source: string): boolean {
@@ -957,27 +586,51 @@ function rewriteCommonJsExportReferences(
   return rewritten;
 }
 
-function rewriteWorkspaceTextContent(
+function resolvePreviewTransformKind(
   file: WorkspaceFileRecord,
   preview: PreviewServerState,
-  documentRoot: string,
-): string {
+): HostRuntimePreviewTransformKind {
+  const plannedTransformKind = preview.transformKind;
+  const plannedWorkspacePath =
+    preview.responseDescriptor?.workspacePath ?? preview.requestHint?.workspacePath ?? null;
+
+  if (plannedTransformKind && plannedWorkspacePath === file.path) {
+    return plannedTransformKind;
+  }
+
+  if (preview.modulePlan && preview.modulePlan.importerPath === file.path) {
+    return "module";
+  }
+
+  if (!file.isText || file.textContent === null) {
+    return "binary";
+  }
+
+  if (
+    file.path.endsWith(".js") ||
+    file.path.endsWith(".mjs") ||
+    file.path.endsWith(".cjs") ||
+    file.path.endsWith(".ts") ||
+    file.path.endsWith(".tsx") ||
+    file.path.endsWith(".jsx") ||
+    file.path.endsWith(".mts") ||
+    file.path.endsWith(".cts") ||
+    file.path.endsWith(".json")
+  ) {
+    return "module";
+  }
+
   if (file.contentType.startsWith("text/html")) {
-    return rewriteHtmlDocument(file.textContent ?? "", preview.url);
+    return "html-document";
   }
-
   if (file.contentType.startsWith("text/css")) {
-    return rewriteStylesheet(file.textContent ?? "", preview.url);
+    return "stylesheet";
   }
-
   if (file.contentType.startsWith("image/svg+xml")) {
-    return rewriteSvgDocument(
-      file.textContent ?? "",
-      buildPreviewUrlForWorkspaceFile(file.path, preview, documentRoot),
-    );
+    return "svg-document";
   }
 
-  return file.textContent ?? "";
+  return "plain-text";
 }
 
 function rewriteModuleSpecifiers(
@@ -1030,6 +683,24 @@ function rewriteStylesheetImports(
   return `import { attachStylesheet as __nodeInNodeAttachStylesheet } from ${JSON.stringify(previewStylesheetShimUrl)};\n${rewritten}`;
 }
 
+function rewriteStaticAssetImports(
+  source: string,
+  importerPath: string,
+  preview: PreviewServerState,
+): string {
+  return source.replace(
+    /^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];?\s*$/gm,
+    (statement: string, localName: string, specifier: string) => {
+      const assetSpecifier = resolvePreviewAssetSpecifier(specifier, importerPath, preview);
+      if (!assetSpecifier) {
+        return statement;
+      }
+
+      return `const ${localName} = ${JSON.stringify(assetSpecifier)};`;
+    },
+  );
+}
+
 function resolvePreviewModuleSpecifier(
   specifier: string,
   importerPath: string,
@@ -1042,6 +713,19 @@ function resolvePreviewModuleSpecifier(
   }
 
   if (isExternalModuleSpecifier(specifier)) {
+    return specifier;
+  }
+
+  const plannedSpecifier = resolvePreviewModuleSpecifierFromPlan(specifier, importerPath, preview);
+
+  if (plannedSpecifier) {
+    return plannedSpecifier;
+  }
+
+  if (
+    (preview.modulePlan && preview.modulePlan.importerPath === importerPath) ||
+    hasBackendOwnedPreviewState(preview)
+  ) {
     return specifier;
   }
 
@@ -1060,6 +744,75 @@ function resolvePreviewModuleSpecifier(
     preview,
     resolvePreviewDocumentRoot(preview),
   );
+}
+
+function resolvePreviewAssetSpecifier(
+  specifier: string,
+  importerPath: string,
+  preview: PreviewServerState,
+): string | null {
+  if (isExternalModuleSpecifier(specifier)) {
+    return specifier;
+  }
+
+  const resolvedPath = resolveWorkspaceModuleSpecifier(specifier, importerPath, preview);
+  if (!resolvedPath) {
+    return null;
+  }
+
+  if (isDirectPreviewModuleUrl(resolvedPath)) {
+    return resolvedPath;
+  }
+
+  const file = preview.files.get(resolvedPath);
+  if (!file) {
+    return null;
+  }
+
+  if (resolvePreviewTransformKind(file, preview) === "module") {
+    return null;
+  }
+
+  return buildPreviewUrlForWorkspaceFile(
+    resolvedPath,
+    preview,
+    resolvePreviewDocumentRoot(preview),
+  );
+}
+
+function resolvePreviewModuleSpecifierFromPlan(
+  specifier: string,
+  importerPath: string,
+  preview: PreviewServerState,
+): string | null {
+  const modulePlan = preview.modulePlan;
+  if (!modulePlan || modulePlan.importerPath !== importerPath) {
+    return null;
+  }
+
+  const importPlan = modulePlan.importPlans.find((plan) => plan.requestSpecifier === specifier);
+  if (!importPlan) {
+    return null;
+  }
+
+  const resolvedSpecifier = importPlan.previewSpecifier;
+  if (isDirectPreviewModuleUrl(resolvedSpecifier)) {
+    return resolvedSpecifier;
+  }
+
+  return resolvedSpecifier;
+}
+
+function resolvePreviewModuleFormat(
+  filePath: string,
+  source: string,
+  modulePlan?: HostRuntimePreviewModulePlan,
+): HostRuntimeModuleFormat {
+  if (modulePlan && modulePlan.importerPath === filePath) {
+    return modulePlan.format;
+  }
+
+  return looksLikeCommonJsModule(filePath, source) ? "commonjs" : "module";
 }
 
 function resolvePreviewShimSpecifier(specifier: string): string | null {
@@ -1749,61 +1502,15 @@ function normalizePosixPath(path: string): string {
   return `${isAbsolute ? "/" : ""}${normalized.join("/")}`;
 }
 
-function resolvePreviewDocument(preview: PreviewServerState): {
-  file: WorkspaceFileRecord;
-  root: string;
-} | null {
-  if (preview.rootRequestHint?.kind === "root-document") {
-    const file = preview.files.get(preview.rootRequestHint.workspacePath);
-
-    if (file && file.isText && file.contentType.startsWith("text/html")) {
-      return {
-        file,
-        root: preview.rootRequestHint.documentRoot,
-      };
-    }
-  }
-
-  for (const candidate of PREVIEW_DOCUMENT_CANDIDATES) {
-    const file = preview.files.get(candidate);
-
-    if (file && file.isText && file.contentType.startsWith("text/html")) {
-      return {
-        file,
-        root: dirname(candidate),
-      };
-    }
-  }
-
-  return null;
-}
-
-function resolvePreviewAppEntry(preview: PreviewServerState): WorkspaceFileRecord | null {
-  if (preview.rootRequestHint?.kind === "root-entry") {
-    const file = preview.files.get(preview.rootRequestHint.workspacePath);
-
-    if (file && shouldTransformWorkspaceModule(file)) {
-      return file;
-    }
-  }
-
-  for (const candidate of PREVIEW_APP_ENTRY_CANDIDATES) {
-    const file = preview.files.get(candidate);
-
-    if (file && shouldTransformWorkspaceModule(file)) {
-      return file;
-    }
-  }
-
-  return null;
-}
-
 function resolvePreviewDocumentRoot(preview: PreviewServerState): string {
-  if (preview.rootRequestHint?.kind === "root-document") {
-    return preview.rootRequestHint.documentRoot;
-  }
-
-  return resolvePreviewDocument(preview)?.root ?? "/workspace";
+  return (
+    preview.renderPlan?.documentRoot ??
+    preview.responseDescriptor?.documentRoot ??
+    preview.requestHint?.documentRoot ??
+    preview.rootResponseDescriptor?.documentRoot ??
+    preview.rootRequestHint?.documentRoot ??
+    "/workspace"
+  );
 }
 
 function resolveWorkspaceAssetCandidates(relativePath: string, documentRoot: string): string[] {
@@ -1855,28 +1562,6 @@ function decodeWorkspacePath(relativePath: string): string {
   return `/workspace${suffix}`;
 }
 
-function rewriteHtmlDocument(source: string, previewUrl: string): string {
-  return source.replace(
-    /\b(src|href|action|poster)=("|')\/(?!\/)/g,
-    (_match, attribute: string, quote: string) => `${attribute}=${quote}${previewUrl}`,
-  );
-}
-
-function rewriteStylesheet(source: string, previewUrl: string): string {
-  return source.replace(/url\((["']?)\/(?!\/)/g, (_match, quote: string) => {
-    return `url(${quote}${previewUrl}`;
-  });
-}
-
-function rewriteSvgDocument(source: string, previewUrl: string): string {
-  return source.replace(
-    /\b(href|xlink:href)=("|')\/(?!\/)/g,
-    (_match, attribute: string, quote: string) => {
-      return `${attribute}=${quote}${previewUrl}`;
-    },
-  );
-}
-
 function escapeRegExp(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1890,13 +1575,4 @@ function dirname(path: string): string {
   }
 
   return normalized.slice(0, index);
-}
-
-function escapeHtml(input: string): string {
-  return input
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }

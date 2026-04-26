@@ -37,9 +37,9 @@ export type SessionSnapshot = {
   workspaceRoot: string;
   archive: ArchiveSummary;
   packageJson: PackageJsonSummary | null;
+  suggestedRunRequest?: RunRequest | null;
   capabilities: {
     detectedReact: boolean;
-    detectedVite: boolean;
   };
 };
 
@@ -80,6 +80,10 @@ export type PreviewWorkspaceFile = {
   isText: boolean;
   url: string;
   previewUrl: string;
+};
+
+export type PreviewSelectedFile = PreviewWorkspaceFile & {
+  content: string;
 };
 
 export type VirtualHttpRequest = {
@@ -132,12 +136,38 @@ export type PreviewDiagnostics = {
   hostFiles: PreviewHostFileSummary;
 };
 
+export type PreviewBootstrapPayload = {
+  preview: PreviewReadyEvent;
+  workspace: SessionSnapshot;
+  files: PreviewWorkspaceFile[];
+  selectedFile: PreviewSelectedFile | null;
+  diagnostics: PreviewDiagnostics;
+};
+
 export type UiToWorkerMessage =
+  | {
+      type: "worker.ping";
+      requestId: string;
+    }
   | {
       type: "session.create";
       requestId: string;
+      sessionId?: SessionId;
       fileName: string;
       zip: ArrayBuffer;
+    }
+  | {
+      type: "session.mount";
+      requestId: string;
+      session: SessionSnapshot;
+      files: Array<{
+        path: string;
+        size: number;
+        contentType: string;
+        isText: boolean;
+        bytes: Uint8Array;
+        textContent: string | null;
+      }>;
     }
   | {
       type: "session.run";
@@ -189,6 +219,27 @@ export type ProcessExitEvent = {
   code: number;
 };
 
+export type RuntimeProgressStage =
+  | "session-create"
+  | "session-mount"
+  | "host-register"
+  | "runtime-launch"
+  | "run-plan"
+  | "runtime-context"
+  | "engine-context"
+  | "preview-attach"
+  | "session-stop";
+
+export type RuntimeProgressValue = string | number | boolean | null;
+
+export type RuntimeProgressEvent = {
+  type: "runtime.progress";
+  sessionId: SessionId;
+  stage: RuntimeProgressStage;
+  message: string;
+  values?: Record<string, RuntimeProgressValue>;
+};
+
 export type PreviewReadyEvent = {
   type: "preview.ready";
   sessionId: SessionId;
@@ -224,6 +275,7 @@ export type WorkerToUiMessage =
   | PreviewHttpResponseMessage
   | SessionCreatedEvent
   | SessionStateEvent
+  | RuntimeProgressEvent
   | ProcessStdoutEvent
   | ProcessStderrEvent
   | ProcessExitEvent

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveStats {
     pub file_name: String,
@@ -32,7 +34,6 @@ pub struct PackageJsonSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityMatrix {
     pub detected_react: bool,
-    pub detected_vite: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,11 +278,7 @@ pub struct HostRuntimeStartupReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimePreviewLaunchReport {
     pub startup: HostRuntimeStartupReport,
-    pub server: Option<HostRuntimeHttpServer>,
-    pub port: Option<HostRuntimePort>,
-    pub root_request: Option<HostRuntimeHttpRequest>,
-    pub root_request_hint: Option<PreviewRequestHint>,
-    pub root_response_descriptor: Option<PreviewResponseDescriptor>,
+    pub root_report: Option<Box<HostRuntimePreviewRequestReport>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +298,7 @@ pub struct HostSessionStateReport {
     pub archive: ArchiveStats,
     pub archive_entries: Vec<ArchiveEntrySummary>,
     pub package_json: Option<PackageJsonSummary>,
+    pub suggested_run_request: Option<RunRequest>,
     pub capabilities: CapabilityMatrix,
     pub host_files: HostWorkspaceFileIndexSummary,
 }
@@ -308,9 +306,32 @@ pub struct HostSessionStateReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimePreviewStateReport {
     pub port: HostRuntimePort,
+    pub url: String,
+    pub model: HostRuntimePreviewModel,
     pub root_request: HostRuntimeHttpRequest,
     pub root_request_hint: PreviewRequestHint,
     pub root_response_descriptor: PreviewResponseDescriptor,
+    pub root_hydrated_files: Vec<WorkspaceFilePayload>,
+    pub host: HostBootstrapSummary,
+    pub run: RunPlan,
+    pub host_files: HostWorkspaceFileIndexSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewModel {
+    pub title: String,
+    pub summary: String,
+    pub cwd: String,
+    pub command: String,
+    pub highlights: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewReadyReport {
+    pub port: HostRuntimePort,
+    pub url: String,
+    pub model: HostRuntimePreviewModel,
+    pub root_hydrated_files: Vec<WorkspaceFilePayload>,
     pub host: HostBootstrapSummary,
     pub run: RunPlan,
     pub host_files: HostWorkspaceFileIndexSummary,
@@ -332,7 +353,8 @@ pub struct HostRuntimeLaunchReport {
     pub bootstrap_plan: HostRuntimeBootstrapPlan,
     pub preview_launch: HostRuntimePreviewLaunchReport,
     pub state: HostRuntimeStateReport,
-    pub startup_logs: Vec<String>,
+    pub startup_stdout: Vec<String>,
+    pub preview_ready: Option<HostRuntimePreviewReadyReport>,
     pub events: Vec<HostRuntimeEvent>,
 }
 
@@ -345,6 +367,48 @@ pub struct HostRuntimePreviewRequestReport {
     pub response_descriptor: PreviewResponseDescriptor,
     pub hydration_paths: Vec<String>,
     pub hydrated_files: Vec<WorkspaceFilePayload>,
+    pub transform_kind: Option<HostRuntimePreviewTransformKind>,
+    pub render_plan: Option<HostRuntimePreviewRenderPlan>,
+    pub module_plan: Option<HostRuntimePreviewModulePlan>,
+    pub direct_response: Option<HostRuntimeDirectHttpResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimePreviewTransformKind {
+    Module,
+    HtmlDocument,
+    Stylesheet,
+    SvgDocument,
+    PlainText,
+    Binary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewRenderPlan {
+    pub kind: HostRuntimePreviewRenderKind,
+    pub workspace_path: Option<String>,
+    pub document_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRuntimePreviewRenderKind {
+    WorkspaceFile,
+    AppShell,
+    HostManagedFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewModulePlan {
+    pub importer_path: String,
+    pub format: HostRuntimeModuleFormat,
+    pub import_plans: Vec<HostRuntimePreviewImportPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimePreviewImportPlan {
+    pub request_specifier: String,
+    pub preview_specifier: String,
+    pub format: HostRuntimeModuleFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,12 +436,27 @@ pub struct HostRuntimePort {
     pub protocol: HostRuntimePortProtocol,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct HostRuntimePreviewClientModule {
+    pub specifier: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRuntimeHttpRequest {
     pub port: u16,
     pub method: String,
     pub relative_path: String,
     pub search: String,
+    pub client_modules: Vec<HostRuntimePreviewClientModule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRuntimeDirectHttpResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub text_body: Option<String>,
+    pub bytes_body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,6 +798,7 @@ pub enum PreviewRequestKind {
     RootDocument,
     RootEntry,
     FallbackRoot,
+    BootstrapState,
     RuntimeState,
     WorkspaceState,
     FileIndex,
@@ -742,6 +822,7 @@ pub enum PreviewResponseKind {
     WorkspaceDocument,
     AppShell,
     HostManagedFallback,
+    BootstrapState,
     RuntimeState,
     WorkspaceState,
     FileIndex,

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          cache: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Check
+        run: vp check
+
+      - name: Rust tests
+        run: cargo test -p runtime-host
+
+      - name: Runtime tests
+        run: vp test src/runtime/host-adapter.test.ts src/runtime/preview-server.test.ts src/runtime/analyze-archive.test.ts
+
+      - name: Install Playwright Chromium
+        run: vp exec playwright install --with-deps chromium
+
+      - name: Browser smoke tests
+        run: vp run test:playwright e2e/browser-c-vm-smoke.e2e.ts e2e/session-preview.e2e.ts e2e/sample2-preview-repro.e2e.ts e2e/sample3-preview.e2e.ts e2e/zip-replace-preview.e2e.ts e2e/zip-replace-sample2-sample3.e2e.ts e2e/zip-replace-three-samples.e2e.ts
+
+      - name: Build
+        run: vp run build

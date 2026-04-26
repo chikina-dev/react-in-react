@@ -1,6 +1,6 @@
 import { expect, test } from "vite-plus/test";
 
-import { MockRuntimeHostAdapter } from "./host-adapter";
+import { createRuntimeHostWasmImports, MockRuntimeHostAdapter } from "./host-adapter";
 import type { WorkspaceFileRecord } from "./analyze-archive";
 import type { SessionSnapshot } from "./protocol";
 
@@ -26,7 +26,6 @@ const session: SessionSnapshot = {
   },
   capabilities: {
     detectedReact: true,
-    detectedVite: true,
   },
 };
 
@@ -75,6 +74,39 @@ const files = new Map<string, WorkspaceFileRecord>([
       textContent: "export const boot = true;",
     },
   ],
+  [
+    "/workspace/node_modules/.bin/vite",
+    {
+      path: "/workspace/node_modules/.bin/vite",
+      size: 7,
+      contentType: "text/plain; charset=utf-8",
+      isText: true,
+      bytes: new TextEncoder().encode("vite.js"),
+      textContent: "vite.js",
+    },
+  ],
+  [
+    "/workspace/node_modules/vite/package.json",
+    {
+      path: "/workspace/node_modules/vite/package.json",
+      size: 34,
+      contentType: "application/json; charset=utf-8",
+      isText: true,
+      bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+      textContent: '{"bin":{"vite":"bin/vite.js"}}',
+    },
+  ],
+  [
+    "/workspace/node_modules/vite/bin/vite.js",
+    {
+      path: "/workspace/node_modules/vite/bin/vite.js",
+      size: 20,
+      contentType: "text/plain; charset=utf-8",
+      isText: true,
+      bytes: new TextEncoder().encode("console.log('vite')"),
+      textContent: "console.log('vite')",
+    },
+  ],
 ]);
 
 test("MockRuntimeHostAdapter reports the null engine boot summary", async () => {
@@ -86,6 +118,30 @@ test("MockRuntimeHostAdapter reports the null engine boot summary", async () => 
     supportsModuleLoader: true,
     workspaceRoot: "/workspace",
   });
+});
+
+test("createRuntimeHostWasmImports defines stubs for browser QuickJS extern imports", () => {
+  const imports = createRuntimeHostWasmImports([
+    { module: "env", name: "JS_NewRuntime", kind: "function" },
+    { module: "env", name: "JS_Eval", kind: "function" },
+    { module: "env", name: "js_malloc", kind: "function" },
+  ]);
+
+  expect(Object.keys(imports)).toEqual(["env"]);
+  expect(typeof imports.env?.JS_NewRuntime).toBe("function");
+  expect(typeof imports.env?.JS_Eval).toBe("function");
+  expect(typeof imports.env?.js_malloc).toBe("function");
+  const newRuntime = imports.env?.JS_NewRuntime as (() => never) | undefined;
+
+  expect(() => newRuntime?.()).toThrow(
+    "runtime-host wasm import env.JS_NewRuntime is not wired yet",
+  );
+});
+
+test("createRuntimeHostWasmImports rejects unsupported import kinds", () => {
+  expect(() =>
+    createRuntimeHostWasmImports([{ module: "env", name: "memory", kind: "memory" }]),
+  ).toThrow("runtime-host wasm import env.memory has unsupported kind memory");
 });
 
 test("MockRuntimeHostAdapter creates sessions and returns run plans", async () => {
@@ -101,9 +157,12 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     sessionId: "session-1",
     workspaceRoot: "/workspace",
     packageName: "demo-app",
-    fileCount: 4,
+    fileCount: 7,
     fileIndex: [
       { path: "/workspace/logo.png", size: 4, isText: false },
+      { path: "/workspace/node_modules/.bin/vite", size: 7, isText: true },
+      { path: "/workspace/node_modules/vite/bin/vite.js", size: 20, isText: true },
+      { path: "/workspace/node_modules/vite/package.json", size: 34, isText: true },
       { path: "/workspace/package.json", size: 19, isText: true },
       { path: "/workspace/src/boot.ts", size: 25, isText: true },
       { path: "/workspace/src/server.ts", size: 20, isText: true },
@@ -184,13 +243,13 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     }),
   ).resolves.toEqual({
     cwd: "/workspace",
-    argv: ["/virtual/node", "npm", "run", "dev", "--host"],
+    argv: ["/virtual/node", "/workspace/node_modules/vite/bin/vite.js", "--host"],
     env: {
       NODE_ENV: "development",
     },
     execPath: "/virtual/node",
     platform: "browser",
-    entrypoint: "dev",
+    entrypoint: "/workspace/node_modules/vite/bin/vite.js",
     commandLine: "npm run dev --host",
     commandKind: "npm-script",
   });
@@ -216,6 +275,21 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
       size: 25,
       isText: true,
     },
+    {
+      path: "/workspace/node_modules/.bin/vite",
+      size: 7,
+      isText: true,
+    },
+    {
+      path: "/workspace/node_modules/vite/package.json",
+      size: 34,
+      isText: true,
+    },
+    {
+      path: "/workspace/node_modules/vite/bin/vite.js",
+      size: 20,
+      isText: true,
+    },
   ]);
 
   await expect(adapter.statWorkspacePath(session.sessionId, "/workspace/src")).resolves.toEqual({
@@ -230,6 +304,12 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
       path: "/workspace/logo.png",
       kind: "file",
       size: 4,
+      isText: false,
+    },
+    {
+      path: "/workspace/node_modules",
+      kind: "directory",
+      size: 0,
       isText: false,
     },
     {
@@ -250,7 +330,11 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
     kind: "workspace-asset",
     workspacePath: "/workspace/logo.png",
     documentRoot: "/workspace",
-    hydratePaths: ["/workspace/package.json", "/workspace/logo.png"],
+    hydratePaths: [
+      "/workspace/package.json",
+      "/workspace/node_modules/vite/package.json",
+      "/workspace/logo.png",
+    ],
   });
 
   await expect(
@@ -290,6 +374,103 @@ test("MockRuntimeHostAdapter creates sessions and returns run plans", async () =
       bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
     },
   ]);
+});
+
+test("MockRuntimeHostAdapter adds a second browser CLI package by registry entry only", async () => {
+  const adapter = new MockRuntimeHostAdapter();
+  const acmeSession: SessionSnapshot = {
+    ...session,
+    sessionId: "session-acme",
+    packageJson: {
+      name: "acme-app",
+      scripts: {
+        dev: "acme-dev",
+      },
+      dependencies: [],
+      devDependencies: ["acme-dev"],
+    },
+  };
+  const acmeFiles = new Map<string, WorkspaceFileRecord>([
+    [
+      "/workspace/package.json",
+      {
+        path: "/workspace/package.json",
+        size: 19,
+        contentType: "application/json; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode('{"name":"acme-app"}'),
+        textContent: '{"name":"acme-app"}',
+      },
+    ],
+    [
+      "/workspace/node_modules/.bin/acme-dev",
+      {
+        path: "/workspace/node_modules/.bin/acme-dev",
+        size: 11,
+        contentType: "text/plain; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("acme-dev.js"),
+        textContent: "acme-dev.js",
+      },
+    ],
+    [
+      "/workspace/node_modules/acme-dev/package.json",
+      {
+        path: "/workspace/node_modules/acme-dev/package.json",
+        size: 66,
+        contentType: "application/json; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode('{"name":"acme-dev","bin":{"acme-dev":"bin/acme-dev.js"}}'),
+        textContent: '{"name":"acme-dev","bin":{"acme-dev":"bin/acme-dev.js"}}',
+      },
+    ],
+    [
+      "/workspace/node_modules/acme-dev/bin/acme-dev.js",
+      {
+        path: "/workspace/node_modules/acme-dev/bin/acme-dev.js",
+        size: 24,
+        contentType: "text/plain; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("console.log('acme-dev')"),
+        textContent: "console.log('acme-dev')",
+      },
+    ],
+  ]);
+
+  await adapter.createSession({
+    sessionId: acmeSession.sessionId,
+    session: acmeSession,
+    files: acmeFiles,
+  });
+
+  await expect(
+    adapter.launchRuntime(
+      acmeSession.sessionId,
+      {
+        cwd: "/workspace",
+        command: "npm",
+        args: ["run", "dev"],
+      },
+      {
+        maxTurns: 16,
+        port: 3400,
+      },
+    ),
+  ).resolves.toEqual(
+    expect.objectContaining({
+      runPlan: expect.objectContaining({
+        commandKind: "npm-script",
+        commandLine: "npm run dev",
+        resolvedScript: "acme-dev",
+      }),
+      startupStdout: expect.arrayContaining([
+        "[browser-cli] runtime=browser-dev-server preview=http-server mode=dev",
+      ]),
+      previewReady: expect.objectContaining({
+        url: "/preview/session-acme/3400/",
+      }),
+    }),
+  );
 });
 
 test("MockRuntimeHostAdapter resolves document-root preview assets", async () => {
@@ -652,6 +833,24 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           modules: ["console", "node:console"],
           commandPrefixes: ["console"],
         },
+        {
+          name: "perf_hooks",
+          globals: ["performance"],
+          modules: ["node:perf_hooks"],
+          commandPrefixes: [],
+        },
+        {
+          name: "module",
+          globals: [],
+          modules: ["node:module"],
+          commandPrefixes: [],
+        },
+        {
+          name: "inspector",
+          globals: [],
+          modules: ["node:inspector"],
+          commandPrefixes: [],
+        },
       ],
     },
   });
@@ -667,6 +866,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     pendingJobs: 0,
     registeredModules: 0,
     bootstrapSpecifier: null,
+    bridgeReady: false,
     moduleLoaderRoots: [],
     state: "booted",
   });
@@ -845,30 +1045,63 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         exited: false,
         exitCode: null,
       }),
-      server: {
+      rootReport: expect.objectContaining({
+        server: {
+          port: {
+            port: 3100,
+            protocol: "http",
+          },
+          kind: "preview",
+          cwd: "/workspace/src",
+          entrypoint: "/workspace/src/server.ts",
+        },
         port: {
           port: 3100,
           protocol: "http",
         },
-        kind: "preview",
-        cwd: "/workspace/src",
-        entrypoint: "/workspace/src/server.ts",
-      },
-      port: {
-        port: 3100,
-        protocol: "http",
-      },
-      rootRequest: {
-        port: 3100,
-        method: "GET",
-        relativePath: "/",
-        search: "",
-      },
-      rootRequestHint: expect.objectContaining({
-        kind: "fallback-root",
-      }),
-      rootResponseDescriptor: expect.objectContaining({
-        kind: "host-managed-fallback",
+        request: {
+          port: 3100,
+          method: "GET",
+          relativePath: "/",
+          search: "",
+          clientModules: [],
+        },
+        requestHint: expect.objectContaining({
+          kind: "fallback-root",
+        }),
+        responseDescriptor: expect.objectContaining({
+          kind: "host-managed-fallback",
+        }),
+        hydrationPaths: ["/workspace/package.json", "/workspace/node_modules/vite/package.json"],
+        hydratedFiles: expect.arrayContaining([
+          {
+            path: "/workspace/package.json",
+            size: 19,
+            isText: true,
+            textContent: '{"name":"demo-app"}',
+            bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+          },
+          {
+            path: "/workspace/node_modules/vite/package.json",
+            size: 34,
+            isText: true,
+            textContent: '{"bin":{"vite":"bin/vite.js"}}',
+            bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+          },
+        ]),
+        directResponse: expect.objectContaining({
+          status: 503,
+          headers: expect.objectContaining({
+            "content-type": "text/html; charset=utf-8",
+          }),
+        }),
+        renderPlan: {
+          kind: "host-managed-fallback",
+          workspacePath: null,
+          documentRoot: null,
+        },
+        modulePlan: null,
+        transformKind: null,
       }),
     },
   });
@@ -913,6 +1146,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       cwd: "/workspace/src",
       entrypoint: "/workspace/src/server.ts",
       state: "booted",
+      bridgeReady: false,
     }),
     bindings: expect.objectContaining({
       globals: expect.arrayContaining(["process", "Buffer", "setTimeout"]),
@@ -920,39 +1154,120 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     bootstrapPlan: expect.objectContaining({
       bootstrapSpecifier: "runtime:bootstrap",
     }),
-    startupLogs: expect.arrayContaining([
+    startupStdout: expect.arrayContaining([
+      expect.stringMatching(/^\[mount] \d+ files available at \/workspace$/),
+      "[exec] node server.ts",
+      expect.stringMatching(/^\[host-vfs] files=\d+ sample=.* size=\d+$/),
       "[host] engine=null-engine interrupts=true module-loader=true",
+      "[plan] cwd=/workspace/src entry=/workspace/src/server.ts env=0",
+      "[process] exec=/virtual/node cwd=/workspace/src argv=/virtual/node /workspace/src/server.ts",
+      "[engine-context] state=booted pending-jobs=0 bridge-ready=false entry=/workspace/src/server.ts",
+      "[bindings] globals=console,process,Buffer,setTimeout,clearTimeout,setInterval,clearInterval,__runtime builtins=process,fs,path,buffer,timers,console,perf_hooks,module,inspector",
+      "[bootstrap] bootstrap=runtime:bootstrap modules=node:process,node:fs,node:path,node:buffer,node:timers,node:console,node:perf_hooks,node:module,node:inspector,runtime:bootstrap",
       "[context] id=runtime-context-2",
+      "[detect] react=true",
+      "[preview] server-ready /preview/session-1/3200/",
     ]),
+    previewReady: {
+      port: {
+        port: 3200,
+        protocol: "http",
+      },
+      url: "/preview/session-1/3200/",
+      model: expect.objectContaining({
+        title: "demo-app guest app",
+      }),
+      rootHydratedFiles: expect.arrayContaining([
+        {
+          path: "/workspace/package.json",
+          size: 19,
+          isText: true,
+          textContent: '{"name":"demo-app"}',
+          bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+        },
+        {
+          path: "/workspace/node_modules/vite/package.json",
+          size: 34,
+          isText: true,
+          textContent: '{"bin":{"vite":"bin/vite.js"}}',
+          bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+        },
+      ]),
+      host: {
+        engineName: "null-engine",
+        supportsInterrupts: true,
+        supportsModuleLoader: true,
+        workspaceRoot: "/workspace",
+      },
+      run: expect.objectContaining({
+        entrypoint: "/workspace/src/server.ts",
+      }),
+      hostFiles: expect.objectContaining({
+        count: 8,
+      }),
+    },
     previewLaunch: {
       startup: expect.objectContaining({
         exited: false,
         exitCode: null,
       }),
-      server: {
+      rootReport: expect.objectContaining({
+        server: {
+          port: {
+            port: 3200,
+            protocol: "http",
+          },
+          kind: "preview",
+          cwd: "/workspace/src",
+          entrypoint: "/workspace/src/server.ts",
+        },
         port: {
           port: 3200,
           protocol: "http",
         },
-        kind: "preview",
-        cwd: "/workspace/src",
-        entrypoint: "/workspace/src/server.ts",
-      },
-      port: {
-        port: 3200,
-        protocol: "http",
-      },
-      rootRequest: {
-        port: 3200,
-        method: "GET",
-        relativePath: "/",
-        search: "",
-      },
-      rootRequestHint: expect.objectContaining({
-        kind: "fallback-root",
-      }),
-      rootResponseDescriptor: expect.objectContaining({
-        kind: "host-managed-fallback",
+        request: {
+          port: 3200,
+          method: "GET",
+          relativePath: "/",
+          search: "",
+          clientModules: [],
+        },
+        requestHint: expect.objectContaining({
+          kind: "fallback-root",
+        }),
+        responseDescriptor: expect.objectContaining({
+          kind: "host-managed-fallback",
+        }),
+        hydrationPaths: ["/workspace/package.json", "/workspace/node_modules/vite/package.json"],
+        hydratedFiles: expect.arrayContaining([
+          {
+            path: "/workspace/package.json",
+            size: 19,
+            isText: true,
+            textContent: '{"name":"demo-app"}',
+            bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+          },
+          {
+            path: "/workspace/node_modules/vite/package.json",
+            size: 34,
+            isText: true,
+            textContent: '{"bin":{"vite":"bin/vite.js"}}',
+            bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+          },
+        ]),
+        directResponse: expect.objectContaining({
+          status: 503,
+          headers: expect.objectContaining({
+            "content-type": "text/html; charset=utf-8",
+          }),
+        }),
+        renderPlan: {
+          kind: "host-managed-fallback",
+          workspacePath: null,
+          documentRoot: null,
+        },
+        modulePlan: null,
+        transformKind: null,
       }),
     },
     state: {
@@ -963,7 +1278,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           name: "demo-app",
         }),
         hostFiles: expect.objectContaining({
-          count: 5,
+          count: 8,
         }),
       }),
       preview: expect.objectContaining({
@@ -971,8 +1286,33 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           port: 3200,
           protocol: "http",
         },
+        rootHydratedFiles: expect.arrayContaining([
+          {
+            path: "/workspace/package.json",
+            size: 19,
+            isText: true,
+            textContent: '{"name":"demo-app"}',
+            bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+          },
+          {
+            path: "/workspace/node_modules/vite/package.json",
+            size: 34,
+            isText: true,
+            textContent: '{"bin":{"vite":"bin/vite.js"}}',
+            bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+          },
+        ]),
         run: expect.objectContaining({
           entrypoint: "/workspace/src/server.ts",
+        }),
+        hostFiles: expect.objectContaining({
+          count: 8,
+        }),
+        rootRequestHint: expect.objectContaining({
+          kind: "fallback-root",
+        }),
+        rootResponseDescriptor: expect.objectContaining({
+          kind: "host-managed-fallback",
         }),
       }),
     },
@@ -1016,8 +1356,9 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
     argvLen: 2,
     envCount: 0,
     pendingJobs: 0,
-    registeredModules: 7,
+    registeredModules: 10,
     bootstrapSpecifier: "runtime:bootstrap",
+    bridgeReady: true,
     moduleLoaderRoots: ["/workspace/node_modules", "/workspace/src/node_modules"],
     state: "ready",
   });
@@ -1265,6 +1606,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         method: "GET",
         relativePath: "/src/server.ts",
         search: "?v=1",
+        clientModules: [],
       },
     }),
   ).resolves.toEqual({
@@ -1287,23 +1629,32 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       method: "GET",
       relativePath: "/src/server.ts",
       search: "?v=1",
+      clientModules: [],
     },
-    requestHint: {
+    requestHint: expect.objectContaining({
       kind: "workspace-asset",
       workspacePath: "/workspace/src/server.ts",
       documentRoot: "/workspace",
-      hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
-    },
-    responseDescriptor: {
+      hydratePaths: [
+        "/workspace/package.json",
+        "/workspace/node_modules/vite/package.json",
+        "/workspace/src/server.ts",
+      ],
+    }),
+    responseDescriptor: expect.objectContaining({
       kind: "workspace-asset",
       workspacePath: "/workspace/src/server.ts",
       documentRoot: "/workspace",
-      hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+      hydratePaths: [
+        "/workspace/package.json",
+        "/workspace/node_modules/vite/package.json",
+        "/workspace/src/server.ts",
+      ],
       statusCode: 200,
       contentType: "text/plain; charset=utf-8",
       allowMethods: [],
       omitBody: false,
-    },
+    }),
   });
 
   await expect(
@@ -1314,6 +1665,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         method: "GET",
         relativePath: "/src/server.ts",
         search: "?v=1",
+        clientModules: [],
       },
     }),
   ).resolves.toEqual({
@@ -1337,24 +1689,49 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         method: "GET",
         relativePath: "/src/server.ts",
         search: "?v=1",
+        clientModules: [],
       },
-      requestHint: {
+      requestHint: expect.objectContaining({
         kind: "workspace-asset",
         workspacePath: "/workspace/src/server.ts",
         documentRoot: "/workspace",
-        hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
-      },
-      responseDescriptor: {
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/src/server.ts",
+        ],
+      }),
+      responseDescriptor: expect.objectContaining({
         kind: "workspace-asset",
         workspacePath: "/workspace/src/server.ts",
         documentRoot: "/workspace",
-        hydratePaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/src/server.ts",
+        ],
         statusCode: 200,
         contentType: "text/plain; charset=utf-8",
         allowMethods: [],
         omitBody: false,
+      }),
+      hydrationPaths: [
+        "/workspace/package.json",
+        "/workspace/node_modules/vite/package.json",
+        "/workspace/src/server.ts",
+      ],
+      transformKind: "module",
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/server.ts",
+        documentRoot: "/workspace",
       },
-      hydrationPaths: ["/workspace/package.json", "/workspace/src/server.ts"],
+      modulePlan: {
+        importerPath: "/workspace/src/server.ts",
+        format: "module",
+        importPlans: [],
+      },
+      directResponse: null,
       hydratedFiles: [
         {
           path: "/workspace/package.json",
@@ -1362,6 +1739,13 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
           isText: true,
           textContent: '{"name":"demo-app"}',
           bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+        },
+        {
+          path: "/workspace/node_modules/vite/package.json",
+          size: 34,
+          isText: true,
+          textContent: '{"bin":{"vite":"bin/vite.js"}}',
+          bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
         },
         {
           path: "/workspace/src/server.ts",
@@ -1375,6 +1759,507 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
   });
 
   await expect(
+    adapter.writeWorkspaceFile(session.sessionId, {
+      path: "/workspace/src/app.css",
+      bytes: new TextEncoder().encode('body{background:url("/bg.png")}'),
+      isText: true,
+    }),
+  ).resolves.toEqual({
+    path: "/workspace/src/app.css",
+    kind: "file",
+    size: 31,
+    isText: true,
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/files/src/app.css",
+        search: "",
+        clientModules: [],
+      },
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-preview-request",
+    report: {
+      server: {
+        port: {
+          port: 4200,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+      port: {
+        port: 4200,
+        protocol: "http",
+      },
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/files/src/app.css",
+        search: "",
+        clientModules: [],
+      },
+      requestHint: expect.objectContaining({
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/app.css",
+        documentRoot: "/workspace",
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/src/app.css",
+        ],
+      }),
+      responseDescriptor: expect.objectContaining({
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/app.css",
+        documentRoot: "/workspace",
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/src/app.css",
+        ],
+        statusCode: 200,
+        contentType: "text/css; charset=utf-8",
+        allowMethods: [],
+        omitBody: false,
+      }),
+      hydrationPaths: [
+        "/workspace/package.json",
+        "/workspace/node_modules/vite/package.json",
+        "/workspace/src/app.css",
+      ],
+      transformKind: "stylesheet",
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/src/app.css",
+        documentRoot: "/workspace",
+      },
+      modulePlan: null,
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "text/css; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: 'body{background:url("/preview/session-1/4200/bg.png")}',
+        bytes: null,
+      },
+      hydratedFiles: [
+        {
+          path: "/workspace/package.json",
+          size: 19,
+          isText: true,
+          textContent: '{"name":"demo-app"}',
+          bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+        },
+        {
+          path: "/workspace/node_modules/vite/package.json",
+          size: 34,
+          isText: true,
+          textContent: '{"bin":{"vite":"bin/vite.js"}}',
+          bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+        },
+        {
+          path: "/workspace/src/app.css",
+          size: 31,
+          isText: true,
+          textContent: 'body{background:url("/bg.png")}',
+          bytes: new TextEncoder().encode('body{background:url("/bg.png")}'),
+        },
+      ],
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/files/logo.png",
+        search: "",
+        clientModules: [],
+      },
+    }),
+  ).resolves.toEqual({
+    kind: "runtime-preview-request",
+    report: {
+      server: {
+        port: {
+          port: 4200,
+          protocol: "http",
+        },
+        kind: "preview",
+        cwd: "/workspace/src",
+        entrypoint: "/workspace/src/server.ts",
+      },
+      port: {
+        port: 4200,
+        protocol: "http",
+      },
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/files/logo.png",
+        search: "",
+        clientModules: [],
+      },
+      requestHint: expect.objectContaining({
+        kind: "workspace-file",
+        workspacePath: "/workspace/logo.png",
+        documentRoot: "/workspace",
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/logo.png",
+        ],
+      }),
+      responseDescriptor: expect.objectContaining({
+        kind: "workspace-file",
+        workspacePath: "/workspace/logo.png",
+        documentRoot: "/workspace",
+        hydratePaths: [
+          "/workspace/package.json",
+          "/workspace/node_modules/vite/package.json",
+          "/workspace/logo.png",
+        ],
+        statusCode: 200,
+        contentType: "image/png",
+        allowMethods: [],
+        omitBody: false,
+      }),
+      hydrationPaths: [
+        "/workspace/package.json",
+        "/workspace/node_modules/vite/package.json",
+        "/workspace/logo.png",
+      ],
+      transformKind: "binary",
+      renderPlan: {
+        kind: "workspace-file",
+        workspacePath: "/workspace/logo.png",
+        documentRoot: "/workspace",
+      },
+      modulePlan: null,
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "no-store",
+        },
+        textBody: null,
+        bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+      },
+      hydratedFiles: [
+        {
+          path: "/workspace/package.json",
+          size: 19,
+          isText: true,
+          textContent: '{"name":"demo-app"}',
+          bytes: new TextEncoder().encode('{"name":"demo-app"}'),
+        },
+        {
+          path: "/workspace/node_modules/vite/package.json",
+          size: 34,
+          isText: true,
+          textContent: '{"bin":{"vite":"bin/vite.js"}}',
+          bytes: new TextEncoder().encode('{"bin":{"vite":"bin/vite.js"}}'),
+        },
+        {
+          path: "/workspace/logo.png",
+          size: 4,
+          isText: false,
+          textContent: null,
+          bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+        },
+      ],
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+        clientModules: [{ specifier: "runtime:preview-client", url: "/assets/preview-client.js" }],
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "runtime-preview-request",
+    report: {
+      requestHint: {
+        kind: "fallback-root",
+      },
+      responseDescriptor: {
+        kind: "host-managed-fallback",
+      },
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: expect.stringContaining("/assets/preview-client.js"),
+        bytes: null,
+      },
+    },
+  });
+
+  const sample3Session: SessionSnapshot = {
+    sessionId: "sample3-session",
+    state: "mounted",
+    revision: 0,
+    workspaceRoot: "/workspace",
+    archive: {
+      fileName: "sample3.zip",
+      fileCount: 3,
+      directoryCount: 2,
+      entries: [],
+      rootPrefix: null,
+    },
+    packageJson: {
+      name: "sample3-app",
+      scripts: {
+        dev: "react-router dev",
+      },
+      dependencies: ["react", "react-dom"],
+      devDependencies: [],
+    },
+    capabilities: {
+      detectedReact: true,
+    },
+  };
+  const sample3Files = new Map<string, WorkspaceFileRecord>([
+    [
+      "/workspace/package.json",
+      {
+        path: "/workspace/package.json",
+        size: 63,
+        contentType: "application/json; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode(
+          '{"name":"sample3-app","dependencies":["react","react-dom"]}',
+        ),
+        textContent: '{"name":"sample3-app","dependencies":["react","react-dom"]}',
+      },
+    ],
+    [
+      "/workspace/app/routes/home.tsx",
+      {
+        path: "/workspace/app/routes/home.tsx",
+        size: 67,
+        contentType: "text/plain; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode(
+          "export default function Home() { return <section>sample3</section>; }",
+        ),
+        textContent: "export default function Home() { return <section>sample3</section>; }",
+      },
+    ],
+    [
+      "/workspace/app/app.css",
+      {
+        path: "/workspace/app/app.css",
+        size: 18,
+        contentType: "text/css; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("body { margin: 0; }"),
+        textContent: "body { margin: 0; }",
+      },
+    ],
+    [
+      "/workspace/node_modules/react/package.json",
+      {
+        path: "/workspace/node_modules/react/package.json",
+        size: 18,
+        contentType: "application/json; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode('{"main":"index.js"}'),
+        textContent: '{"main":"index.js"}',
+      },
+    ],
+    [
+      "/workspace/node_modules/react/index.js",
+      {
+        path: "/workspace/node_modules/react/index.js",
+        size: 33,
+        contentType: "text/plain; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("export const createElement = () => null;"),
+        textContent: "export const createElement = () => null;",
+      },
+    ],
+    [
+      "/workspace/node_modules/react-dom/client.js",
+      {
+        path: "/workspace/node_modules/react-dom/client.js",
+        size: 58,
+        contentType: "text/plain; charset=utf-8",
+        isText: true,
+        bytes: new TextEncoder().encode("export function createRoot() { return { render() {} }; }"),
+        textContent: "export function createRoot() { return { render() {} }; }",
+      },
+    ],
+  ]);
+  await adapter.createSession({
+    sessionId: sample3Session.sessionId,
+    session: sample3Session,
+    files: sample3Files,
+  });
+  const sample3RuntimeContext = await adapter.createRuntimeContext(sample3Session.sessionId, {
+    cwd: "/workspace",
+    command: "npm",
+    args: ["run", "dev"],
+  });
+  await adapter.executeRuntimeCommand(sample3RuntimeContext.contextId, {
+    kind: "http.serve-preview",
+    port: 4300,
+  });
+  await expect(
+    adapter.executeRuntimeCommand(sample3RuntimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4300,
+        method: "GET",
+        relativePath: "/",
+        search: "",
+        clientModules: [{ specifier: "runtime:preview-client", url: "/assets/preview-client.js" }],
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "runtime-preview-request",
+    report: {
+      requestHint: {
+        kind: "root-entry",
+        workspacePath: "/workspace/app/routes/home.tsx",
+      },
+      responseDescriptor: {
+        kind: "app-shell",
+        workspacePath: "/workspace/app/routes/home.tsx",
+      },
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: expect.stringContaining("globalThis.process ??="),
+        bytes: null,
+      },
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/__bootstrap.json",
+        search: "",
+        clientModules: [],
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "runtime-preview-request",
+    report: {
+      requestHint: {
+        kind: "bootstrap-state",
+      },
+      transformKind: null,
+      renderPlan: null,
+      responseDescriptor: {
+        kind: "bootstrap-state",
+      },
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: expect.stringContaining('"preview":{"type":"preview.ready"'),
+        bytes: null,
+      },
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/__workspace.json",
+        search: "",
+        clientModules: [],
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "runtime-preview-request",
+    report: {
+      requestHint: {
+        kind: "workspace-state",
+      },
+      transformKind: null,
+      renderPlan: null,
+      responseDescriptor: {
+        kind: "workspace-state",
+      },
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: expect.stringContaining('"sessionId":"session-1"'),
+        bytes: null,
+      },
+    },
+  });
+
+  await expect(
+    adapter.executeRuntimeCommand(runtimeContext.contextId, {
+      kind: "runtime.preview-request",
+      request: {
+        port: 4200,
+        method: "GET",
+        relativePath: "/assets/runtime.css",
+        search: "",
+        clientModules: [],
+      },
+    }),
+  ).resolves.toMatchObject({
+    kind: "runtime-preview-request",
+    report: {
+      requestHint: {
+        kind: "runtime-stylesheet",
+      },
+      transformKind: null,
+      renderPlan: null,
+      responseDescriptor: {
+        kind: "runtime-stylesheet",
+      },
+      directResponse: {
+        status: 200,
+        headers: {
+          "content-type": "text/css; charset=utf-8",
+          "cache-control": "no-store",
+        },
+        textBody: expect.stringContaining(".guest-shell"),
+        bytes: null,
+      },
+    },
+  });
+
+  await expect(
     adapter.executeRuntimeCommand(runtimeContext.contextId, {
       kind: "http.resolve-preview",
       request: {
@@ -1382,6 +2267,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         method: "HEAD",
         relativePath: "/src/server.ts",
         search: "",
+        clientModules: [],
       },
     }),
   ).resolves.toMatchObject({
@@ -1404,6 +2290,7 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
         method: "POST",
         relativePath: "/src/server.ts",
         search: "",
+        clientModules: [],
       },
     }),
   ).resolves.toMatchObject({
@@ -1826,6 +2713,36 @@ test("MockRuntimeHostAdapter exposes a generic fs command surface", async () => 
       kind: "runtime.drain-events",
     }),
   ).rejects.toThrow("runtime context not found");
+
+  await expect(
+    adapter.launchRuntime(
+      session.sessionId,
+      {
+        cwd: "/workspace",
+        command: "npm",
+        args: ["run", "dev"],
+      },
+      {
+        maxTurns: 16,
+        port: 3300,
+      },
+    ),
+  ).resolves.toEqual(
+    expect.objectContaining({
+      runPlan: expect.objectContaining({
+        cwd: "/workspace",
+        commandKind: "npm-script",
+        commandLine: "npm run dev",
+        resolvedScript: "vite",
+      }),
+      startupStdout: expect.arrayContaining([
+        "[browser-cli] runtime=browser-dev-server preview=http-server mode=dev",
+      ]),
+      previewReady: expect.objectContaining({
+        url: "/preview/session-1/3300/",
+      }),
+    }),
+  );
 
   await expect(
     adapter.executeContextFsCommand(runtimeContext.contextId, {

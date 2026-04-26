@@ -1,7 +1,13 @@
 import { strToU8, zipSync } from "fflate";
 import { expect, test } from "vite-plus/test";
 
-import { detectCommonPrefix, normalizeArchivePath, parseArchive } from "./analyze-archive";
+import {
+  detectCommonPrefix,
+  guessContentType,
+  mountArchive,
+  normalizeArchivePath,
+  parseArchive,
+} from "./analyze-archive";
 
 test("detectCommonPrefix strips the single top-level workspace folder", () => {
   const prefix = detectCommonPrefix([
@@ -44,4 +50,36 @@ test("parseArchive extracts package.json and react capability", () => {
   expect(parsed.packageJson?.scripts.dev).toBe("vite");
   expect(parsed.archive.entries[0]?.path.startsWith("/workspace")).toBe(true);
   expect(parsed.capabilities.detectedReact).toBe(true);
+});
+
+test("mountArchive derives suggested run request with dev-first policy", () => {
+  const archive = zipSync({
+    "demo/package.json": strToU8(
+      JSON.stringify({
+        name: "guest-app",
+        scripts: {
+          start: "node server.js",
+          dev: "vite",
+        },
+      }),
+    ),
+  });
+
+  const zipBytes = new Uint8Array(archive);
+  const mounted = mountArchive("guest.zip", zipBytes.buffer as ArrayBuffer, "session-1");
+
+  expect(mounted.snapshot.suggestedRunRequest).toEqual({
+    cwd: "/workspace",
+    command: "npm",
+    args: ["run", "dev"],
+  });
+});
+
+test("guessContentType treats node_modules .bin wrappers as text", () => {
+  expect(
+    guessContentType(
+      "/workspace/node_modules/.bin/vite",
+      strToU8("#!/usr/bin/env node\nconsole.log('vite');\n"),
+    ),
+  ).toBe("text/plain; charset=utf-8");
 });

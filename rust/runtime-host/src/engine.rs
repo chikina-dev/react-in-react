@@ -1,23 +1,22 @@
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 use serde_json::Value as JsonValue;
+use serde::Serialize;
 use std::collections::BTreeMap;
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 use std::ffi::{CStr, CString, c_void};
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 use std::ptr;
 
 use crate::protocol::{
-    HostRuntimeBootstrapPlan, HostRuntimeEvent, HostRuntimeModuleImportPlan,
-    HostRuntimeModuleLoaderPlan, HostRuntimeTimer, RunCommandKind, RunPlan, RunRequest,
+    HostRuntimeBootstrapPlan, HostRuntimeConsoleLevel, HostRuntimeEvent,
+    HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeTimer,
+    HostRuntimeTimerKind,
+    RunCommandKind, RunPlan, RunRequest,
 };
-#[cfg(feature = "quickjs-ng-engine")]
-use crate::protocol::{HostRuntimeConsoleLevel, HostRuntimeTimerKind};
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 use crate::protocol::{HostRuntimeModuleFormat, WorkspaceEntryKind, WorkspaceEntrySummary};
-use crate::vfs::VirtualFileSystem;
-#[cfg(feature = "quickjs-ng-engine")]
-use crate::vfs::normalize_posix_path;
-#[cfg(feature = "quickjs-ng-engine")]
+use crate::vfs::{VirtualFileSystem, normalize_posix_path};
+#[cfg(quickjs_ng_native)]
 use quickjs_ng_sys as qjs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +76,7 @@ pub struct EngineContextSnapshot {
     pub pending_jobs: usize,
     pub registered_modules: usize,
     pub bootstrap_specifier: Option<String>,
+    pub bridge_ready: bool,
     pub module_loader_roots: Vec<String>,
     pub state: EngineContextState,
 }
@@ -109,6 +109,7 @@ pub struct EngineBridgeSnapshot {
     pub events: Vec<HostRuntimeEvent>,
     pub timers: Vec<HostRuntimeTimer>,
     pub exit_code: Option<i32>,
+    pub bridge_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +200,7 @@ struct EngineContextRecord {
     pending_jobs: usize,
     registered_modules: usize,
     bootstrap_specifier: Option<String>,
+    bridge_ready: bool,
     module_loader_roots: Vec<String>,
     modules: BTreeMap<String, String>,
     state: EngineContextState,
@@ -260,6 +262,7 @@ impl EngineStateStore {
                 pending_jobs: 0,
                 registered_modules: 0,
                 bootstrap_specifier: None,
+                bridge_ready: false,
                 module_loader_roots: Vec::new(),
                 modules: BTreeMap::new(),
                 state: EngineContextState::Booted,
@@ -282,6 +285,7 @@ impl EngineStateStore {
             pending_jobs: context.pending_jobs,
             registered_modules: context.registered_modules,
             bootstrap_specifier: context.bootstrap_specifier.clone(),
+            bridge_ready: context.bridge_ready,
             module_loader_roots: context.module_loader_roots.clone(),
             state: context.state.clone(),
         })
@@ -306,6 +310,7 @@ impl EngineStateStore {
             })?;
 
         context.bootstrap_specifier = Some(plan.bootstrap_specifier.clone());
+        context.bridge_ready = false;
         context.module_loader_roots = loader_plan.node_module_search_roots.clone();
         context.modules = plan
             .modules
@@ -453,19 +458,226 @@ pub struct NullEngineAdapter {
 }
 
 #[derive(Default)]
-pub struct QuickJsNgEngineAdapter {
+pub struct QuickJsNgBrowserEngineAdapter {
     state: EngineStateStore,
-    #[cfg(feature = "quickjs-ng-engine")]
+    browser_bridges: BTreeMap<String, BrowserRuntimeBridgeState>,
+    #[cfg(quickjs_ng_native)]
     native: QuickJsNativeStore,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
+#[derive(Default)]
+pub struct QuickJsNgNativeEngineAdapter {
+    state: EngineStateStore,
+    #[cfg(quickjs_ng_native)]
+    native: QuickJsNativeStore,
+}
+
+#[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+pub type QuickJsNgEngineAdapter = QuickJsNgNativeEngineAdapter;
+
+#[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+pub type QuickJsNgEngineAdapter = QuickJsNgBrowserEngineAdapter;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct BrowserRuntimeBridgeState {
+    cwd: String,
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    vfs: VirtualFileSystem,
+    clock_ms: u64,
+    next_timer_id: u64,
+    timers: BTreeMap<String, HostRuntimeTimer>,
+    pending_jobs: usize,
+    pending_events: Vec<HostRuntimeEvent>,
+    exit_code: Option<i32>,
+    interrupt_reason: Option<String>,
+    bridge_ready: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+struct BrowserBridgeFileRecord {
+    path: String,
+    is_text: bool,
+    text_content: Option<String>,
+    bytes: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl BrowserRuntimeBridgeState {
+    fn from_bootstrap_bridge(bridge: &EngineBootstrapBridge) -> Self {
+        Self {
+            cwd: bridge.cwd.clone(),
+            argv: bridge.argv.clone(),
+            env: bridge.env.clone(),
+            vfs: bridge.vfs.clone(),
+            clock_ms: 0,
+            next_timer_id: 1,
+            timers: BTreeMap::new(),
+            pending_jobs: 0,
+            pending_events: Vec::new(),
+            exit_code: None,
+            interrupt_reason: None,
+            bridge_ready: false,
+        }
+    }
+
+    fn take_snapshot(&mut self) -> EngineBridgeSnapshot {
+        EngineBridgeSnapshot {
+            cwd: self.cwd.clone(),
+            vfs: self.vfs.clone(),
+            events: std::mem::take(&mut self.pending_events),
+            timers: self.timers.values().cloned().collect(),
+            exit_code: self.exit_code,
+            bridge_ready: self.bridge_ready,
+        }
+    }
+
+    fn process_cwd(&self) -> String {
+        self.cwd.clone()
+    }
+
+    fn process_chdir(&mut self, path: &str) -> Result<String, String> {
+        let resolved = browser_bridge_resolve_path(&self.cwd, path);
+        if !self.vfs.exists(&resolved) || !self.vfs.is_dir(&resolved) {
+            return Err(format!(
+                "quickjs-ng browser bridge process.chdir target is not a directory: {resolved}"
+            ));
+        }
+        self.cwd = resolved.clone();
+        Ok(resolved)
+    }
+
+    fn fs_exists(&self, path: &str) -> bool {
+        let resolved = browser_bridge_resolve_path(&self.cwd, path);
+        self.vfs.exists(&resolved)
+    }
+
+    fn fs_read_file(&self, path: &str) -> Result<(bool, Vec<u8>), String> {
+        let resolved = browser_bridge_resolve_path(&self.cwd, path);
+        let Some(file) = self.vfs.read(&resolved) else {
+            return Err(format!(
+                "quickjs-ng browser bridge fs.read-file missing path: {resolved}"
+            ));
+        };
+        Ok((file.is_text, file.bytes.clone()))
+    }
+
+    fn path_resolve(&self, segments: &[String]) -> String {
+        browser_bridge_path_resolve(&self.cwd, segments)
+    }
+
+    fn console_emit(&mut self, level: HostRuntimeConsoleLevel, values: &[String]) {
+        let line = values.join(" ");
+        self.pending_events.push(HostRuntimeEvent::Console {
+            level: level.clone(),
+            line: line.clone(),
+        });
+        self.pending_events.push(match level {
+            HostRuntimeConsoleLevel::Warn | HostRuntimeConsoleLevel::Error => {
+                HostRuntimeEvent::Stderr { chunk: line }
+            }
+            HostRuntimeConsoleLevel::Log | HostRuntimeConsoleLevel::Info => {
+                HostRuntimeEvent::Stdout { chunk: line }
+            }
+        });
+    }
+
+    fn schedule_timer(&mut self, delay_ms: u64, repeat: bool) -> String {
+        let timer_id = format!("browser-runtime-timer-{}", self.next_timer_id);
+        self.next_timer_id += 1;
+        self.timers.insert(
+            timer_id.clone(),
+            HostRuntimeTimer {
+                timer_id: timer_id.clone(),
+                kind: if repeat {
+                    HostRuntimeTimerKind::Interval
+                } else {
+                    HostRuntimeTimerKind::Timeout
+                },
+                delay_ms,
+                due_at_ms: self.clock_ms.saturating_add(delay_ms),
+            },
+        );
+        timer_id
+    }
+
+    fn clear_timer(&mut self, timer_id: &str) -> bool {
+        self.timers.remove(timer_id).is_some()
+    }
+
+    fn fire_timers(&mut self, now_ms: u64, timer_ids: &[String]) -> usize {
+        self.clock_ms = now_ms;
+        let mut fired = 0;
+        for timer_id in timer_ids {
+            let Some(existing) = self.timers.get(timer_id).cloned() else {
+                continue;
+            };
+            fired += 1;
+            self.pending_jobs = self.pending_jobs.saturating_add(1);
+            self.pending_events.push(HostRuntimeEvent::Console {
+                level: HostRuntimeConsoleLevel::Info,
+                line: format!("[browser-timer] {timer_id} fired"),
+            });
+            match existing.kind {
+                HostRuntimeTimerKind::Timeout => {
+                    self.timers.remove(timer_id);
+                }
+                HostRuntimeTimerKind::Interval => {
+                    if let Some(timer) = self.timers.get_mut(timer_id) {
+                        timer.due_at_ms = now_ms.saturating_add(timer.delay_ms);
+                    }
+                }
+            }
+        }
+        fired
+    }
+
+    fn drain_jobs(&mut self) -> EngineJobDrain {
+        let drained_jobs = self.pending_jobs;
+        self.pending_jobs = 0;
+        EngineJobDrain {
+            drained_jobs,
+            pending_jobs: self.pending_jobs,
+        }
+    }
+
+    fn interrupt(&mut self, reason: &str) {
+        self.interrupt_reason = Some(reason.to_string());
+        self.pending_events.push(HostRuntimeEvent::Console {
+            level: HostRuntimeConsoleLevel::Warn,
+            line: format!("[browser-interrupt] {reason}"),
+        });
+    }
+
+    fn file_records(&self) -> Vec<BrowserBridgeFileRecord> {
+        self.vfs
+            .files()
+            .map(|file| BrowserBridgeFileRecord {
+                path: file.path.clone(),
+                is_text: file.is_text,
+                text_content: file
+                    .is_text
+                    .then(|| String::from_utf8_lossy(&file.bytes).into_owned()),
+                bytes: file.bytes.clone(),
+            })
+            .collect()
+    }
+
+    fn directory_records(&self) -> Vec<String> {
+        self.vfs.directories().cloned().collect()
+    }
+}
+
+#[cfg(quickjs_ng_native)]
 struct QuickJsNativeSessionRecord {
     runtime: *mut qjs::JSRuntime,
     opaque: Box<QuickJsRuntimeOpaque>,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 #[derive(Debug)]
 struct QuickJsNativeContextRecord {
     engine_session_id: String,
@@ -473,14 +685,14 @@ struct QuickJsNativeContextRecord {
     context: *mut qjs::JSContext,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 #[derive(Default)]
 struct QuickJsNativeStore {
     sessions: BTreeMap<String, QuickJsNativeSessionRecord>,
     contexts: BTreeMap<String, QuickJsNativeContextRecord>,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 #[derive(Default)]
 struct QuickJsRuntimeOpaque {
     active_context_id: Option<String>,
@@ -489,7 +701,7 @@ struct QuickJsRuntimeOpaque {
     bridges_by_context: BTreeMap<String, QuickJsRuntimeBridge>,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 struct QuickJsRuntimeBridge {
     cwd: String,
     argv: Vec<String>,
@@ -502,13 +714,13 @@ struct QuickJsRuntimeBridge {
     exit_code: Option<i32>,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 struct QuickJsStoredTimer {
     timer: HostRuntimeTimer,
     callback_id: String,
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 impl Clone for QuickJsRuntimeBridge {
     fn clone(&self) -> Self {
         Self {
@@ -525,7 +737,7 @@ impl Clone for QuickJsRuntimeBridge {
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 impl QuickJsNativeStore {
     fn boot_session(&mut self, handle: &EngineSessionHandle) -> Result<(), String> {
         let runtime = unsafe { qjs::JS_NewRuntime() };
@@ -838,6 +1050,7 @@ impl QuickJsNativeStore {
                 .map(|entry| entry.timer.clone())
                 .collect(),
             exit_code: bridge.exit_code,
+            bridge_ready: true,
         }))
     }
 
@@ -1061,7 +1274,7 @@ impl QuickJsNativeStore {
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 unsafe extern "C" fn quickjs_native_module_normalize(
     ctx: *mut qjs::JSContext,
     module_base_name: *const ::core::ffi::c_char,
@@ -1116,7 +1329,7 @@ unsafe extern "C" fn quickjs_native_module_normalize(
     quickjs_strdup(ctx, &resolved)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 unsafe extern "C" fn quickjs_native_module_loader(
     ctx: *mut qjs::JSContext,
     module_name: *const ::core::ffi::c_char,
@@ -1164,7 +1377,7 @@ unsafe extern "C" fn quickjs_native_module_loader(
     quickjs_compile_registered_module(ctx, &module_name, source)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_compile_registered_module(
     ctx: *mut qjs::JSContext,
     module_name: &str,
@@ -1217,7 +1430,7 @@ fn quickjs_compile_registered_module(
     module
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 unsafe extern "C" fn quickjs_runtime_invoke(
     ctx: *mut qjs::JSContext,
     _this_val: qjs::JSValue,
@@ -1549,7 +1762,7 @@ unsafe extern "C" fn quickjs_runtime_invoke(
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_throw_module_error(ctx: *mut qjs::JSContext, message: &str) -> *mut qjs::JSModuleDef {
     let value =
         unsafe { qjs::JS_NewStringLen(ctx, message.as_ptr().cast(), message.len() as qjs::size_t) };
@@ -1559,12 +1772,12 @@ fn quickjs_throw_module_error(ctx: *mut qjs::JSContext, message: &str) -> *mut q
     ptr::null_mut()
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_runtime_opaque(opaque: *mut c_void) -> Option<&'static mut QuickJsRuntimeOpaque> {
     (!opaque.is_null()).then(|| unsafe { &mut *opaque.cast::<QuickJsRuntimeOpaque>() })
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_runtime_opaque_from_context(
     ctx: *mut qjs::JSContext,
 ) -> Option<&'static mut QuickJsRuntimeOpaque> {
@@ -1573,7 +1786,7 @@ fn quickjs_runtime_opaque_from_context(
     quickjs_runtime_opaque(opaque)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_strdup(ctx: *mut qjs::JSContext, value: &str) -> *mut ::core::ffi::c_char {
     let size = value.len() + 1;
     let pointer = unsafe { qjs::js_malloc(ctx, size as qjs::size_t) }.cast::<u8>();
@@ -1587,7 +1800,7 @@ fn quickjs_strdup(ctx: *mut qjs::JSContext, value: &str) -> *mut ::core::ffi::c_
     pointer.cast()
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_install_runtime_bridge(ctx: *mut qjs::JSContext) -> Result<(), String> {
     let global = unsafe { qjs::JS_GetGlobalObject(ctx) };
     if unsafe { qjs::JS_IsException(global) } {
@@ -1621,22 +1834,22 @@ fn quickjs_install_runtime_bridge(ctx: *mut qjs::JSContext) -> Result<(), String
     Ok(())
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_object(ctx: *mut qjs::JSContext) -> qjs::JSValue {
     unsafe { qjs::JS_NewObject(ctx) }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_bool(value: bool) -> qjs::JSValue {
     if value { qjs::JS_TRUE } else { qjs::JS_FALSE }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_string(ctx: *mut qjs::JSContext, value: &str) -> qjs::JSValue {
     unsafe { qjs::JS_NewStringLen(ctx, value.as_ptr().cast(), value.len() as qjs::size_t) }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_string_array(ctx: *mut qjs::JSContext, values: &[String]) -> qjs::JSValue {
     let array = unsafe { qjs::JS_NewArray(ctx) };
     for (index, value) in values.iter().enumerate() {
@@ -1648,7 +1861,7 @@ fn quickjs_new_string_array(ctx: *mut qjs::JSContext, values: &[String]) -> qjs:
     array
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_string_map(
     ctx: *mut qjs::JSContext,
     values: &BTreeMap<String, String>,
@@ -1662,7 +1875,7 @@ fn quickjs_new_string_map(
     object
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_workspace_entry(
     ctx: *mut qjs::JSContext,
     entry: &WorkspaceEntrySummary,
@@ -1688,7 +1901,7 @@ fn quickjs_new_workspace_entry(
     object
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_new_workspace_entries(
     ctx: *mut qjs::JSContext,
     entries: &[WorkspaceEntrySummary],
@@ -1703,7 +1916,7 @@ fn quickjs_new_workspace_entries(
     array
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_wrap_path_value(
     ctx: *mut qjs::JSContext,
     value: Result<String, String>,
@@ -1722,7 +1935,7 @@ fn quickjs_wrap_path_value(
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_set_property(
     ctx: *mut qjs::JSContext,
     object: qjs::JSValue,
@@ -1737,7 +1950,7 @@ fn quickjs_set_property(
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_throw_value_error(ctx: *mut qjs::JSContext, message: &str) -> qjs::JSValue {
     let value = quickjs_new_string(ctx, message);
     unsafe {
@@ -1746,7 +1959,7 @@ fn quickjs_throw_value_error(ctx: *mut qjs::JSContext, message: &str) -> qjs::JS
     qjs::JS_EXCEPTION
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_value_to_string(
     ctx: *mut qjs::JSContext,
     value: qjs::JSValue,
@@ -1764,7 +1977,7 @@ fn quickjs_value_to_string(
     Ok(rendered)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_get_required_string_property(
     ctx: *mut qjs::JSContext,
     payload: qjs::JSValue,
@@ -1783,7 +1996,7 @@ fn quickjs_get_required_string_property(
     rendered
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_get_optional_bool_property(
     ctx: *mut qjs::JSContext,
     payload: qjs::JSValue,
@@ -1802,7 +2015,7 @@ fn quickjs_get_optional_bool_property(
     result
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_get_optional_i32_property(
     ctx: *mut qjs::JSContext,
     payload: qjs::JSValue,
@@ -1822,7 +2035,7 @@ fn quickjs_get_optional_i32_property(
     result
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_get_optional_console_level_property(
     ctx: *mut qjs::JSContext,
     payload: qjs::JSValue,
@@ -1838,7 +2051,7 @@ fn quickjs_get_optional_console_level_property(
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_get_string_array_property(
     ctx: *mut qjs::JSContext,
     payload: qjs::JSValue,
@@ -1885,7 +2098,7 @@ fn quickjs_get_string_array_property(
     Ok(result)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_extract_bytes(
     ctx: *mut qjs::JSContext,
     value: qjs::JSValue,
@@ -1913,7 +2126,7 @@ fn quickjs_extract_bytes(
     Err("bytes must be string, ArrayBuffer, or Uint8Array".into())
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_bridge_resolve_path(cwd: &str, path: &str) -> String {
     if path.starts_with('/') {
         normalize_posix_path(path)
@@ -1922,7 +2135,7 @@ fn quickjs_bridge_resolve_path(cwd: &str, path: &str) -> String {
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_path_resolve(
     ctx: *mut qjs::JSContext,
     bridge: &QuickJsRuntimeBridge,
@@ -1940,7 +2153,7 @@ fn quickjs_path_resolve(
     Ok(current)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_path_join(ctx: *mut qjs::JSContext, payload: qjs::JSValue) -> Result<String, String> {
     let segments = quickjs_get_string_array_property(ctx, payload, "segments")?;
     if segments.is_empty() {
@@ -1949,7 +2162,7 @@ fn quickjs_path_join(ctx: *mut qjs::JSContext, payload: qjs::JSValue) -> Result<
     Ok(normalize_posix_path(&segments.join("/")))
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_materialize_module_source(
     specifier: &str,
     source: &str,
@@ -1999,7 +2212,7 @@ export default __cjs_default;
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_ensure_module_registered(
     runtime: &mut QuickJsRuntimeOpaque,
     context_id: &str,
@@ -2067,7 +2280,7 @@ fn quickjs_ensure_module_registered(
     Ok(())
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_runtime_resolve_specifier(
     runtime: &QuickJsRuntimeOpaque,
     context_id: &str,
@@ -2097,6 +2310,11 @@ fn quickjs_runtime_resolve_specifier(
         } else {
             normalize_posix_path(&format!("{base_dir}/{specifier}"))
         };
+        if let Some(mapped) =
+            quickjs_resolve_package_relative_browser_path(bridge, importer, &requested, specifier)?
+        {
+            return Ok(mapped);
+        }
         return quickjs_resolve_workspace_module(bridge, &requested);
     }
 
@@ -2107,7 +2325,7 @@ fn quickjs_runtime_resolve_specifier(
     quickjs_resolve_package_module(bridge, base_dir, specifier)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_collect_module_dependency_specifiers(
     source: &str,
     format: &HostRuntimeModuleFormat,
@@ -2141,7 +2359,7 @@ fn quickjs_collect_module_dependency_specifiers(
     specifiers
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_collect_string_literals_after_marker(
     source: &str,
     marker: &str,
@@ -2163,7 +2381,7 @@ fn quickjs_collect_string_literals_after_marker(
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_collect_line_prefixed_imports(source: &str, marker: &str, output: &mut Vec<String>) {
     for line in source.lines().map(str::trim_start) {
         if let Some(rest) = line.strip_prefix(marker) {
@@ -2178,7 +2396,7 @@ fn quickjs_collect_line_prefixed_imports(source: &str, marker: &str, output: &mu
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_resolve_workspace_module(
     bridge: &QuickJsRuntimeBridge,
     requested: &str,
@@ -2191,12 +2409,20 @@ fn quickjs_resolve_workspace_module(
     Err(format!("quickjs-ng module not found: {requested}"))
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_resolve_package_module(
     bridge: &QuickJsRuntimeBridge,
     importer_dir: &str,
     specifier: &str,
 ) -> Result<String, String> {
+    if specifier.starts_with('#') {
+        return quickjs_resolve_package_import_module(bridge, importer_dir, specifier);
+    }
+
+    if let Some(resolved) = quickjs_resolve_package_self_module(bridge, importer_dir, specifier)? {
+        return Ok(resolved);
+    }
+
     let (package_name, subpath) = quickjs_split_package_specifier(specifier);
     for package_root in quickjs_node_module_search_roots(importer_dir, &package_name) {
         let package_json_path = format!("{package_root}/package.json");
@@ -2204,28 +2430,14 @@ fn quickjs_resolve_package_module(
             .vfs
             .read(&package_json_path)
             .and_then(|file| serde_json::from_slice::<JsonValue>(&file.bytes).ok());
-
-        if let Some(subpath) = subpath.as_deref() {
-            let requested = normalize_posix_path(&format!("{package_root}/{subpath}"));
-            if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &requested) {
-                return Ok(resolved);
-            }
-        } else if let Some(manifest) = manifest {
-            let entry = manifest
-                .get("module")
-                .and_then(quickjs_json_string)
-                .or_else(|| manifest.get("main").and_then(quickjs_json_string));
-            if let Some(entry) = entry {
-                let requested = normalize_posix_path(&format!("{package_root}/{entry}"));
-                if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &requested) {
-                    return Ok(resolved);
-                }
-            }
-        }
-
-        if let Ok(resolved) =
-            quickjs_resolve_workspace_module(bridge, &format!("{package_root}/index"))
-        {
+        if let Ok(resolved) = quickjs_resolve_package_from_root(
+            bridge,
+            importer_dir,
+            &package_root,
+            manifest.as_ref(),
+            subpath.as_deref(),
+            specifier,
+        ) {
             return Ok(resolved);
         }
     }
@@ -2233,12 +2445,12 @@ fn quickjs_resolve_package_module(
     Err(format!("quickjs-ng module not found: {specifier}"))
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_json_string(value: &JsonValue) -> Option<String> {
     value.as_str().map(ToOwned::to_owned)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_workspace_module_candidates(requested: &str) -> Vec<String> {
     let normalized = normalize_posix_path(requested);
     [
@@ -2262,7 +2474,916 @@ fn quickjs_workspace_module_candidates(requested: &str) -> Vec<String> {
     .collect()
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
+fn quickjs_read_package_manifest_at(
+    bridge: &QuickJsRuntimeBridge,
+    package_root: &str,
+) -> Option<JsonValue> {
+    let package_json_path = format!("{package_root}/package.json");
+    bridge
+        .vfs
+        .read(&package_json_path)
+        .and_then(|file| serde_json::from_slice::<JsonValue>(&file.bytes).ok())
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_import_module(
+    bridge: &QuickJsRuntimeBridge,
+    importer_dir: &str,
+    specifier: &str,
+) -> Result<String, String> {
+    let Some(package_root) = quickjs_resolve_nearest_package_root(bridge, importer_dir) else {
+        return Err(format!("quickjs-ng module not found: {specifier}"));
+    };
+    let Some(manifest) = quickjs_read_package_manifest_at(bridge, &package_root) else {
+        return Err(format!("quickjs-ng module not found: {specifier}"));
+    };
+    let Some(imports_field) = manifest.get("imports") else {
+        return Err(format!("quickjs-ng module not found: {specifier}"));
+    };
+
+    match quickjs_resolve_package_export_target(imports_field, specifier) {
+        QuickJsPackageExportResolution::Target(target) => {
+            quickjs_resolve_package_export_specifier(bridge, importer_dir, &package_root, &target)
+        }
+        QuickJsPackageExportResolution::Blocked | QuickJsPackageExportResolution::Missing => {
+            Err(format!("quickjs-ng module not found: {specifier}"))
+        }
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_self_module(
+    bridge: &QuickJsRuntimeBridge,
+    importer_dir: &str,
+    specifier: &str,
+) -> Result<Option<String>, String> {
+    let Some(package_root) = quickjs_resolve_nearest_package_root(bridge, importer_dir) else {
+        return Ok(None);
+    };
+    let Some(manifest) = quickjs_read_package_manifest_at(bridge, &package_root) else {
+        return Ok(None);
+    };
+    let Some(package_name) = manifest.get("name").and_then(JsonValue::as_str) else {
+        return Ok(None);
+    };
+
+    if specifier != package_name && !specifier.starts_with(&format!("{package_name}/")) {
+        return Ok(None);
+    }
+
+    let remainder = specifier
+        .strip_prefix(package_name)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let resolved = quickjs_resolve_package_from_root(
+        bridge,
+        importer_dir,
+        &package_root,
+        Some(&manifest),
+        if remainder.is_empty() {
+            None
+        } else {
+            Some(remainder)
+        },
+        specifier,
+    )?;
+    Ok(Some(resolved))
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_from_root(
+    bridge: &QuickJsRuntimeBridge,
+    importer_dir: &str,
+    package_root: &str,
+    manifest: Option<&JsonValue>,
+    remainder: Option<&str>,
+    requested_specifier: &str,
+) -> Result<String, String> {
+    if let Some(manifest) = manifest {
+        if let Some(exports_field) = manifest.get("exports") {
+            let export_subpath = remainder
+                .map(|path| format!("./{path}"))
+                .unwrap_or_else(|| ".".to_string());
+            match quickjs_resolve_package_export_target(exports_field, &export_subpath) {
+                QuickJsPackageExportResolution::Target(target) => {
+                    return quickjs_resolve_package_export_specifier(
+                        bridge,
+                        importer_dir,
+                        package_root,
+                        &target,
+                    );
+                }
+                QuickJsPackageExportResolution::Blocked
+                | QuickJsPackageExportResolution::Missing => {
+                    return Err(format!("quickjs-ng module not found: {requested_specifier}"));
+                }
+            }
+        }
+
+        if remainder.is_none() {
+            if let Some(browser_entry) = manifest.get("browser").and_then(JsonValue::as_str) {
+                return quickjs_resolve_package_export_specifier(
+                    bridge,
+                    importer_dir,
+                    package_root,
+                    browser_entry,
+                );
+            }
+        } else if let Some(remainder) = remainder {
+            match quickjs_resolve_package_browser_subpath(manifest, package_root, remainder) {
+                QuickJsBrowserMappingResolution::Target(target) => {
+                    return quickjs_resolve_workspace_module(bridge, &target);
+                }
+                QuickJsBrowserMappingResolution::Blocked => {
+                    return Err(format!("quickjs-ng module not found: {requested_specifier}"));
+                }
+                QuickJsBrowserMappingResolution::NotMapped => {}
+            }
+        }
+    }
+
+    if let Some(remainder) = remainder {
+        let requested = normalize_posix_path(&format!("{package_root}/{remainder}"));
+        if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &requested) {
+            return Ok(resolved);
+        }
+    } else if let Some(manifest) = manifest {
+        let entry = manifest
+            .get("module")
+            .and_then(quickjs_json_string)
+            .or_else(|| manifest.get("main").and_then(quickjs_json_string));
+        if let Some(entry) = entry {
+            let requested = match quickjs_resolve_legacy_browser_entry(manifest, package_root, &entry)
+            {
+                QuickJsBrowserMappingResolution::Target(target) => target,
+                QuickJsBrowserMappingResolution::Blocked => {
+                    return Err(format!("quickjs-ng module not found: {requested_specifier}"));
+                }
+                QuickJsBrowserMappingResolution::NotMapped => {
+                    normalize_posix_path(&format!("{package_root}/{entry}"))
+                }
+            };
+            if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &requested) {
+                return Ok(resolved);
+            }
+        }
+    }
+
+    if let Ok(resolved) = quickjs_resolve_workspace_module(bridge, &format!("{package_root}/index"))
+    {
+        return Ok(resolved);
+    }
+
+    Err(format!("quickjs-ng module not found: {requested_specifier}"))
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_export_specifier(
+    bridge: &QuickJsRuntimeBridge,
+    importer_dir: &str,
+    package_root: &str,
+    target: &str,
+) -> Result<String, String> {
+    if target.starts_with('.') {
+        return quickjs_resolve_workspace_module(
+            bridge,
+            &normalize_posix_path(&format!("{package_root}/{target}")),
+        );
+    }
+
+    if target.starts_with('/') {
+        return quickjs_resolve_workspace_module(bridge, target);
+    }
+
+    quickjs_resolve_package_module(bridge, importer_dir, target)
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_relative_browser_path(
+    bridge: &QuickJsRuntimeBridge,
+    importer: Option<&str>,
+    requested_path: &str,
+    requested_specifier: &str,
+) -> Result<Option<String>, String> {
+    let Some(importer_path) = importer.filter(|value| value.starts_with("/workspace")) else {
+        return Ok(None);
+    };
+    let Some(package_root) = quickjs_resolve_nearest_package_root(bridge, quickjs_dirname(importer_path))
+    else {
+        return Ok(None);
+    };
+    if !requested_path.starts_with(&format!("{package_root}/")) && requested_path != package_root {
+        return Ok(None);
+    }
+    let Some(manifest) = quickjs_read_package_manifest_at(bridge, &package_root) else {
+        return Ok(None);
+    };
+
+    match quickjs_resolve_package_browser_path(
+        &manifest,
+        &package_root,
+        requested_path,
+        requested_specifier,
+    ) {
+        QuickJsBrowserMappingResolution::Target(target) => Ok(Some(target)),
+        QuickJsBrowserMappingResolution::Blocked => {
+            Err(format!("quickjs-ng module not found: {requested_specifier}"))
+        }
+        QuickJsBrowserMappingResolution::NotMapped => Ok(None),
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_browser_subpath(
+    manifest: &JsonValue,
+    package_root: &str,
+    remainder: &str,
+) -> QuickJsBrowserMappingResolution {
+    let requested = normalize_posix_path(&format!("{package_root}/{remainder}"));
+    quickjs_resolve_package_browser_path(manifest, package_root, &requested, remainder)
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_legacy_browser_entry(
+    manifest: &JsonValue,
+    package_root: &str,
+    entry: &str,
+) -> QuickJsBrowserMappingResolution {
+    let requested = normalize_posix_path(&format!("{package_root}/{entry}"));
+    quickjs_resolve_package_browser_path(manifest, package_root, &requested, entry)
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_browser_path(
+    manifest: &JsonValue,
+    package_root: &str,
+    requested_path: &str,
+    fallback: &str,
+) -> QuickJsBrowserMappingResolution {
+    let Some(browser_field) = manifest.get("browser").and_then(JsonValue::as_object) else {
+        return QuickJsBrowserMappingResolution::NotMapped;
+    };
+    let Some(browser_subpath) = quickjs_to_package_browser_subpath(requested_path, package_root) else {
+        return QuickJsBrowserMappingResolution::NotMapped;
+    };
+    match quickjs_resolve_browser_object_mapping(browser_field, &browser_subpath) {
+        QuickJsBrowserMappingResolution::Target(mapped) => {
+            if mapped.starts_with('.') {
+                QuickJsBrowserMappingResolution::Target(normalize_posix_path(&format!(
+                    "{package_root}/{mapped}"
+                )))
+            } else if mapped.starts_with('/') {
+                QuickJsBrowserMappingResolution::Target(normalize_posix_path(&mapped))
+            } else {
+                QuickJsBrowserMappingResolution::Target(normalize_posix_path(&format!(
+                    "{package_root}/{fallback}"
+                )))
+            }
+        }
+        other => other,
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_browser_object_mapping(
+    browser_field: &serde_json::Map<String, JsonValue>,
+    subpath: &str,
+) -> QuickJsBrowserMappingResolution {
+    for candidate in quickjs_build_browser_subpath_candidates(subpath) {
+        let Some(mapped) = browser_field.get(&candidate) else {
+            continue;
+        };
+
+        return match mapped {
+            JsonValue::String(value) if !value.is_empty() => {
+                QuickJsBrowserMappingResolution::Target(value.clone())
+            }
+            JsonValue::Bool(false) => QuickJsBrowserMappingResolution::Blocked,
+            _ => QuickJsBrowserMappingResolution::NotMapped,
+        };
+    }
+
+    QuickJsBrowserMappingResolution::NotMapped
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_build_browser_subpath_candidates(subpath: &str) -> Vec<String> {
+    let normalized = quickjs_normalize_browser_subpath(subpath);
+    if let Some(stripped) = normalized.strip_prefix("./") {
+        vec![normalized.clone(), stripped.to_string()]
+    } else {
+        vec![normalized]
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_normalize_browser_subpath(subpath: &str) -> String {
+    if subpath == "." {
+        ".".into()
+    } else if subpath.starts_with("./") {
+        subpath.to_string()
+    } else {
+        format!("./{}", subpath.trim_start_matches('/'))
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_to_package_browser_subpath(requested_path: &str, package_root: &str) -> Option<String> {
+    if requested_path == package_root {
+        return Some(".".into());
+    }
+    if !requested_path.starts_with(&format!("{package_root}/")) {
+        return None;
+    }
+    Some(format!(".{}", &requested_path[package_root.len()..]))
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_package_export_target(
+    exports_field: &JsonValue,
+    subpath: &str,
+) -> QuickJsPackageExportResolution {
+    match exports_field {
+        JsonValue::String(value) => {
+            if subpath == "." {
+                QuickJsPackageExportResolution::Target(value.clone())
+            } else {
+                QuickJsPackageExportResolution::Missing
+            }
+        }
+        JsonValue::Null => {
+            if subpath == "." {
+                QuickJsPackageExportResolution::Blocked
+            } else {
+                QuickJsPackageExportResolution::Missing
+            }
+        }
+        JsonValue::Object(map) => {
+            if quickjs_has_conditional_export_keys(map) {
+                if subpath == "." {
+                    quickjs_resolve_conditional_export_value(exports_field)
+                } else {
+                    QuickJsPackageExportResolution::Missing
+                }
+            } else {
+                if let Some(value) = map.get(subpath) {
+                    let resolved = quickjs_resolve_conditional_export_value(value);
+                    if !matches!(resolved, QuickJsPackageExportResolution::Missing) {
+                        return resolved;
+                    }
+                }
+
+                if subpath == "." {
+                    if let Some(value) = map.get(".") {
+                        let resolved = quickjs_resolve_conditional_export_value(value);
+                        if !matches!(resolved, QuickJsPackageExportResolution::Missing) {
+                            return resolved;
+                        }
+                    }
+                }
+
+                quickjs_resolve_wildcard_export_target(map, subpath)
+            }
+        }
+        _ => QuickJsPackageExportResolution::Missing,
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_conditional_export_value(value: &JsonValue) -> QuickJsPackageExportResolution {
+    match value {
+        JsonValue::String(target) => QuickJsPackageExportResolution::Target(target.clone()),
+        JsonValue::Null => QuickJsPackageExportResolution::Blocked,
+        JsonValue::Object(map) => {
+            for condition in ["browser", "import", "module", "default", "require"] {
+                if let Some(nested) = map.get(condition) {
+                    let resolved = quickjs_resolve_conditional_export_value(nested);
+                    if !matches!(resolved, QuickJsPackageExportResolution::Missing) {
+                        return resolved;
+                    }
+                }
+            }
+            QuickJsPackageExportResolution::Missing
+        }
+        _ => QuickJsPackageExportResolution::Missing,
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_wildcard_export_target(
+    exports_field: &serde_json::Map<String, JsonValue>,
+    subpath: &str,
+) -> QuickJsPackageExportResolution {
+    for (key, value) in exports_field {
+        if !key.contains('*') {
+            continue;
+        }
+
+        let mut parts = key.splitn(2, '*');
+        let prefix = parts.next().unwrap_or_default();
+        let suffix = parts.next().unwrap_or_default();
+
+        if !subpath.starts_with(prefix) || !subpath.ends_with(suffix) {
+            continue;
+        }
+
+        let matched = &subpath[prefix.len()..subpath.len().saturating_sub(suffix.len())];
+        match quickjs_resolve_conditional_export_value(value) {
+            QuickJsPackageExportResolution::Target(target) => {
+                return QuickJsPackageExportResolution::Target(target.replace('*', matched));
+            }
+            QuickJsPackageExportResolution::Blocked => {
+                return QuickJsPackageExportResolution::Blocked;
+            }
+            QuickJsPackageExportResolution::Missing => continue,
+        }
+    }
+
+    QuickJsPackageExportResolution::Missing
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_has_conditional_export_keys(map: &serde_json::Map<String, JsonValue>) -> bool {
+    ["browser", "import", "module", "default", "require"]
+        .iter()
+        .any(|key| map.contains_key(*key))
+}
+
+#[cfg(quickjs_ng_native)]
+fn quickjs_resolve_nearest_package_root(
+    bridge: &QuickJsRuntimeBridge,
+    importer_dir: &str,
+) -> Option<String> {
+    let mut current = normalize_posix_path(importer_dir);
+
+    while current.starts_with("/workspace") {
+        let package_json_path = format!("{current}/package.json");
+        if bridge.vfs.read(&package_json_path).is_some() {
+            return Some(current);
+        }
+        if current == "/workspace" {
+            break;
+        }
+        current = quickjs_dirname(&current).to_string();
+    }
+
+    None
+}
+
+#[cfg(quickjs_ng_native)]
+enum QuickJsPackageExportResolution {
+    Target(String),
+    Blocked,
+    Missing,
+}
+
+#[cfg(quickjs_ng_native)]
+enum QuickJsBrowserMappingResolution {
+    Target(String),
+    Blocked,
+    NotMapped,
+}
+
+fn browser_bootstrap_bridge_summary(
+    plan: &HostRuntimeBootstrapPlan,
+    loader_plan: &HostRuntimeModuleLoaderPlan,
+) -> String {
+    let engine_label = if cfg!(quickjs_ng_native) {
+        "quickjs-ng browser c-vm"
+    } else {
+        "quickjs-ng browser vm harness"
+    };
+    format!(
+        "{engine_label} bootstrapped {} across {} registered modules and {} loader roots",
+        plan.bootstrap_specifier,
+        plan.modules.len(),
+        loader_plan.node_module_search_roots.len()
+    )
+}
+
+#[allow(dead_code)]
+fn browser_bridge_resolve_path(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        normalize_posix_path(path)
+    } else {
+        normalize_posix_path(&format!("{cwd}/{path}"))
+    }
+}
+
+#[allow(dead_code)]
+fn browser_bridge_path_resolve(cwd: &str, segments: &[String]) -> String {
+    let mut current = cwd.to_string();
+    for segment in segments {
+        if segment.is_empty() {
+            continue;
+        }
+        current = browser_bridge_resolve_path(&current, segment);
+    }
+    current
+}
+
+fn browser_bootstrap_bridge_script(
+    state: &BrowserRuntimeBridgeState,
+    plan: &HostRuntimeBootstrapPlan,
+    loader_plan: &HostRuntimeModuleLoaderPlan,
+) -> Result<String, String> {
+    let bootstrap_specifier =
+        serde_json::to_string(&plan.bootstrap_specifier).map_err(|error| error.to_string())?;
+    let entrypoint = serde_json::to_string(&plan.entrypoint).map_err(|error| error.to_string())?;
+    let cwd = serde_json::to_string(&state.cwd).map_err(|error| error.to_string())?;
+    let argv = serde_json::to_string(&state.argv).map_err(|error| error.to_string())?;
+    let env = serde_json::to_string(&state.env).map_err(|error| error.to_string())?;
+    let files = serde_json::to_string(&state.file_records()).map_err(|error| error.to_string())?;
+    let directories =
+        serde_json::to_string(&state.directory_records()).map_err(|error| error.to_string())?;
+    let module_specifiers = serde_json::to_string(
+        &plan
+            .modules
+            .iter()
+            .map(|module| module.specifier.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| error.to_string())?;
+    let module_entries = serde_json::to_string(
+        &plan
+            .modules
+            .iter()
+            .map(|module| (module.specifier.as_str(), module.source.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| error.to_string())?;
+    let loader_roots =
+        serde_json::to_string(&loader_plan.node_module_search_roots).map_err(|error| {
+            error.to_string()
+        })?;
+
+    Ok(format!(
+        r#"
+const runtime = globalThis.__runtime || (globalThis.__runtime = {{}});
+runtime.bootstrap = {{
+  specifier: {bootstrap_specifier},
+  entrypoint: {entrypoint},
+  moduleSpecifiers: {module_specifiers},
+  loaderRoots: {loader_roots},
+}};
+runtime.__bridge = {{
+  cwd: {cwd},
+  argv: {argv},
+  env: {env},
+  clockMs: 0,
+  nextTimerId: 1,
+  timers: new Map(),
+  timerCallbacks: new Map(),
+  pendingJobs: 0,
+  files: new Map({files}.map((file) => [file.path, file])),
+  directories: new Set({directories}),
+  events: [],
+  exitCode: null,
+  bridgeReady: false,
+}};
+runtime.__modules = new Map({module_entries});
+function normalizePosixPath(input) {{
+  const raw = String(input ?? "");
+  const absolute = raw.startsWith("/");
+  const parts = [];
+  for (const part of raw.split("/")) {{
+    if (!part || part === ".") continue;
+    if (part === "..") {{
+      parts.pop();
+      continue;
+    }}
+    parts.push(part);
+  }}
+  if (!parts.length) {{
+    return absolute ? "/" : ".";
+  }}
+  return absolute ? `/${{parts.join("/")}}` : parts.join("/");
+}}
+function resolvePath(base, target) {{
+  const value = String(target ?? "");
+  if (value.startsWith("/")) {{
+    return normalizePosixPath(value);
+  }}
+  return normalizePosixPath(`${{base}}/${{value}}`);
+}}
+function pathResolve(cwd, segments) {{
+  let current = cwd;
+  for (const segment of segments ?? []) {{
+    if (!segment) continue;
+    current = resolvePath(current, segment);
+  }}
+  return current;
+}}
+function pathJoin(segments) {{
+  return normalizePosixPath((segments ?? []).join("/"));
+}}
+function pathDirname(path) {{
+  const normalized = normalizePosixPath(path);
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) return normalized.startsWith("/") ? "/" : ".";
+  return normalized.slice(0, index);
+}}
+function pathBasename(path) {{
+  const normalized = normalizePosixPath(path);
+  return normalized.split("/").pop() || normalized;
+}}
+function pathExtname(path) {{
+  const base = pathBasename(path);
+  const index = base.lastIndexOf(".");
+  return index > 0 ? base.slice(index) : "";
+}}
+function ensureDir(path) {{
+  const normalized = normalizePosixPath(path);
+  const parts = normalized.split("/").filter(Boolean);
+  let current = normalized.startsWith("/") ? "/" : "";
+  runtime.__bridge.directories.add(normalized.startsWith("/") ? "/" : ".");
+  for (const part of parts) {{
+    current = current === "/" ? `/${{part}}` : current ? `${{current}}/${{part}}` : part;
+    runtime.__bridge.directories.add(current);
+  }}
+  return normalized;
+}}
+function exists(path) {{
+  return runtime.__bridge.files.has(path) || runtime.__bridge.directories.has(path);
+}}
+function encodeUtf8Like(value) {{
+  return [...String(value ?? "")].map((char) => char.charCodeAt(0) & 0xff);
+}}
+function decodeUtf8Like(bytes) {{
+  return String.fromCharCode(...Array.from(bytes ?? [], (value) => Number(value) || 0));
+}}
+function stat(path) {{
+  const file = runtime.__bridge.files.get(path);
+  if (file) {{
+    return {{
+      path: file.path,
+      kind: "File",
+      size: file.is_text ? encodeUtf8Like(file.text_content ?? "").length : file.bytes.length,
+      is_text: file.is_text,
+    }};
+  }}
+  if (runtime.__bridge.directories.has(path)) {{
+    return {{
+      path,
+      kind: "Directory",
+      size: 0,
+      is_text: false,
+    }};
+  }}
+  return null;
+}}
+function readDir(path) {{
+  if (!runtime.__bridge.directories.has(path)) {{
+    throw new Error(`quickjs-ng browser bridge fs.read-dir missing directory: ${{path}}`);
+  }}
+  const entries = new Map();
+  const parentOf = (value) => {{
+    const normalized = normalizePosixPath(value);
+    const index = normalized.lastIndexOf("/");
+    if (index <= 0) return normalized.startsWith("/") ? "/" : ".";
+    return normalized.slice(0, index);
+  }};
+  for (const directory of runtime.__bridge.directories) {{
+    if (directory !== path && parentOf(directory) === path) {{
+      entries.set(directory, {{
+        path: directory,
+        kind: "Directory",
+        size: 0,
+        is_text: false,
+      }});
+    }}
+  }}
+  for (const [filePath, file] of runtime.__bridge.files) {{
+    if (parentOf(filePath) === path) {{
+      entries.set(filePath, {{
+        path: filePath,
+        kind: "File",
+        size: file.is_text ? encodeUtf8Like(file.text_content ?? "").length : file.bytes.length,
+        is_text: file.is_text,
+      }});
+    }}
+  }}
+  return [...entries.values()];
+}}
+runtime.invoke = (kind, payload = {{}}) => {{
+  switch (kind) {{
+    case "process.cwd":
+      return runtime.__bridge.cwd;
+    case "process.chdir": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      if (!runtime.__bridge.directories.has(resolved)) {{
+        throw new Error(`quickjs-ng browser bridge process.chdir target is not a directory: ${{resolved}}`);
+      }}
+      runtime.__bridge.cwd = resolved;
+      return undefined;
+    }}
+    case "process.exit":
+      runtime.__bridge.exitCode = payload.code ?? 0;
+      return undefined;
+    case "process.argv":
+      return [...runtime.__bridge.argv];
+    case "process.env":
+      return {{ ...runtime.__bridge.env }};
+    case "fs.exists": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      return {{ exists: exists(resolved) }};
+    }}
+    case "fs.stat": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      const entry = stat(resolved);
+      if (!entry) {{
+        throw new Error(`quickjs-ng browser bridge fs.stat missing path: ${{resolved}}`);
+      }}
+      return {{ entry }};
+    }}
+    case "fs.read-dir": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      return {{ entries: readDir(resolved) }};
+    }}
+    case "fs.read-file": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      const file = runtime.__bridge.files.get(resolved);
+      if (!file) {{
+        throw new Error(`quickjs-ng browser bridge fs.read-file missing path: ${{resolved}}`);
+      }}
+      return file.is_text ? (file.text_content ?? "") : Uint8Array.from(file.bytes);
+    }}
+    case "fs.mkdir": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      ensureDir(resolved);
+      return undefined;
+    }}
+    case "fs.write-file": {{
+      const resolved = resolvePath(runtime.__bridge.cwd, payload.path);
+      ensureDir(pathDirname(resolved));
+      const isText = Boolean(payload.isText);
+      let bytes = [];
+      let textContent = null;
+      if (typeof payload.bytes === "string") {{
+        textContent = payload.bytes;
+        bytes = encodeUtf8Like(payload.bytes);
+      }} else if (payload.bytes instanceof Uint8Array) {{
+        bytes = [...payload.bytes];
+        textContent = isText ? decodeUtf8Like(payload.bytes) : null;
+      }} else if (Array.isArray(payload.bytes)) {{
+        bytes = payload.bytes.map((value) => Number(value) || 0);
+        textContent = isText ? decodeUtf8Like(bytes) : null;
+      }}
+      runtime.__bridge.files.set(resolved, {{
+        path: resolved,
+        is_text: isText,
+        text_content: textContent,
+        bytes,
+      }});
+      return undefined;
+    }}
+    case "path.resolve":
+      return {{ value: pathResolve(runtime.__bridge.cwd, payload.segments ?? []) }};
+    case "path.join":
+      return {{ value: pathJoin(payload.segments ?? []) }};
+    case "path.dirname":
+      return {{ value: pathDirname(payload.path ?? ".") }};
+    case "path.basename":
+      return {{ value: pathBasename(payload.path ?? "") }};
+    case "path.extname":
+      return {{ value: pathExtname(payload.path ?? "") }};
+    case "path.normalize":
+      return {{ value: normalizePosixPath(payload.path ?? ".") }};
+    case "console.emit": {{
+      const line = (payload.values ?? []).map((value) => String(value)).join(" ");
+      runtime.__bridge.events.push({{
+        kind: "console",
+        level: payload.level ?? "log",
+        line,
+      }});
+      return undefined;
+    }}
+    case "timers.schedule": {{
+      const delayMs = Number(payload.delayMs ?? 0);
+      const repeat = Boolean(payload.repeat);
+      const timerId = `browser-runtime-timer-${{runtime.__bridge.nextTimerId ?? 1}}`;
+      runtime.__bridge.nextTimerId = (runtime.__bridge.nextTimerId ?? 1) + 1;
+      runtime.__bridge.timers ??= new Map();
+      runtime.__bridge.timerCallbacks ??= new Map();
+      if (typeof payload.callback === "function") {{
+        runtime.__bridge.timerCallbacks.set(timerId, payload.callback);
+      }}
+      runtime.__bridge.timers.set(timerId, {{
+        timer_id: timerId,
+        kind: repeat ? "Interval" : "Timeout",
+        delay_ms: delayMs,
+        due_at_ms: (runtime.__bridge.clockMs ?? 0) + delayMs,
+      }});
+      return timerId;
+    }}
+    case "timers.clear":
+      runtime.__bridge.timerCallbacks?.delete(String(payload.timerId));
+      runtime.__bridge.timers?.delete(String(payload.timerId));
+      return undefined;
+    default:
+      throw new Error(`runtime bridge is not attached for command: ${{kind}}`);
+  }}
+}};
+runtime.readRegisteredModule = (specifier) => runtime.__modules.get(String(specifier));
+runtime.listRegisteredModules = () => [...runtime.__modules.keys()];
+runtime.__fireTimers = (nowMs, timerIds = []) => {{
+  runtime.__bridge.clockMs = Number(nowMs ?? runtime.__bridge.clockMs ?? 0);
+  let fired = 0;
+  for (const timerId of timerIds) {{
+    const timer = runtime.__bridge.timers?.get(String(timerId));
+    if (!timer) continue;
+    fired += 1;
+    runtime.__bridge.pendingJobs = (runtime.__bridge.pendingJobs ?? 0) + 1;
+    const callback = runtime.__bridge.timerCallbacks?.get(String(timerId));
+    if (typeof callback === "function") {{
+      callback();
+    }}
+    if (timer.kind === "Interval") {{
+      timer.due_at_ms = runtime.__bridge.clockMs + Number(timer.delay_ms ?? 0);
+      runtime.__bridge.timers.set(String(timerId), timer);
+    }} else {{
+      runtime.__bridge.timers?.delete(String(timerId));
+      runtime.__bridge.timerCallbacks?.delete(String(timerId));
+    }}
+  }}
+  return fired;
+}};
+runtime.__drainJobs = () => {{
+  const drained = Number(runtime.__bridge.pendingJobs ?? 0);
+  runtime.__bridge.pendingJobs = 0;
+  return drained;
+}};
+runtime.process = {{
+  cwd: () => runtime.invoke("process.cwd"),
+  chdir: (path) => runtime.invoke("process.chdir", {{ path }}),
+  exit: (code = 0) => runtime.invoke("process.exit", {{ code }}),
+  get argv() {{ return runtime.invoke("process.argv"); }},
+  get env() {{ return runtime.invoke("process.env"); }},
+  platform: "browser",
+}};
+runtime.fs = {{
+  existsSync: (path) => runtime.invoke("fs.exists", {{ path }}).exists,
+  statSync: (path) => runtime.invoke("fs.stat", {{ path }}).entry,
+  readdirSync: (path) => runtime.invoke("fs.read-dir", {{ path }}).entries.map((entry) => entry.path),
+  readFileSync: (path) => runtime.invoke("fs.read-file", {{ path }}),
+  mkdirSync: (path) => runtime.invoke("fs.mkdir", {{ path }}),
+  writeFileSync: (path, bytes, isText = false) => runtime.invoke("fs.write-file", {{ path, bytes, isText }}),
+}};
+runtime.path = {{
+  resolve: (...segments) => runtime.invoke("path.resolve", {{ segments }}).value,
+  join: (...segments) => runtime.invoke("path.join", {{ segments }}).value,
+  dirname: (path) => runtime.invoke("path.dirname", {{ path }}).value,
+  basename: (path) => runtime.invoke("path.basename", {{ path }}).value,
+  extname: (path) => runtime.invoke("path.extname", {{ path }}).value,
+  normalize: (path) => runtime.invoke("path.normalize", {{ path }}).value,
+}};
+const consoleSink = globalThis.console || {{}};
+runtime.console = {{
+  log: (...values) => {{
+    runtime.invoke("console.emit", {{ level: "log", values }});
+    return typeof consoleSink.log === "function" ? consoleSink.log(...values) : undefined;
+  }},
+  info: (...values) => {{
+    runtime.invoke("console.emit", {{ level: "info", values }});
+    return typeof consoleSink.info === "function" ? consoleSink.info(...values) : undefined;
+  }},
+  warn: (...values) => {{
+    runtime.invoke("console.emit", {{ level: "warn", values }});
+    return typeof consoleSink.warn === "function" ? consoleSink.warn(...values) : undefined;
+  }},
+  error: (...values) => {{
+    runtime.invoke("console.emit", {{ level: "error", values }});
+    return typeof consoleSink.error === "function" ? consoleSink.error(...values) : undefined;
+  }},
+}};
+globalThis.process = runtime.process;
+globalThis.fs = runtime.fs;
+globalThis.path = runtime.path;
+globalThis.Buffer = Uint8Array;
+globalThis.console = runtime.console;
+globalThis.setTimeout = (callback, delay = 0) => runtime.invoke("timers.schedule", {{ delayMs: delay, repeat: false, callback }});
+globalThis.clearTimeout = (timerId) => runtime.invoke("timers.clear", {{ timerId }});
+globalThis.setInterval = (callback, delay = 0) => runtime.invoke("timers.schedule", {{ delayMs: delay, repeat: true, callback }});
+globalThis.clearInterval = (timerId) => runtime.invoke("timers.clear", {{ timerId }});
+runtime.console.info(
+  `[browser-bootstrap] bridge-ready entry=${{runtime.bootstrap.entrypoint}} cwd=${{runtime.process.cwd()}}`
+);
+runtime.__bridge.bridgeReady = true;
+{summary}
+"#,
+        cwd = cwd,
+        argv = argv,
+        env = env,
+        files = files,
+        directories = directories,
+        module_entries = module_entries,
+        summary = serde_json::to_string(&browser_bootstrap_bridge_summary(plan, loader_plan))
+            .map_err(|error| error.to_string())?,
+    ))
+}
+
+#[cfg(quickjs_ng_native)]
 fn quickjs_split_package_specifier(specifier: &str) -> (String, Option<String>) {
     if let Some(stripped) = specifier.strip_prefix('@') {
         let mut parts = stripped.splitn(3, '/');
@@ -2279,7 +3400,7 @@ fn quickjs_split_package_specifier(specifier: &str) -> (String, Option<String>) 
     (package_name, subpath)
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_node_module_search_roots(importer_dir: &str, package_name: &str) -> Vec<String> {
     let mut roots = BTreeMap::new();
     let mut current = importer_dir.to_string();
@@ -2300,7 +3421,7 @@ fn quickjs_node_module_search_roots(importer_dir: &str, package_name: &str) -> V
     roots.into_values().collect()
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_detect_module_format(path: &str) -> HostRuntimeModuleFormat {
     if path.ends_with(".cjs") {
         HostRuntimeModuleFormat::CommonJs
@@ -2311,7 +3432,7 @@ fn quickjs_detect_module_format(path: &str) -> HostRuntimeModuleFormat {
     }
 }
 
-#[cfg(feature = "quickjs-ng-engine")]
+#[cfg(quickjs_ng_native)]
 fn quickjs_dirname(path: &str) -> &str {
     let normalized = path.trim_end_matches('/');
     match normalized.rfind('/') {
@@ -2394,6 +3515,9 @@ impl EngineAdapter for NullEngineAdapter {
         self.state
             .register_bootstrap(handle, plan, loader_plan, import_plans, "null engine")?;
         let mut outcome = self.state.mark_ready(handle, "null engine")?;
+        if let Some(context) = self.state.contexts.get_mut(&handle.engine_context_id) {
+            context.bridge_ready = true;
+        }
         outcome.result_summary = format!(
             "null-engine prepared bootstrap {} with {} modules across {} loader roots",
             plan.bootstrap_specifier,
@@ -2443,30 +3567,329 @@ impl EngineAdapter for NullEngineAdapter {
     }
 }
 
-impl EngineAdapter for QuickJsNgEngineAdapter {
+impl EngineAdapter for QuickJsNgBrowserEngineAdapter {
     fn descriptor(&self) -> EngineDescriptor {
         EngineDescriptor {
-            name: {
-                #[cfg(feature = "quickjs-ng-engine")]
-                {
-                    "quickjs-ng-native-bootstrap-loader"
-                }
-                #[cfg(not(feature = "quickjs-ng-engine"))]
-                {
-                    "quickjs-ng-stub"
-                }
+            name: if cfg!(quickjs_ng_native) {
+                "quickjs-ng-browser-c-vm"
+            } else {
+                "quickjs-ng-browser-vm-harness"
             },
-            supports_interrupts: true,
-            supports_module_loader: {
-                #[cfg(feature = "quickjs-ng-engine")]
+            supports_interrupts: {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 {
                     true
                 }
-                #[cfg(not(feature = "quickjs-ng-engine"))]
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                 {
-                    false
+                    true
                 }
             },
+            supports_module_loader: true,
+            supports_eval: true,
+            supports_job_queue: {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    true
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    true
+                }
+            },
+        }
+    }
+
+    fn plan_run(&self, request: &RunRequest) -> RunPlan {
+        let command_line = std::iter::once(request.command.as_str())
+            .chain(request.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        RunPlan {
+            cwd: request.cwd.clone(),
+            entrypoint: request.command.clone(),
+            command_line,
+            env_count: request.env.len(),
+            command_kind: RunCommandKind::NodeEntrypoint,
+            resolved_script: None,
+        }
+    }
+
+    fn boot_session(&mut self, spec: &EngineSessionSpec) -> Result<EngineSessionHandle, String> {
+        let handle = self.state.boot_session(spec, "quickjs-ng-browser-session");
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        self.native.boot_session(&handle)?;
+        Ok(handle)
+    }
+
+    fn dispose_session(&mut self, handle: &EngineSessionHandle) {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        self.native.dispose_session(handle);
+        self.state.dispose_session(handle);
+    }
+
+    fn create_context(&mut self, spec: &EngineContextSpec) -> Result<EngineContextHandle, String> {
+        let handle = self
+            .state
+            .create_context(
+                spec,
+                "quickjs-ng-browser-context",
+                "quickjs-ng-browser-vm-harness",
+            )?;
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        self.native.create_context(&handle)?;
+        Ok(handle)
+    }
+
+    fn describe_context(&self, handle: &EngineContextHandle) -> Option<EngineContextSnapshot> {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        let mut snapshot = self.state.describe_context(handle)?;
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        let snapshot = self.state.describe_context(handle)?;
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        if let Ok(modules) = self.native.list_modules(handle) {
+            snapshot.registered_modules = modules.len();
+        }
+        Some(snapshot)
+    }
+
+    fn eval(
+        &mut self,
+        handle: &EngineContextHandle,
+        request: &EngineEvalRequest,
+    ) -> Result<EngineEvalOutcome, String> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let _ = request;
+
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        {
+            self.native.activate_context(handle)?;
+            let (result_summary, pending_jobs) = self.native.eval(handle, request)?;
+            let context = self
+                .state
+                .contexts
+                .get_mut(&handle.engine_context_id)
+                .ok_or_else(|| {
+                    format!(
+                        "quickjs-ng-browser-vm-harness context not found: {}",
+                        handle.engine_context_id
+                    )
+                })?;
+            context.state = EngineContextState::Ready;
+            context.pending_jobs = pending_jobs;
+            return Ok(EngineEvalOutcome {
+                result_summary,
+                pending_jobs,
+                state: context.state.clone(),
+            });
+        }
+
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        {
+            let snapshot = self.state.describe_context(handle).ok_or_else(|| {
+                format!(
+                    "quickjs-ng-browser-vm-harness context not found: {}",
+                    handle.engine_context_id
+                )
+            })?;
+
+            Err(format!(
+                "quickjs-ng browser vm harness is ready for {} but only wasm32 browser target can execute it",
+                snapshot.entrypoint
+            ))
+        }
+    }
+
+    fn bootstrap(
+        &mut self,
+        handle: &EngineContextHandle,
+        plan: &HostRuntimeBootstrapPlan,
+        loader_plan: &HostRuntimeModuleLoaderPlan,
+        import_plans: &[HostRuntimeModuleImportPlan],
+        bridge: &EngineBootstrapBridge,
+    ) -> Result<EngineEvalOutcome, String> {
+        self.state
+            .register_bootstrap(
+                handle,
+                plan,
+                loader_plan,
+                import_plans,
+                "quickjs-ng-browser-vm-harness",
+            )?;
+
+        let bridge_state = BrowserRuntimeBridgeState::from_bootstrap_bridge(bridge);
+        self.browser_bridges
+            .insert(handle.engine_context_id.clone(), bridge_state.clone());
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        {
+            let script = browser_bootstrap_bridge_script(&bridge_state, plan, loader_plan)?;
+            self.native.register_bootstrap(handle, plan, import_plans, bridge)?;
+            self.native.activate_context(handle)?;
+            let _ = self.native.eval(
+                handle,
+                &EngineEvalRequest {
+                    filename: String::from("runtime:browser-bootstrap"),
+                    source: script,
+                    mode: EngineEvalMode::Script,
+                },
+            )?;
+            let bootstrap_source = plan
+                .modules
+                .iter()
+                .find(|module| module.specifier == plan.bootstrap_specifier)
+                .map(|module| module.source.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "quickjs-ng browser bootstrap module not registered: {}",
+                        plan.bootstrap_specifier
+                    )
+                })?;
+            let _ = self.native.eval(
+                handle,
+                &EngineEvalRequest {
+                    filename: plan.bootstrap_specifier.clone(),
+                    source: bootstrap_source,
+                    mode: EngineEvalMode::Module,
+                },
+            )?;
+            if let Some(bridge) = self.browser_bridges.get_mut(&handle.engine_context_id) {
+                bridge.bridge_ready = true;
+            }
+        }
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        if let Some(bridge) = self.browser_bridges.get_mut(&handle.engine_context_id) {
+            bridge.bridge_ready = true;
+            bridge.console_emit(
+                HostRuntimeConsoleLevel::Info,
+                &[format!(
+                    "[browser-bootstrap] bridge-ready entry={} cwd={}",
+                    plan.entrypoint, bridge.cwd
+                )],
+            );
+        }
+        let mut outcome = self
+            .state
+            .mark_ready(handle, "quickjs-ng-browser-vm-harness")?;
+        if let Some(context) = self.state.contexts.get_mut(&handle.engine_context_id) {
+            context.bridge_ready = self.browser_bridges.get(&handle.engine_context_id).map_or(
+                cfg!(quickjs_ng_native),
+                |bridge| bridge.bridge_ready,
+            );
+        }
+        outcome.result_summary = browser_bootstrap_bridge_summary(plan, loader_plan);
+        Ok(outcome)
+    }
+
+    fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        let drain = self.native.drain_jobs(handle)?;
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        let drain = if let Some(bridge) = self.browser_bridges.get_mut(&handle.engine_context_id) {
+            bridge.drain_jobs()
+        } else {
+            self.state
+                .drain_jobs(handle, "quickjs-ng-browser-vm-harness")?
+        };
+        if let Some(context) = self.state.contexts.get_mut(&handle.engine_context_id) {
+            context.pending_jobs = drain.pending_jobs;
+            if context.state != EngineContextState::Disposed {
+                context.state = EngineContextState::Ready;
+            }
+        }
+        Ok(drain)
+    }
+
+    fn list_modules(
+        &self,
+        handle: &EngineContextHandle,
+    ) -> Result<Vec<EngineRegisteredModule>, String> {
+        self.state
+            .list_modules(handle, "quickjs-ng-browser-vm-harness")
+    }
+
+    fn read_module(
+        &self,
+        handle: &EngineContextHandle,
+        specifier: &str,
+    ) -> Result<EngineRegisteredModule, String> {
+        self.state
+            .read_module(handle, specifier, "quickjs-ng-browser-vm-harness")
+    }
+
+    fn take_bridge_snapshot(
+        &mut self,
+        handle: &EngineContextHandle,
+    ) -> Result<Option<EngineBridgeSnapshot>, String> {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        {
+            self.native.take_bridge_snapshot(handle)
+        }
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        {
+            Ok(self
+            .browser_bridges
+            .get_mut(&handle.engine_context_id)
+            .map(BrowserRuntimeBridgeState::take_snapshot))
+        }
+    }
+
+    fn fire_timers(
+        &mut self,
+        handle: &EngineContextHandle,
+        now_ms: u64,
+        timer_ids: &[String],
+    ) -> Result<usize, String> {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        let fired = self.native.fire_timers(handle, now_ms, timer_ids)?;
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        let fired = if let Some(bridge) = self.browser_bridges.get_mut(&handle.engine_context_id) {
+            bridge.fire_timers(now_ms, timer_ids)
+        } else {
+            0
+        };
+        if let Some(context) = self.state.contexts.get_mut(&handle.engine_context_id) {
+            context.pending_jobs = self
+                .browser_bridges
+                .get(&handle.engine_context_id)
+                .map(|bridge| bridge.pending_jobs)
+                .unwrap_or(0);
+        }
+        Ok(fired)
+    }
+
+    fn interrupt(&mut self, handle: &EngineContextHandle, reason: &str) -> Result<(), String> {
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        {
+            let _ = reason;
+            self.native.interrupt(handle)?;
+            Ok(())
+        }
+        #[cfg(any(not(quickjs_ng_native), quickjs_ng_browser_c_vm_sys))]
+        {
+            if let Some(bridge) = self.browser_bridges.get_mut(&handle.engine_context_id) {
+            bridge.interrupt(reason);
+            }
+            self.state
+                .interrupt(handle, "quickjs-ng-browser-vm-harness")
+        }
+    }
+
+    fn dispose_context(&mut self, handle: &EngineContextHandle) {
+        self.browser_bridges.remove(&handle.engine_context_id);
+        #[cfg(all(quickjs_ng_native, not(quickjs_ng_browser_c_vm_sys)))]
+        self.native.dispose_context(handle);
+        self.state.dispose_context(handle);
+    }
+}
+
+#[cfg(quickjs_ng_native)]
+impl EngineAdapter for QuickJsNgNativeEngineAdapter {
+    fn descriptor(&self) -> EngineDescriptor {
+        EngineDescriptor {
+            name: "quickjs-ng-native-bootstrap-loader",
+            supports_interrupts: true,
+            supports_module_loader: true,
             supports_eval: true,
             supports_job_queue: true,
         }
@@ -2490,13 +3913,11 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
 
     fn boot_session(&mut self, spec: &EngineSessionSpec) -> Result<EngineSessionHandle, String> {
         let handle = self.state.boot_session(spec, "quickjs-ng-session");
-        #[cfg(feature = "quickjs-ng-engine")]
         self.native.boot_session(&handle)?;
         Ok(handle)
     }
 
     fn dispose_session(&mut self, handle: &EngineSessionHandle) {
-        #[cfg(feature = "quickjs-ng-engine")]
         self.native.dispose_session(handle);
         self.state.dispose_session(handle);
     }
@@ -2505,63 +3926,38 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         let handle = self
             .state
             .create_context(spec, "quickjs-ng-context", "quickjs-ng")?;
-        #[cfg(feature = "quickjs-ng-engine")]
         self.native.create_context(&handle)?;
         Ok(handle)
     }
 
     fn describe_context(&self, handle: &EngineContextHandle) -> Option<EngineContextSnapshot> {
-        let snapshot = self.state.describe_context(handle)?;
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            let mut snapshot = snapshot;
-            if let Ok(modules) = self.native.list_modules(handle) {
-                snapshot.registered_modules = modules.len();
-            }
-            return Some(snapshot);
+        let mut snapshot = self.state.describe_context(handle)?;
+        if let Ok(modules) = self.native.list_modules(handle) {
+            snapshot.registered_modules = modules.len();
         }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
         Some(snapshot)
     }
 
     fn eval(
         &mut self,
         handle: &EngineContextHandle,
-        _request: &EngineEvalRequest,
+        request: &EngineEvalRequest,
     ) -> Result<EngineEvalOutcome, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            self.native.activate_context(handle)?;
-            let (result_summary, pending_jobs) = self.native.eval(handle, _request)?;
-            let context = self
-                .state
-                .contexts
-                .get_mut(&handle.engine_context_id)
-                .ok_or_else(|| {
-                    format!("quickjs-ng context not found: {}", handle.engine_context_id)
-                })?;
-            context.state = EngineContextState::Ready;
-            context.pending_jobs = pending_jobs;
+        self.native.activate_context(handle)?;
+        let (result_summary, pending_jobs) = self.native.eval(handle, request)?;
+        let context = self
+            .state
+            .contexts
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+        context.state = EngineContextState::Ready;
+        context.pending_jobs = pending_jobs;
 
-            return Ok(EngineEvalOutcome {
-                result_summary,
-                pending_jobs,
-                state: context.state.clone(),
-            });
-        }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            let snapshot = self.state.describe_context(handle).ok_or_else(|| {
-                format!("quickjs-ng context not found: {}", handle.engine_context_id)
-            })?;
-
-            Err(format!(
-                "quickjs-ng adapter scaffold is ready for {} but the VM crate is not linked yet",
-                snapshot.entrypoint
-            ))
-        }
+        Ok(EngineEvalOutcome {
+            result_summary,
+            pending_jobs,
+            state: context.state.clone(),
+        })
     }
 
     fn bootstrap(
@@ -2574,96 +3970,61 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
     ) -> Result<EngineEvalOutcome, String> {
         self.state
             .register_bootstrap(handle, plan, loader_plan, import_plans, "quickjs-ng")?;
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        let _ = bridge;
-
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            self.native
-                .register_bootstrap(handle, plan, import_plans, bridge)?;
-            self.native.activate_context(handle)?;
-            let bootstrap_source = plan
-                .modules
-                .iter()
-                .find(|module| module.specifier == plan.bootstrap_specifier)
-                .map(|module| module.source.clone())
-                .ok_or_else(|| {
-                    format!(
-                        "quickjs-ng bootstrap module not registered: {}",
-                        plan.bootstrap_specifier
-                    )
-                })?;
-            let mut outcome = self.eval(
-                handle,
-                &EngineEvalRequest {
-                    filename: plan.bootstrap_specifier.clone(),
-                    source: bootstrap_source,
-                    mode: EngineEvalMode::Module,
-                },
-            )?;
-            outcome.result_summary = format!(
-                "quickjs-ng booted {} bootstrap modules via {} across {} loader roots",
-                plan.modules.len(),
-                plan.bootstrap_specifier,
-                loader_plan.node_module_search_roots.len()
-            );
-            return Ok(outcome);
-        }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            let snapshot = self.state.describe_context(handle).ok_or_else(|| {
-                format!("quickjs-ng context not found: {}", handle.engine_context_id)
+        self.native
+            .register_bootstrap(handle, plan, import_plans, bridge)?;
+        self.native.activate_context(handle)?;
+        let bootstrap_source = plan
+            .modules
+            .iter()
+            .find(|module| module.specifier == plan.bootstrap_specifier)
+            .map(|module| module.source.clone())
+            .ok_or_else(|| {
+                format!(
+                    "quickjs-ng bootstrap module not registered: {}",
+                    plan.bootstrap_specifier
+                )
             })?;
-
-            Err(format!(
-                "quickjs-ng adapter scaffold registered {} modules across {} loader roots for {} but the VM crate is not linked yet",
-                plan.modules.len(),
-                loader_plan.node_module_search_roots.len(),
-                snapshot.entrypoint
-            ))
+        let mut outcome = self.eval(
+            handle,
+            &EngineEvalRequest {
+                filename: plan.bootstrap_specifier.clone(),
+                source: bootstrap_source,
+                mode: EngineEvalMode::Module,
+            },
+        )?;
+        if let Some(context) = self.state.contexts.get_mut(&handle.engine_context_id) {
+            context.bridge_ready = true;
         }
+        outcome.result_summary = format!(
+            "quickjs-ng booted {} bootstrap modules via {} across {} loader roots",
+            plan.modules.len(),
+            plan.bootstrap_specifier,
+            loader_plan.node_module_search_roots.len()
+        );
+        Ok(outcome)
     }
 
     fn drain_jobs(&mut self, handle: &EngineContextHandle) -> Result<EngineJobDrain, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            let drain = self.native.drain_jobs(handle)?;
-            let context = self
-                .state
-                .contexts
-                .get_mut(&handle.engine_context_id)
-                .ok_or_else(|| {
-                    format!("quickjs-ng context not found: {}", handle.engine_context_id)
-                })?;
-            context.pending_jobs = drain.pending_jobs;
-            if context.state != EngineContextState::Disposed {
-                context.state = EngineContextState::Ready;
-            }
-            return Ok(drain);
+        let drain = self.native.drain_jobs(handle)?;
+        let context = self
+            .state
+            .contexts
+            .get_mut(&handle.engine_context_id)
+            .ok_or_else(|| format!("quickjs-ng context not found: {}", handle.engine_context_id))?;
+        context.pending_jobs = drain.pending_jobs;
+        if context.state != EngineContextState::Disposed {
+            context.state = EngineContextState::Ready;
         }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            self.state.drain_jobs(handle, "quickjs-ng")
-        }
+        Ok(drain)
     }
 
     fn list_modules(
         &self,
         handle: &EngineContextHandle,
     ) -> Result<Vec<EngineRegisteredModule>, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            if let Ok(modules) = self.native.list_modules(handle) {
-                return Ok(modules);
-            }
+        if let Ok(modules) = self.native.list_modules(handle) {
+            return Ok(modules);
         }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {}
-
         self.state.list_modules(handle, "quickjs-ng")
     }
 
@@ -2672,16 +4033,9 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         handle: &EngineContextHandle,
         specifier: &str,
     ) -> Result<EngineRegisteredModule, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            if let Ok(module) = self.native.read_module(handle, specifier) {
-                return Ok(module);
-            }
+        if let Ok(module) = self.native.read_module(handle, specifier) {
+            return Ok(module);
         }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {}
-
         self.state.read_module(handle, specifier, "quickjs-ng")
     }
 
@@ -2689,16 +4043,7 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         &mut self,
         handle: &EngineContextHandle,
     ) -> Result<Option<EngineBridgeSnapshot>, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            return self.native.take_bridge_snapshot(handle);
-        }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            let _ = handle;
-            Ok(None)
-        }
+        self.native.take_bridge_snapshot(handle)
     }
 
     fn fire_timers(
@@ -2707,33 +4052,130 @@ impl EngineAdapter for QuickJsNgEngineAdapter {
         now_ms: u64,
         timer_ids: &[String],
     ) -> Result<usize, String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            return self.native.fire_timers(handle, now_ms, timer_ids);
-        }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            let _ = (handle, now_ms, timer_ids);
-            Ok(0)
-        }
+        self.native.fire_timers(handle, now_ms, timer_ids)
     }
 
     fn interrupt(&mut self, handle: &EngineContextHandle, _reason: &str) -> Result<(), String> {
-        #[cfg(feature = "quickjs-ng-engine")]
-        {
-            return self.native.interrupt(handle);
-        }
-
-        #[cfg(not(feature = "quickjs-ng-engine"))]
-        {
-            self.state.interrupt(handle, "quickjs-ng")
-        }
+        self.native.interrupt(handle)
     }
 
     fn dispose_context(&mut self, handle: &EngineContextHandle) {
-        #[cfg(feature = "quickjs-ng-engine")]
         self.native.dispose_context(handle);
         self.state.dispose_context(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrowserRuntimeBridgeState, EngineBootstrapBridge, browser_bridge_path_resolve};
+    use crate::protocol::{HostRuntimeConsoleLevel, HostRuntimeEvent};
+    use crate::vfs::{VirtualFile, VirtualFileSystem};
+    use std::collections::BTreeMap;
+
+    fn sample_browser_bridge() -> BrowserRuntimeBridgeState {
+        let mut vfs = VirtualFileSystem::new("/workspace");
+        vfs.mount_files(vec![
+            VirtualFile::text("/workspace/src/main.js", "console.log('hello');"),
+            VirtualFile::text("/workspace/src/util.js", "export const value = 1;"),
+            VirtualFile::binary("/workspace/assets/logo.bin", vec![1, 2, 3]),
+        ])
+        .expect("bridge vfs should mount");
+        vfs.create_dir_all("/workspace/generated")
+            .expect("generated dir should exist");
+
+        BrowserRuntimeBridgeState::from_bootstrap_bridge(&EngineBootstrapBridge {
+            cwd: String::from("/workspace/src"),
+            argv: vec![String::from("node"), String::from("main.js")],
+            env: BTreeMap::from([(String::from("MODE"), String::from("test"))]),
+            vfs,
+        })
+    }
+
+    #[test]
+    fn browser_bridge_state_supports_process_fs_path_and_console() {
+        let mut bridge = sample_browser_bridge();
+
+        assert_eq!(bridge.process_cwd(), "/workspace/src");
+        assert!(bridge.fs_exists("./main.js"));
+        assert!(!bridge.fs_exists("./missing.js"));
+
+        let (is_text, text_bytes) = bridge
+            .fs_read_file("./main.js")
+            .expect("text file should be readable");
+        assert!(is_text);
+        assert_eq!(
+            String::from_utf8(text_bytes).expect("utf8"),
+            "console.log('hello');"
+        );
+
+        let (is_text, binary_bytes) = bridge
+            .fs_read_file("../assets/logo.bin")
+            .expect("binary file should be readable");
+        assert!(!is_text);
+        assert_eq!(binary_bytes, vec![1, 2, 3]);
+
+        assert_eq!(
+            browser_bridge_path_resolve(
+                &bridge.process_cwd(),
+                &[String::from("./util.js"), String::from("../generated")]
+            ),
+            "/workspace/src/generated"
+        );
+
+        assert_eq!(
+            bridge
+                .process_chdir("../generated")
+                .expect("chdir should resolve directory"),
+            "/workspace/generated"
+        );
+        assert_eq!(bridge.process_cwd(), "/workspace/generated");
+
+        bridge.console_emit(
+            HostRuntimeConsoleLevel::Log,
+            &[String::from("bridge"), String::from("ok")],
+        );
+        assert_eq!(bridge.pending_events.len(), 2);
+        assert!(matches!(
+            &bridge.pending_events[0],
+            HostRuntimeEvent::Console { level: HostRuntimeConsoleLevel::Log, line }
+                if line == "bridge ok"
+        ));
+        assert!(matches!(
+            &bridge.pending_events[1],
+            HostRuntimeEvent::Stdout { chunk } if chunk == "bridge ok"
+        ));
+    }
+
+    #[test]
+    fn browser_bridge_state_tracks_timers_jobs_and_interrupts() {
+        let mut bridge = sample_browser_bridge();
+
+        let timeout = bridge.schedule_timer(25, false);
+        let interval = bridge.schedule_timer(10, true);
+        assert_eq!(bridge.timers.len(), 2);
+
+        let fired = bridge.fire_timers(10, &[interval.clone()]);
+        assert_eq!(fired, 1);
+        assert_eq!(bridge.pending_jobs, 1);
+        assert!(bridge.timers.contains_key(&interval));
+        assert_eq!(bridge.timers.get(&interval).map(|timer| timer.due_at_ms), Some(20));
+
+        let drain = bridge.drain_jobs();
+        assert_eq!(drain.drained_jobs, 1);
+        assert_eq!(drain.pending_jobs, 0);
+
+        let fired = bridge.fire_timers(25, &[timeout.clone(), interval.clone()]);
+        assert_eq!(fired, 2);
+        assert!(!bridge.timers.contains_key(&timeout));
+        assert_eq!(bridge.timers.get(&interval).map(|timer| timer.due_at_ms), Some(35));
+
+        bridge.interrupt("stop requested");
+        let snapshot = bridge.take_snapshot();
+        assert_eq!(snapshot.timers.len(), 1);
+        assert!(matches!(
+            snapshot.events.last(),
+            Some(HostRuntimeEvent::Console { level: HostRuntimeConsoleLevel::Warn, line })
+                if line == "[browser-interrupt] stop requested"
+        ));
     }
 }

@@ -3,6 +3,8 @@ import { expect, test } from "vite-plus/test";
 import type { SessionSnapshot } from "./protocol";
 import {
   applyPackageJsonTextToSessionSnapshot,
+  deriveSuggestedRunRequest,
+  deriveSuggestedRunScriptName,
   applyWorkspaceEntryToSessionSnapshot,
   parsePackageJsonSummary,
 } from "./runtime-session-state";
@@ -26,7 +28,6 @@ function createSession(): SessionSnapshot {
     packageJson: null,
     capabilities: {
       detectedReact: false,
-      detectedVite: false,
     },
   };
 }
@@ -88,12 +89,78 @@ test("applyPackageJsonTextToSessionSnapshot updates package summary and capabili
     dependencies: ["react", "react-dom"],
     devDependencies: ["vite"],
   });
+  expect(session.suggestedRunRequest).toEqual({
+    cwd: "/workspace",
+    command: "npm",
+    args: ["run", "dev"],
+  });
   expect(session.capabilities).toEqual({
     detectedReact: true,
-    detectedVite: true,
   });
 });
 
 test("parsePackageJsonSummary returns null for invalid JSON", () => {
   expect(parsePackageJsonSummary("{")).toBeNull();
+});
+
+test("deriveSuggestedRunRequest prefers dev before start", () => {
+  expect(
+    deriveSuggestedRunRequest(
+      {
+        name: "demo-app",
+        scripts: {
+          dev: "vite",
+          start: "node server.js",
+        },
+        dependencies: [],
+        devDependencies: [],
+      },
+      "/workspace",
+    ),
+  ).toEqual({
+    cwd: "/workspace",
+    command: "npm",
+    args: ["run", "dev"],
+  });
+  expect(
+    deriveSuggestedRunScriptName({
+      name: "demo-app",
+      scripts: {
+        dev: "vite",
+        start: "node server.js",
+      },
+      dependencies: [],
+      devDependencies: [],
+    }),
+  ).toBe("dev");
+});
+
+test("deriveSuggestedRunRequest falls back to start when dev is absent", () => {
+  expect(
+    deriveSuggestedRunRequest(
+      {
+        name: "demo-app",
+        scripts: {
+          start: "node server.js",
+        },
+        dependencies: [],
+        devDependencies: [],
+      },
+      "/workspace",
+    ),
+  ).toEqual({
+    cwd: "/workspace",
+    command: "npm",
+    args: ["run", "start"],
+  });
+  expect(
+    deriveSuggestedRunScriptName({
+      name: "demo-app",
+      scripts: {
+        start: "node server.js",
+      },
+      dependencies: [],
+      devDependencies: [],
+    }),
+  ).toBe("start");
 });

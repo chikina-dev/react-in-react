@@ -38,6 +38,7 @@ export function PreviewFrame(props: PreviewFrameProps) {
 
   return (
     <iframe
+      key={`${props.preview.sessionId}:${props.preview.port}:${props.preview.url}`}
       className="preview-frame"
       sandbox="allow-same-origin allow-scripts"
       src={props.preview.url}

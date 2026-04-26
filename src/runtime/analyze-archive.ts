@@ -1,6 +1,7 @@
 import { strFromU8, unzipSync } from "fflate";
 
 import type { ArchiveEntry, ArchiveSummary, PackageJsonSummary, SessionSnapshot } from "./protocol";
+import { deriveSuggestedRunRequest } from "./runtime-session-state";
 
 type ParsedArchive = Pick<
   SessionSnapshot,
@@ -49,6 +50,7 @@ export function mountArchive(
       workspaceRoot: "/workspace",
       archive: parsed.archive,
       packageJson: parsed.packageJson,
+      suggestedRunRequest: deriveSuggestedRunRequest(parsed.packageJson, "/workspace"),
       capabilities: parsed.capabilities,
     },
     files: parsed.files,
@@ -82,7 +84,7 @@ function parseArchiveWithFiles(
     const normalizedPath = normalizeArchivePath(rawPath, commonPrefix);
 
     if (guessEntryKind(rawPath, bytes.byteLength) === "file") {
-      const contentType = guessContentType(normalizedPath);
+      const contentType = guessContentType(normalizedPath, bytes);
       const isText = isTextContentType(contentType);
       files.set(normalizedPath, {
         path: normalizedPath,
@@ -131,7 +133,6 @@ function parseArchiveWithFiles(
     files,
     capabilities: {
       detectedReact: dependencies.includes("react") || dependencies.includes("react-dom"),
-      detectedVite: dependencies.includes("vite"),
     },
   };
 }
@@ -249,7 +250,7 @@ function restoreOriginalPath(
   return suffix;
 }
 
-export function guessContentType(path: string): string {
+export function guessContentType(path: string, bytes?: Uint8Array): string {
   if (path.endsWith(".html")) {
     return "text/html; charset=utf-8";
   }
@@ -312,6 +313,14 @@ export function guessContentType(path: string): string {
     return "font/woff2";
   }
 
+  if (path.includes("/node_modules/.bin/")) {
+    return "text/plain; charset=utf-8";
+  }
+
+  if (bytes && looksLikeShebangScript(bytes)) {
+    return "text/plain; charset=utf-8";
+  }
+
   return "application/octet-stream";
 }
 
@@ -330,4 +339,8 @@ function decodeText(bytes: Uint8Array): string {
   } catch {
     return "";
   }
+}
+
+function looksLikeShebangScript(bytes: Uint8Array): boolean {
+  return bytes.length >= 2 && bytes[0] === 0x23 && bytes[1] === 0x21;
 }

@@ -1,21 +1,13 @@
 import ReactDOM from "react-dom/client";
 
 import { PreviewApp } from "./preview/PreviewApp";
-import type {
-  PreviewDiagnostics,
-  PreviewReadyEvent,
-  PreviewWorkspaceFile,
-  SessionSnapshot,
-} from "./runtime/protocol";
+import type { PreviewBootstrapPayload } from "./runtime/protocol";
 import "./style.css";
 
 type PreviewBootstrap = {
   sessionId: string;
   port: number;
-  stateUrl: string;
-  workspaceUrl: string;
-  filesUrl: string;
-  diagnosticsUrl: string;
+  bootstrapUrl: string;
 };
 
 declare global {
@@ -37,62 +29,19 @@ async function main(): Promise<void> {
     throw new Error("Missing preview bootstrap payload");
   }
 
-  const [previewResponse, workspaceResponse, filesResponse, diagnosticsResponse] =
-    await Promise.all([
-      fetch(bootstrap.stateUrl, { cache: "no-store" }),
-      fetch(bootstrap.workspaceUrl, { cache: "no-store" }),
-      fetch(bootstrap.filesUrl, { cache: "no-store" }),
-      fetch(bootstrap.diagnosticsUrl, { cache: "no-store" }),
-    ]);
-
-  if (!previewResponse.ok) {
-    throw new Error(`Failed to load preview data: ${previewResponse.status}`);
+  const bootstrapResponse = await fetch(bootstrap.bootstrapUrl, { cache: "no-store" });
+  if (!bootstrapResponse.ok) {
+    throw new Error(`Failed to load preview bootstrap: ${bootstrapResponse.status}`);
   }
-
-  if (!workspaceResponse.ok) {
-    throw new Error(`Failed to load workspace data: ${workspaceResponse.status}`);
-  }
-
-  if (!filesResponse.ok) {
-    throw new Error(`Failed to load file index: ${filesResponse.status}`);
-  }
-
-  if (!diagnosticsResponse.ok) {
-    throw new Error(`Failed to load diagnostics: ${diagnosticsResponse.status}`);
-  }
-
-  const [preview, workspace, files, diagnostics] = (await Promise.all([
-    previewResponse.json(),
-    workspaceResponse.json(),
-    filesResponse.json(),
-    diagnosticsResponse.json(),
-  ])) as [PreviewReadyEvent, SessionSnapshot, PreviewWorkspaceFile[], PreviewDiagnostics];
-
-  const preferredFile =
-    files.find((file) => file.path.endsWith("/package.json")) ??
-    files.find((file) => file.path.includes("/src/")) ??
-    files[0];
-
-  const selectedFile = preferredFile
-    ? await fetch(preferredFile.url, { cache: "no-store" }).then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Failed to load file ${preferredFile.path}: ${response.status}`);
-        }
-
-        return {
-          ...preferredFile,
-          content: await response.text(),
-        };
-      })
-    : null;
+  const payload = (await bootstrapResponse.json()) as PreviewBootstrapPayload;
 
   ReactDOM.createRoot(rootElement).render(
     <PreviewApp
-      files={files}
-      preview={preview}
-      diagnostics={diagnostics}
-      selectedFile={selectedFile}
-      workspace={workspace}
+      files={payload.files}
+      preview={payload.preview}
+      diagnostics={payload.diagnostics}
+      selectedFile={payload.selectedFile}
+      workspace={payload.workspace}
     />,
   );
 }

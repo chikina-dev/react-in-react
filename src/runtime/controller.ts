@@ -1,4 +1,6 @@
+import { type MountedArchive, type WorkspaceFileRecord } from "./analyze-archive";
 import type {
+  PreviewReadyEvent,
   PreviewHttpResponseMessage,
   RunRequest,
   RuntimeEvent,
@@ -8,11 +10,28 @@ import type {
   VirtualHttpResponse,
   WorkerToUiMessage,
 } from "./protocol";
+import {
+  connectPreviewBridge,
+  ensurePreviewServiceWorker,
+  registerPreview,
+  subscribePreviewWorkerState,
+  unregisterSessionPreviews,
+  type PreviewWorkerState,
+} from "./preview-service-worker";
+import RuntimeWorker from "./runtime.worker?worker";
+
+const WORKER_PING_TIMEOUT_MS = 1500;
+const WORKER_MOUNT_TIMEOUT_MS = 10000;
+const WORKER_RUN_TIMEOUT_MS = 5000;
+const WORKER_STOP_TIMEOUT_MS = 5000;
 
 export class RuntimeController {
   private readonly worker: Worker;
   private readonly listeners = new Set<(event: RuntimeEvent) => void>();
+  private readonly workerErrorListeners = new Set<(error: Error) => void>();
   private readonly pending = new Map<string, () => void>();
+  private workerReadyPromise: Promise<void> | null = null;
+  private lastWorkerError: Error | null = null;
   private readonly pendingPreviewResponses = new Map<
     string,
     {
@@ -20,11 +39,10 @@ export class RuntimeController {
       reject: (error: Error) => void;
     }
   >();
+  private previewBridgePromise: Promise<void> | null = null;
 
   constructor() {
-    this.worker = new Worker(new URL("./runtime.worker.ts", import.meta.url), {
-      type: "module",
-    });
+    this.worker = new RuntimeWorker();
 
     this.worker.addEventListener("message", (event: MessageEvent<WorkerToUiMessage>) => {
       const message = event.data;
@@ -45,10 +63,27 @@ export class RuntimeController {
         return;
       }
 
-      for (const listener of this.listeners) {
-        listener(message);
+      if (message.type === "preview.ready") {
+        void this.handlePreviewReady(message);
+        return;
       }
+
+      this.emitLocalRuntimeEvent(message);
     });
+
+    this.worker.addEventListener("error", (event) => {
+      const error = new Error(event.message || "Runtime worker failed to load.");
+      this.handleWorkerFailure(error);
+    });
+
+    this.worker.addEventListener("messageerror", () => {
+      const error = new Error("Runtime worker could not deserialize a message.");
+      this.handleWorkerFailure(error);
+    });
+
+    if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+      void this.ensurePreviewWorker();
+    }
   }
 
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
@@ -58,55 +93,122 @@ export class RuntimeController {
     };
   }
 
+  subscribeWorkerErrors(listener: (error: Error) => void): () => void {
+    if (this.lastWorkerError) {
+      listener(this.lastWorkerError);
+    }
+    this.workerErrorListeners.add(listener);
+    return () => {
+      this.workerErrorListeners.delete(listener);
+    };
+  }
+
+  subscribePreviewWorkerState(listener: (state: PreviewWorkerState) => void): () => void {
+    return subscribePreviewWorkerState(listener);
+  }
+
+  async ensurePreviewWorker(): Promise<void> {
+    await ensurePreviewServiceWorker();
+    await this.ensurePreviewBridge();
+  }
+
   async createSession(file: File): Promise<SessionSnapshot> {
-    const requestId = createRequestId();
     const zip = await file.arrayBuffer();
-
-    return new Promise<SessionSnapshot>((resolve, reject) => {
-      const unsubscribe = this.subscribe((event) => {
-        if (event.type === "session.created" && event.requestId === requestId) {
-          unsubscribe();
-          resolve(event.session);
-        }
-
-        if (event.type === "runtime.error" && event.requestId === requestId) {
-          unsubscribe();
-          reject(new Error(event.error.message));
-        }
-      });
-
-      this.postMessage({
+    await this.ensureWorkerResponsive();
+    const requestId = createRequestId();
+    const sessionCreated = this.awaitSessionCreated(requestId);
+    await withTimeout(
+      this.awaitAck(requestId, {
         type: "session.create",
         requestId,
         fileName: file.name,
         zip,
-      });
-    });
+      }),
+      WORKER_MOUNT_TIMEOUT_MS,
+    );
+    return await withTimeout(sessionCreated, WORKER_MOUNT_TIMEOUT_MS);
+  }
+
+  async replaceSession(previousSessionId: string | null, file: File): Promise<SessionSnapshot> {
+    if (previousSessionId) {
+      await this.stop(previousSessionId).catch(() => undefined);
+    }
+
+    return await this.createSession(file);
+  }
+
+  async mountSession(mounted: MountedArchive): Promise<SessionSnapshot> {
+    await this.ensureWorkerResponsive();
+    const requestId = createRequestId();
+    const sessionCreated = this.awaitSessionCreated(requestId);
+    await withTimeout(
+      this.awaitAck(requestId, {
+        type: "session.mount",
+        requestId,
+        session: mounted.snapshot,
+        files: [...mounted.files.values()].map(serializeWorkspaceFileRecord),
+      }),
+      WORKER_MOUNT_TIMEOUT_MS,
+    );
+    return await withTimeout(sessionCreated, WORKER_MOUNT_TIMEOUT_MS);
   }
 
   async run(sessionId: string, request: RunRequest): Promise<void> {
-    const requestId = createRequestId();
-    await this.awaitAck(requestId, {
-      type: "session.run",
-      requestId,
-      sessionId,
-      request,
-    });
+    try {
+      await this.ensureWorkerResponsive();
+      const requestId = createRequestId();
+      await withTimeout(
+        this.awaitAck(requestId, {
+          type: "session.run",
+          requestId,
+          sessionId,
+          request,
+        }),
+        WORKER_RUN_TIMEOUT_MS,
+      );
+    } catch (error) {
+      this.emitWorkerOperationFailure(
+        sessionId,
+        "WORKER_RUN_FAILED",
+        error,
+        "Failed to launch runtime through worker.",
+      );
+    }
   }
 
   async stop(sessionId: string): Promise<void> {
     const requestId = createRequestId();
-    await this.awaitAck(requestId, {
-      type: "session.stop",
-      requestId,
-      sessionId,
-    });
+    try {
+      await this.ensureWorkerResponsive();
+      await unregisterSessionPreviews(sessionId).catch(() => undefined);
+      await withTimeout(
+        this.awaitAck(requestId, {
+          type: "session.stop",
+          requestId,
+          sessionId,
+        }),
+        WORKER_STOP_TIMEOUT_MS,
+      );
+    } catch (error) {
+      this.emitWorkerOperationFailure(
+        sessionId,
+        "WORKER_STOP_FAILED",
+        error,
+        "Failed to stop runtime through worker.",
+      );
+    }
   }
 
   async requestPreviewResponse(request: VirtualHttpRequest): Promise<VirtualHttpResponse> {
+    if (this.lastWorkerError) {
+      throw new Error(
+        `Runtime worker unavailable: ${this.lastWorkerError.message || "unknown worker failure"}`,
+      );
+    }
+
     const requestId = createRequestId();
 
-    return new Promise<VirtualHttpResponse>((resolve, reject) => {
+    return await new Promise<VirtualHttpResponse>((resolve, reject) => {
       this.pendingPreviewResponses.set(requestId, { resolve, reject });
       this.postMessage({
         type: "preview.http",
@@ -147,19 +249,126 @@ export class RuntimeController {
     this.listeners.clear();
   }
 
+  private async ensureWorkerResponsive(): Promise<void> {
+    if (this.lastWorkerError) {
+      throw new Error(this.lastWorkerError.message || "Runtime worker is unavailable.");
+    }
+
+    if (!this.workerReadyPromise) {
+      const requestId = createRequestId();
+      this.workerReadyPromise = this.awaitAck(requestId, {
+        type: "worker.ping",
+        requestId,
+      }).catch((error) => {
+        this.workerReadyPromise = null;
+        throw error;
+      });
+    }
+
+    try {
+      await withTimeout(this.workerReadyPromise, WORKER_PING_TIMEOUT_MS);
+    } catch (error) {
+      throw new Error(
+        error instanceof Error ? error.message : "Runtime worker did not become responsive.",
+      );
+    }
+  }
+
+  private async ensurePreviewBridge(): Promise<void> {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
+      return;
+    }
+
+    if (!this.previewBridgePromise) {
+      const channel = new MessageChannel();
+      this.worker.postMessage({ type: "preview.bridge.connect" }, [channel.port1]);
+      this.previewBridgePromise = connectPreviewBridge(channel.port2).catch((error) => {
+        this.previewBridgePromise = null;
+        throw error;
+      });
+    }
+
+    await this.previewBridgePromise;
+  }
+
+  private async handlePreviewReady(event: PreviewReadyEvent): Promise<void> {
+    try {
+      await registerPreview(event);
+      this.emitLocalRuntimeEvent(event);
+    } catch (error) {
+      this.emitLocalRuntimeEvent({
+        type: "session.state",
+        sessionId: event.sessionId,
+        state: "errored",
+      });
+      this.emitLocalRuntimeEvent({
+        type: "runtime.error",
+        sessionId: event.sessionId,
+        error: {
+          code: "PREVIEW_REGISTER_FAILED",
+          message: error instanceof Error ? error.message : "Unknown preview registration error",
+        },
+      });
+    }
+  }
+
+  private emitLocalRuntimeEvent(event: RuntimeEvent): void {
+    for (const listener of Array.from(this.listeners)) {
+      listener(event);
+    }
+  }
+
   private async awaitAck(requestId: string, message: UiToWorkerMessage): Promise<void> {
-    await new Promise<void>((resolve) => {
-      this.pending.set(requestId, resolve);
+    await new Promise<void>((resolve, reject) => {
+      const handleWorkerError = (error: Error) => {
+        unsubscribe();
+        this.workerErrorListeners.delete(handleWorkerError);
+        this.pending.delete(requestId);
+        reject(error);
+      };
+      const unsubscribe = this.subscribe((event) => {
+        if (event.type === "runtime.error" && event.requestId === requestId) {
+          unsubscribe();
+          this.workerErrorListeners.delete(handleWorkerError);
+          this.pending.delete(requestId);
+          reject(new Error(event.error.message));
+        }
+      });
+      this.workerErrorListeners.add(handleWorkerError);
+      this.pending.set(requestId, () => {
+        unsubscribe();
+        this.workerErrorListeners.delete(handleWorkerError);
+        resolve();
+      });
       this.postMessage(message);
     });
   }
 
-  private postMessage(message: UiToWorkerMessage): void {
-    if (message.type === "session.create") {
-      this.worker.postMessage(message, [message.zip]);
-      return;
-    }
+  private async awaitSessionCreated(requestId: string): Promise<SessionSnapshot> {
+    return await new Promise<SessionSnapshot>((resolve, reject) => {
+      const handleWorkerError = (error: Error) => {
+        unsubscribe();
+        this.workerErrorListeners.delete(handleWorkerError);
+        reject(error);
+      };
+      const unsubscribe = this.subscribe((event) => {
+        if (event.type === "runtime.error" && event.requestId === requestId) {
+          unsubscribe();
+          this.workerErrorListeners.delete(handleWorkerError);
+          reject(new Error(event.error.message));
+          return;
+        }
+        if (event.type === "session.created" && event.requestId === requestId) {
+          unsubscribe();
+          this.workerErrorListeners.delete(handleWorkerError);
+          resolve(event.session);
+        }
+      });
+      this.workerErrorListeners.add(handleWorkerError);
+    });
+  }
 
+  private postMessage(message: UiToWorkerMessage): void {
     this.worker.postMessage(message);
   }
 
@@ -173,6 +382,38 @@ export class RuntimeController {
     this.pendingPreviewResponses.delete(message.requestId);
     pending.resolve(message.response);
   }
+  private handleWorkerFailure(error: Error): void {
+    this.lastWorkerError = error;
+    this.workerReadyPromise = null;
+    for (const pending of this.pendingPreviewResponses.values()) {
+      pending.reject(error);
+    }
+    this.pendingPreviewResponses.clear();
+    for (const listener of Array.from(this.workerErrorListeners)) {
+      listener(error);
+    }
+  }
+
+  private emitWorkerOperationFailure(
+    sessionId: string,
+    code: string,
+    error: unknown,
+    fallbackMessage: string,
+  ): void {
+    this.emitLocalRuntimeEvent({
+      type: "session.state",
+      sessionId,
+      state: "errored",
+    });
+    this.emitLocalRuntimeEvent({
+      type: "runtime.error",
+      sessionId,
+      error: {
+        code,
+        message: error instanceof Error ? error.message : fallbackMessage,
+      },
+    });
+  }
 }
 
 function createRequestId(): string {
@@ -183,10 +424,35 @@ function createRequestId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function serializeWorkspaceFileRecord(file: WorkspaceFileRecord): WorkspaceFileRecord {
+  return {
+    ...file,
+    bytes: file.bytes.slice(),
+  };
+}
+
 function decodeVirtualHttpBody(body: string | Uint8Array): string {
   if (typeof body === "string") {
     return body;
   }
 
   return new TextDecoder().decode(body);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timerId: number | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timerId = window.setTimeout(() => {
+          reject(new Error(`Timed out waiting for worker ack after ${timeoutMs}ms.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timerId != null) {
+      clearTimeout(timerId);
+    }
+  }
 }

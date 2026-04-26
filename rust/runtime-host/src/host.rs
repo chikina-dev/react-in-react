@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::engine::{
     EngineAdapter, EngineBootstrapBridge, EngineBridgeSnapshot, EngineContextHandle,
-    EngineContextSnapshot, EngineContextSpec, EngineEvalMode, EngineEvalOutcome, EngineEvalRequest,
-    EngineJobDrain, EngineSessionHandle, EngineSessionSpec,
+    EngineContextSnapshot, EngineContextSpec, EngineContextState, EngineEvalMode,
+    EngineEvalOutcome, EngineEvalRequest, EngineJobDrain, EngineSessionHandle, EngineSessionSpec,
 };
 use crate::error::{RuntimeHostError, RuntimeHostResult};
 use crate::protocol::{
@@ -18,13 +18,16 @@ use crate::protocol::{
     HostRuntimeIdleReport, HostRuntimeLaunchReport, HostRuntimeLoadedModule,
     HostRuntimeModuleImportPlan, HostRuntimeModuleLoaderPlan, HostRuntimeModuleRecord,
     HostRuntimeModuleSource, HostRuntimePort, HostRuntimePortProtocol,
-    HostRuntimePreviewLaunchReport, HostRuntimePreviewRequestReport, HostRuntimePreviewStateReport,
+    HostRuntimePreviewLaunchReport, HostRuntimePreviewModel, HostRuntimePreviewRequestReport,
+    HostRuntimePreviewImportPlan, HostRuntimePreviewModulePlan, HostRuntimePreviewReadyReport,
+    HostRuntimePreviewStateReport, HostRuntimePreviewTransformKind,
+    HostRuntimePreviewClientModule,
     HostRuntimeResolvedModule, HostRuntimeResponse, HostRuntimeShutdownReport,
     HostRuntimeStartupReport, HostRuntimeStateReport, HostRuntimeStdioStream, HostRuntimeTimer,
     HostRuntimeTimerKind, HostSessionStateReport, HostWorkspaceFileIndexSummary,
     PackageJsonSummary, PreviewRequestHint, PreviewRequestKind, PreviewResponseDescriptor,
     PreviewResponseKind, RunPlan, RunRequest, SessionSnapshot, SessionState, WorkspaceEntrySummary,
-    WorkspaceFilePayload, WorkspaceFileSummary,
+    WorkspaceFilePayload, WorkspaceFileSummary, HostRuntimeDirectHttpResponse,
 };
 use crate::vfs::{VirtualFile, VirtualFileSystem, normalize_posix_path};
 
@@ -35,7 +38,7 @@ const PREVIEW_DOCUMENT_CANDIDATES: [&str; 4] = [
     "/workspace/public/index.html",
 ];
 
-const PREVIEW_APP_ENTRY_CANDIDATES: [&str; 8] = [
+const PREVIEW_APP_ENTRY_CANDIDATES: [&str; 12] = [
     "/workspace/src/main.tsx",
     "/workspace/src/main.jsx",
     "/workspace/src/main.ts",
@@ -44,6 +47,24 @@ const PREVIEW_APP_ENTRY_CANDIDATES: [&str; 8] = [
     "/workspace/src/index.jsx",
     "/workspace/src/index.ts",
     "/workspace/src/index.js",
+    "/workspace/app/routes/home.tsx",
+    "/workspace/app/routes/home.jsx",
+    "/workspace/app/routes/index.tsx",
+    "/workspace/app/routes/index.jsx",
+];
+
+const PREVIEW_GUEST_COMPONENT_CANDIDATES: [&str; 4] = [
+    "/workspace/app/routes/home.tsx",
+    "/workspace/app/routes/home.jsx",
+    "/workspace/app/routes/index.tsx",
+    "/workspace/app/routes/index.jsx",
+];
+
+const PREVIEW_GUEST_STYLESHEET_CANDIDATES: [&str; 4] = [
+    "/workspace/app/app.css",
+    "/workspace/src/index.css",
+    "/workspace/src/App.css",
+    "/workspace/src/app.css",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +87,24 @@ struct PreviewAssetHint {
     document_root: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewGuestAppShell {
+    entry_url: String,
+    stylesheet_urls: Vec<String>,
+    react_url: String,
+    react_dom_client_url: String,
+}
+
+fn find_preview_client_module_url<'a>(
+    modules: &'a [HostRuntimePreviewClientModule],
+    specifier: &str,
+) -> Option<&'a str> {
+    modules
+        .iter()
+        .find(|module| module.specifier == specifier)
+        .map(|module| module.url.as_str())
+}
+
 #[derive(Debug)]
 struct SessionRecord {
     snapshot: SessionSnapshot,
@@ -79,6 +118,8 @@ struct PackageManifest {
     name: Option<String>,
     main: Option<String>,
     module: Option<String>,
+    style: Option<String>,
+    bin: Option<JsonValue>,
     exports: Option<JsonValue>,
     imports: Option<JsonValue>,
     browser: Option<JsonValue>,
@@ -286,6 +327,399 @@ impl<'a, E: EngineAdapter> RuntimeModuleLoaderBridge<'a, E> {
     }
 }
 
+fn split_command_tokens(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+struct BrowserCliShimSpec {
+    package_name: &'static str,
+    specifier: &'static str,
+    mode: &'static str,
+    runtime_kind: &'static str,
+    preview_role: &'static str,
+}
+
+struct BuiltinBootstrapModuleSpec {
+    specifier: &'static str,
+    source: &'static str,
+}
+
+const BROWSER_CLI_SHIMS: &[BrowserCliShimSpec] = &[
+    BrowserCliShimSpec {
+        package_name: "vite",
+        specifier: "runtime:browser-cli/vite",
+        mode: "dev",
+        runtime_kind: "browser-dev-server",
+        preview_role: "http-server",
+    },
+    BrowserCliShimSpec {
+        package_name: "acme-dev",
+        specifier: "runtime:browser-cli/acme-dev",
+        mode: "dev",
+        runtime_kind: "browser-dev-server",
+        preview_role: "http-server",
+    },
+];
+
+const PREVIEW_AUXILIARY_ROUTES: &[(&str, PreviewRequestKind)] = &[
+    ("/__runtime.json", PreviewRequestKind::RuntimeState),
+    ("/__bootstrap.json", PreviewRequestKind::BootstrapState),
+    ("/__workspace.json", PreviewRequestKind::WorkspaceState),
+    ("/__files.json", PreviewRequestKind::FileIndex),
+    ("/__diagnostics.json", PreviewRequestKind::DiagnosticsState),
+    ("/assets/runtime.css", PreviewRequestKind::RuntimeStylesheet),
+];
+
+const BUILTIN_BOOTSTRAP_MODULE_SPECS: &[BuiltinBootstrapModuleSpec] = &[
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:process",
+        source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+const process = {
+  cwd() { return invoke("process.cwd"); },
+  chdir(path) { return invoke("process.chdir", { path }); },
+  exit(code = 0) { return invoke("process.exit", { code }); },
+  get argv() { return invoke("process.argv"); },
+  get env() { return invoke("process.env"); },
+  platform: "browser",
+};
+export default process;
+export const cwd = () => process.cwd();
+export const chdir = (path) => process.chdir(path);
+export const exit = (code = 0) => process.exit(code);
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:fs",
+        source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const existsSync = (path) => invoke("fs.exists", { path }).exists;
+export const statSync = (path) => invoke("fs.stat", { path }).entry;
+export const readdirSync = (path) => invoke("fs.read-dir", { path }).entries.map((entry) => entry.path);
+export const readFileSync = (path) => invoke("fs.read-file", { path });
+export const mkdirSync = (path) => invoke("fs.mkdir", { path });
+export const writeFileSync = (path, bytes, isText = false) =>
+  invoke("fs.write-file", { path, bytes, isText });
+export default {
+  existsSync,
+  statSync,
+  readdirSync,
+  readFileSync,
+  mkdirSync,
+  writeFileSync,
+};
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:path",
+        source: r#"const runtime = globalThis.__runtime;
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload).value;
+}
+export const resolve = (...segments) => invoke("path.resolve", { segments });
+export const join = (...segments) => invoke("path.join", { segments });
+export const dirname = (path) => invoke("path.dirname", { path });
+export const basename = (path) => invoke("path.basename", { path });
+export const extname = (path) => invoke("path.extname", { path });
+export const normalize = (path) => invoke("path.normalize", { path });
+export default { resolve, join, dirname, basename, extname, normalize };
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:buffer",
+        source: r#"export const Buffer = Uint8Array;
+export default { Buffer };
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:timers",
+        source: r#"const runtime = globalThis.__runtime;
+if (!runtime.__timerState) {
+  runtime.__timerState = {
+    nextCallbackId: 1,
+    callbackIdsByTimerId: new Map(),
+    callbacks: new Map(),
+  };
+}
+if (typeof runtime.fireTimer !== "function") {
+  runtime.fireTimer = (callbackId, repeat = false) => {
+    const callback = runtime.__timerState.callbacks.get(callbackId);
+    if (typeof callback === "function") {
+      callback();
+    }
+    if (!repeat) {
+      runtime.__timerState.callbacks.delete(callbackId);
+    }
+    return runtime.__timerState.callbacks.has(callbackId);
+  };
+}
+function invoke(kind, payload = {}) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke(kind, payload);
+}
+export const setTimeout = (callback, delay = 0) => {
+  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
+  runtime.__timerState.callbacks.set(callbackId, callback);
+  const timerId = invoke("timers.schedule", {
+    delayMs: delay,
+    repeat: false,
+    callback,
+    callbackId,
+  });
+  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
+  return timerId;
+};
+export const setInterval = (callback, delay = 0) => {
+  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
+  runtime.__timerState.callbacks.set(callbackId, callback);
+  const timerId = invoke("timers.schedule", {
+    delayMs: delay,
+    repeat: true,
+    callback,
+    callbackId,
+  });
+  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
+  return timerId;
+};
+export const clearTimeout = (timerId) => {
+  const callbackId = runtime.__timerState.callbackIdsByTimerId.get(timerId);
+  if (callbackId) {
+    runtime.__timerState.callbackIdsByTimerId.delete(timerId);
+    runtime.__timerState.callbacks.delete(callbackId);
+  }
+  return invoke("timers.clear", { timerId });
+};
+export const clearInterval = clearTimeout;
+export default { setTimeout, clearTimeout, setInterval, clearInterval };
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:console",
+        source: r#"const runtime = globalThis.__runtime;
+function emit(level, values) {
+  if (!runtime || typeof runtime.invoke !== "function") {
+    throw new Error("runtime bridge is not attached");
+  }
+  return runtime.invoke("console.emit", { level, values });
+}
+const consoleValue = {
+  log: (...values) => emit("log", values),
+  info: (...values) => emit("info", values),
+  warn: (...values) => emit("warn", values),
+  error: (...values) => emit("error", values),
+};
+export { consoleValue as console };
+export default consoleValue;
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:perf_hooks",
+        source: r#"const performanceValue =
+  globalThis.performance ??
+  {
+    now() {
+      return Date.now();
+    },
+  };
+export const performance = performanceValue;
+export default { performance };
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:module",
+        source: r#"const moduleValue = {
+  enableCompileCache() {},
+  flushCompileCache() {},
+};
+export const enableCompileCache = (...args) =>
+  moduleValue.enableCompileCache(...args);
+export const flushCompileCache = (...args) =>
+  moduleValue.flushCompileCache(...args);
+export default moduleValue;
+"#,
+    },
+    BuiltinBootstrapModuleSpec {
+        specifier: "node:inspector",
+        source: r#"class Session {
+  connect() {}
+  post(_method, callback) {
+    if (typeof callback === "function") {
+      callback();
+    }
+  }
+  disconnect() {}
+}
+const inspectorValue = { Session };
+export { Session };
+export default inspectorValue;
+"#,
+    },
+];
+
+fn render_browser_cli_shim_source(shim: &BrowserCliShimSpec) -> String {
+    format!(
+        r#"const runtimeValue = {{
+  mode: {mode},
+  runtimeKind: {runtime_kind},
+  previewRole: {preview_role},
+  ready: true,
+}};
+globalThis.__browserCliRuntime = runtimeValue;
+export default runtimeValue;
+"#,
+        mode = serde_json::to_string(shim.mode)
+            .expect("browser cli shim mode should serialize as json string"),
+        runtime_kind = serde_json::to_string(shim.runtime_kind)
+            .expect("browser cli shim runtime kind should serialize as json string"),
+        preview_role = serde_json::to_string(shim.preview_role)
+            .expect("browser cli shim preview role should serialize as json string"),
+    )
+}
+
+fn manifest_declares_bin_command(manifest: &PackageManifest, command_name: &str) -> bool {
+    match manifest.bin.as_ref() {
+        Some(JsonValue::String(_)) => manifest
+            .name
+            .as_deref()
+            .is_some_and(|name| name == command_name),
+        Some(JsonValue::Object(map)) => map.contains_key(command_name),
+        _ => false,
+    }
+}
+
+fn find_browser_cli_shim_for_manifest(
+    manifest: &PackageManifest,
+    command_name: &str,
+    args: &[String],
+) -> Option<&'static BrowserCliShimSpec> {
+    if !args.is_empty() {
+        return None;
+    }
+
+    let package_name = manifest.name.as_deref()?;
+    if !manifest_declares_bin_command(manifest, command_name) {
+        return None;
+    }
+
+    BROWSER_CLI_SHIMS
+        .iter()
+        .find(|shim| shim.package_name == package_name)
+}
+
+fn find_browser_cli_shim_by_specifier(specifier: &str) -> Option<&'static BrowserCliShimSpec> {
+    BROWSER_CLI_SHIMS
+        .iter()
+        .find(|shim| shim.specifier == specifier)
+}
+
+fn find_browser_cli_shim_for_resolved_script(
+    resolved_script: &str,
+) -> Option<&'static BrowserCliShimSpec> {
+    let command_name = split_command_tokens(resolved_script).into_iter().next()?;
+    BROWSER_CLI_SHIMS
+        .iter()
+        .find(|shim| shim.package_name == command_name)
+}
+
+fn find_preview_auxiliary_route(relative_path: &str) -> Option<PreviewRequestKind> {
+    PREVIEW_AUXILIARY_ROUTES
+        .iter()
+        .find(|(path, _)| *path == relative_path)
+        .map(|(_, kind)| kind.clone())
+}
+
+fn resolve_npm_script_process_entrypoint(
+    record: &SessionRecord,
+    cwd: &str,
+    plan: &RunPlan,
+) -> RuntimeHostResult<(String, Vec<String>)> {
+    let tokens = plan
+        .resolved_script
+        .as_deref()
+        .map(split_command_tokens)
+        .unwrap_or_default();
+
+    if let Some((entrypoint, args)) = tokens.split_first() {
+        if entrypoint.starts_with("./") || entrypoint.starts_with("../") || entrypoint.starts_with('/')
+        {
+            return Ok((
+                resolve_node_entrypoint(record, cwd, Some(entrypoint))?,
+                args.to_vec(),
+            ));
+        }
+
+        for root in node_module_directory_roots(cwd) {
+            let package_root = normalize_posix_path(&format!("{root}/{entrypoint}"));
+            if let Some(manifest) = read_package_manifest_at(record, &package_root) {
+                if let Some(shim) =
+                    find_browser_cli_shim_for_manifest(&manifest, entrypoint, args)
+                {
+                    return Ok((String::from(shim.specifier), Vec::new()));
+                }
+
+                if let Some(resolved) = resolve_package_bin_entrypoint(
+                    record,
+                    &package_root,
+                    entrypoint,
+                    &manifest,
+                )? {
+                    return Ok((resolved, args.to_vec()));
+                }
+            }
+
+            let candidate = normalize_posix_path(&format!("{root}/.bin/{entrypoint}"));
+            if record.vfs.read(&candidate).is_some() {
+                return Ok((candidate, args.to_vec()));
+            }
+        }
+
+        return Err(RuntimeHostError::ModuleNotFound(entrypoint.clone()));
+    }
+
+    Ok((plan.entrypoint.clone(), Vec::new()))
+}
+
+fn resolve_package_bin_entrypoint(
+    record: &SessionRecord,
+    package_root: &str,
+    command_name: &str,
+    manifest: &PackageManifest,
+) -> RuntimeHostResult<Option<String>> {
+    match manifest.bin.as_ref() {
+        Some(JsonValue::String(target)) => {
+            resolve_workspace_module(record, &normalize_posix_path(&format!("{package_root}/{target}")))
+                .map(Some)
+        }
+        Some(JsonValue::Object(map)) => {
+            let Some(target) = map.get(command_name).and_then(JsonValue::as_str) else {
+                return Ok(None);
+            };
+            resolve_workspace_module(record, &normalize_posix_path(&format!("{package_root}/{target}")))
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 pub struct RuntimeHostCore<E: EngineAdapter> {
     engine: E,
     sessions: BTreeMap<String, SessionRecord>,
@@ -365,9 +799,6 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 detected_react: package_manifest
                     .as_ref()
                     .is_some_and(detect_react_dependency),
-                detected_vite: package_manifest
-                    .as_ref()
-                    .is_some_and(detect_vite_dependency),
             },
         };
 
@@ -462,21 +893,24 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         request: &RunRequest,
     ) -> RuntimeHostResult<HostProcessInfo> {
         let plan = self.plan_run(session_id, request)?;
-        let argv = match plan.command_kind {
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let (entrypoint, argv) = match plan.command_kind {
             crate::protocol::RunCommandKind::NodeEntrypoint => {
-                let mut argv = vec![String::from("/virtual/node"), plan.entrypoint.clone()];
+                let entrypoint = plan.entrypoint.clone();
+                let mut argv = vec![String::from("/virtual/node"), entrypoint.clone()];
                 argv.extend(request.args.iter().skip(1).cloned());
-                argv
+                (entrypoint, argv)
             }
             crate::protocol::RunCommandKind::NpmScript => {
-                let mut argv = vec![
-                    String::from("/virtual/node"),
-                    String::from("npm"),
-                    String::from("run"),
-                ];
-                argv.push(plan.entrypoint.clone());
+                let (entrypoint, script_args) =
+                    resolve_npm_script_process_entrypoint(record, &plan.cwd, &plan)?;
+                let mut argv = vec![String::from("/virtual/node"), entrypoint.clone()];
+                argv.extend(script_args);
                 argv.extend(request.args.iter().skip(2).cloned());
-                argv
+                (entrypoint, argv)
             }
         };
 
@@ -486,7 +920,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             env: request.env.clone(),
             exec_path: String::from("/virtual/node"),
             platform: String::from("browser"),
-            entrypoint: plan.entrypoint,
+            entrypoint,
             command_line: plan.command_line,
             command_kind: plan.command_kind,
         })
@@ -770,11 +1204,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         if startup.exited {
             return Ok(HostRuntimePreviewLaunchReport {
                 startup,
-                server: None,
-                port: None,
-                root_request: None,
-                root_request_hint: None,
-                root_response_descriptor: None,
+                root_report: None,
             });
         }
 
@@ -794,36 +1224,14 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             method: String::from("GET"),
             relative_path: String::from("/"),
             search: String::new(),
+            client_modules: Vec::new(),
         };
 
-        let (resolved_server, resolved_port, root_request_hint, root_response_descriptor) =
-            match self.execute_runtime_command(
-                context_id,
-                HostRuntimeCommand::HttpResolvePreview {
-                    request: request.clone(),
-                },
-            )? {
-                HostRuntimeResponse::PreviewRequestResolved {
-                    server,
-                    port,
-                    request: _,
-                    request_hint,
-                    response_descriptor,
-                } => (server, port, request_hint, response_descriptor),
-                other => {
-                    return Err(RuntimeHostError::EngineFailure(format!(
-                        "launch preview expected preview request resolved response, got {other:?}",
-                    )));
-                }
-            };
+        let root_report = self.resolve_runtime_preview_request(context_id, request.clone())?;
 
         Ok(HostRuntimePreviewLaunchReport {
             startup,
-            server: Some(resolved_server),
-            port: Some(resolved_port),
-            root_request: Some(request),
-            root_request_hint: Some(root_request_hint),
-            root_response_descriptor: Some(root_response_descriptor),
+            root_report: Some(Box::new(root_report)),
         })
     }
 
@@ -846,7 +1254,6 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.to_string()))?;
         let runtime_context = self.create_runtime_context(session_id, request)?;
         let context_id = runtime_context.context_id.clone();
-        let engine_context = self.describe_engine_context(&context_id)?;
         let runtime_context_record = self
             .runtime_contexts
             .get(&context_id)
@@ -859,7 +1266,13 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         );
         let bootstrap_plan = build_runtime_bootstrap_plan(&bindings);
         let preview_launch = self.launch_runtime_preview(&context_id, max_turns, port)?;
+        let runtime_context_record = self
+            .runtime_contexts
+            .get(&context_id)
+            .cloned()
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.clone()))?;
         let state = self.runtime_state_report(&context_id)?;
+        let engine_context = self.describe_engine_context(&context_id)?;
         let startup_logs = build_runtime_startup_logs(
             &run_plan,
             &context_id,
@@ -870,7 +1283,21 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             &bindings,
             &bootstrap_plan,
         );
+        let preview_ready = state.preview.as_ref().map(Self::preview_ready_report);
+        let startup_stdout = build_runtime_startup_stdout(
+            &state.session,
+            &run_plan,
+            &startup_logs,
+            preview_launch.startup.exit_code,
+            preview_launch.startup.exited,
+            preview_ready.as_ref(),
+        );
         let events = self.drain_runtime_events(&context_id)?;
+        let runtime_context = HostRuntimeContext {
+            context_id: context_id.clone(),
+            session_id: runtime_context_record.session_id.clone(),
+            process: runtime_context_record.process.clone(),
+        };
 
         Ok(HostRuntimeLaunchReport {
             boot_summary,
@@ -881,7 +1308,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             bootstrap_plan,
             preview_launch,
             state,
-            startup_logs,
+            startup_stdout,
+            preview_ready,
             events,
         })
     }
@@ -903,6 +1331,7 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                 .ok_or(RuntimeHostError::HttpServerNotFound(request.port))?;
             (context.session_id.clone(), server)
         };
+        self.ensure_runtime_preview_request_ready(context_id)?;
         let request_hint =
             self.resolve_preview_request_hint(&session_id, &request.relative_path)?;
         let response_descriptor = describe_preview_response(&request_hint, request.method.as_str());
@@ -930,8 +1359,33 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     },
                     bytes: file.bytes.clone(),
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
+        let module_plan = build_runtime_preview_module_plan(
+            self,
+            context_id,
+            request.port,
+            &request_hint,
+            &response_descriptor,
+        )?;
+        let transform_kind = determine_runtime_preview_transform_kind(
+            &request_hint,
+            &response_descriptor,
+            module_plan.as_ref(),
+        );
+        let direct_response = self.build_runtime_direct_preview_response(
+            context_id,
+            &session_id,
+            &request,
+            &request_hint,
+            &response_descriptor,
+            transform_kind.as_ref(),
+            &hydrated_files,
+        )?;
+        let render_plan = build_runtime_preview_render_plan(
+            &request_hint,
+            &response_descriptor,
+        );
 
         Ok(HostRuntimePreviewRequestReport {
             server: runtime_http_server_view(&server),
@@ -941,7 +1395,244 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             response_descriptor,
             hydration_paths,
             hydrated_files,
+            transform_kind,
+            render_plan,
+            module_plan,
+            direct_response,
         })
+    }
+
+    fn ensure_runtime_preview_request_ready(&self, context_id: &str) -> RuntimeHostResult<()> {
+        let descriptor = self.engine.descriptor();
+        if descriptor.name != "quickjs-ng-browser-vm-harness"
+            && descriptor.name != "quickjs-ng-browser-c-vm"
+        {
+            return Ok(());
+        }
+
+        let snapshot = self.describe_engine_context(context_id)?;
+        let bootstrap_ready = snapshot.state == EngineContextState::Ready
+            && snapshot.bootstrap_specifier.as_deref() == Some("runtime:bootstrap")
+            && snapshot.bridge_ready
+            && snapshot.registered_modules > 0;
+        if bootstrap_ready {
+            return Ok(());
+        }
+
+        Err(RuntimeHostError::EngineFailure(format!(
+            "browser preview request requires bootstrap-ready engine context: state={:?} bootstrap={:?} bridge_ready={} modules={}",
+            snapshot.state,
+            snapshot.bootstrap_specifier,
+            snapshot.bridge_ready,
+            snapshot.registered_modules
+        )))
+    }
+
+    fn build_runtime_direct_preview_response(
+        &self,
+        context_id: &str,
+        session_id: &str,
+        request: &HostRuntimeHttpRequest,
+        request_hint: &PreviewRequestHint,
+        response_descriptor: &PreviewResponseDescriptor,
+        transform_kind: Option<&HostRuntimePreviewTransformKind>,
+        hydrated_files: &[WorkspaceFilePayload],
+    ) -> RuntimeHostResult<Option<HostRuntimeDirectHttpResponse>> {
+        let context = self
+            .runtime_contexts
+            .get(context_id)
+            .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?;
+        let record = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let session_state = self.session_state_report(session_id)?;
+        let preview_model = Self::preview_model(session_id, &context.run_plan, &session_state);
+        let preview_url = preview_request_url(session_id, request.port);
+
+        let response = match response_descriptor.kind {
+            PreviewResponseKind::WorkspaceDocument => response_descriptor
+                .workspace_path
+                .as_ref()
+                .and_then(|path| record.vfs.read(path))
+                .map(|file| {
+                    build_preview_direct_workspace_file_response(
+                        record,
+                        session_id,
+                        request.port,
+                        file,
+                        response_descriptor,
+                        transform_kind,
+                        Some(&preview_url),
+                    )
+                }),
+            PreviewResponseKind::AppShell => response_descriptor.workspace_path.as_ref().and_then(|path| {
+                if is_preview_guest_component_path(path) {
+                    resolve_preview_guest_app_shell_for_path(
+                        self,
+                        context_id,
+                        record,
+                        session_id,
+                        request.port,
+                        path,
+                        &request.client_modules,
+                    )
+                    .map(|guest_app_shell| HostRuntimeDirectHttpResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        text_body: Some(render_preview_guest_app_shell_html(
+                            &preview_model.title,
+                            &guest_app_shell,
+                        )),
+                        bytes_body: None,
+                    })
+                    .or_else(|| Some(render_preview_root_html(
+                        session_id,
+                        request.port,
+                        &preview_model,
+                        &request.client_modules,
+                    )))
+                } else {
+                    let entry_url = build_preview_url_for_workspace_file(
+                        session_id,
+                        request.port,
+                        path,
+                        response_descriptor
+                            .document_root
+                            .as_deref()
+                            .unwrap_or("/workspace"),
+                    );
+                    Some(HostRuntimeDirectHttpResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        text_body: Some(render_preview_app_shell_html(&preview_model.title, &entry_url)),
+                        bytes_body: None,
+                    })
+                }
+            }),
+            PreviewResponseKind::HostManagedFallback => Some(render_preview_root_html(
+                session_id,
+                request.port,
+                &preview_model,
+                &request.client_modules,
+            )),
+            PreviewResponseKind::WorkspaceFile => response_descriptor
+                .workspace_path
+                .as_ref()
+                .and_then(|path| {
+                    transform_kind
+                        .filter(|kind| !matches!(kind, HostRuntimePreviewTransformKind::Module))
+                        .and_then(|kind| {
+                            record.vfs.read(path).map(|file| {
+                                build_preview_direct_workspace_file_response(
+                                    record,
+                                    session_id,
+                                    request.port,
+                                    file,
+                                    response_descriptor,
+                                    Some(kind),
+                                    Some(&preview_url),
+                                )
+                            })
+                        })
+                }),
+            PreviewResponseKind::WorkspaceAsset => response_descriptor
+                .workspace_path
+                .as_ref()
+                .and_then(|path| {
+                    transform_kind
+                        .filter(|kind| !matches!(kind, HostRuntimePreviewTransformKind::Module))
+                        .and_then(|kind| {
+                            record.vfs.read(path).map(|file| {
+                                build_preview_direct_workspace_file_response(
+                                    record,
+                                    session_id,
+                                    request.port,
+                                    file,
+                                    response_descriptor,
+                                    Some(kind),
+                                    Some(&preview_url),
+                                )
+                            })
+                        })
+                }),
+            PreviewResponseKind::MethodNotAllowed => Some(HostRuntimeDirectHttpResponse {
+                status: 405,
+                headers: BTreeMap::new(),
+                text_body: Some(
+                    serde_json::json!({
+                        "error": "Method not allowed",
+                        "pathname": request.relative_path,
+                        "method": request.method,
+                        "allowMethods": response_descriptor.allow_methods,
+                    })
+                    .to_string(),
+                ),
+                bytes_body: None,
+            }),
+            PreviewResponseKind::BootstrapState => self
+                .preview_state_report(context_id)?
+                .as_ref()
+                .map(|preview| {
+                    render_preview_json_response(render_preview_bootstrap_json(
+                        record,
+                        &session_state,
+                        preview,
+                        request_hint,
+                        hydrated_files,
+                    ))
+                }),
+            PreviewResponseKind::RuntimeState => self
+                .preview_state_report(context_id)?
+                .as_ref()
+                .map(|preview| render_preview_json_response(render_preview_ready_event_json(preview))),
+            PreviewResponseKind::WorkspaceState => {
+                Some(render_preview_json_response(render_session_snapshot_json(
+                    &session_state,
+                )))
+            }
+            PreviewResponseKind::FileIndex => self
+                .preview_state_report(context_id)?
+                .as_ref()
+                .map(|preview| {
+                    render_preview_json_response(render_preview_file_index_json(
+                        session_id,
+                        preview,
+                        &session_state.host_files.index,
+                    ))
+                }),
+            PreviewResponseKind::DiagnosticsState => self
+                .preview_state_report(context_id)?
+                .as_ref()
+                .map(|preview| {
+                    render_preview_json_response(render_preview_diagnostics_json(
+                        &session_state,
+                        preview,
+                        request_hint,
+                        hydrated_files,
+                    ))
+                }),
+            PreviewResponseKind::RuntimeStylesheet => Some(HostRuntimeDirectHttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                text_body: Some(render_runtime_stylesheet()),
+                bytes_body: None,
+            }),
+            PreviewResponseKind::NotFound => Some(HostRuntimeDirectHttpResponse {
+                status: 404,
+                headers: BTreeMap::new(),
+                text_body: Some(
+                    serde_json::json!({
+                        "error": "Unsupported preview path",
+                        "pathname": request.relative_path,
+                    })
+                    .to_string(),
+                ),
+                bytes_body: None,
+            }),
+        };
+
+        Ok(response.map(|response| apply_direct_preview_response_metadata(response, response_descriptor)))
     }
 
     fn shutdown_runtime_context(
@@ -1130,8 +1821,20 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         plan: &HostRuntimeBootstrapPlan,
         loader_plan: &HostRuntimeModuleLoaderPlan,
     ) -> RuntimeHostResult<Vec<HostRuntimeModuleImportPlan>> {
-        let entry_module =
-            self.load_runtime_module(context_id, &loader_plan.entry_module.resolved_specifier)?;
+        let entry_module = if let Some(module) = plan
+            .modules
+            .iter()
+            .find(|module| module.specifier == loader_plan.entry_module.resolved_specifier)
+        {
+            HostRuntimeLoadedModule {
+                resolved_specifier: module.specifier.clone(),
+                kind: crate::protocol::HostRuntimeModuleKind::Registered,
+                format: crate::protocol::HostRuntimeModuleFormat::Module,
+                source: module.source.clone(),
+            }
+        } else {
+            self.load_runtime_module(context_id, &loader_plan.entry_module.resolved_specifier)?
+        };
         let mut imports = Vec::new();
         let mut queue = VecDeque::from([HostRuntimeModuleImportPlan {
             request_specifier: loader_plan.entry_module.requested_specifier.clone(),
@@ -1266,11 +1969,63 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
         })
     }
 
+    fn preview_model(
+        session_id: &str,
+        run_plan: &RunPlan,
+        session: &HostSessionStateReport,
+    ) -> HostRuntimePreviewModel {
+        let package_name = session
+            .package_json
+            .as_ref()
+            .and_then(|summary| summary.name.clone())
+            .unwrap_or_else(|| session.archive.file_name.clone());
+
+        HostRuntimePreviewModel {
+            title: format!("{package_name} guest app"),
+            summary: String::from(
+                "Host React から iframe 内 DOM に別 root を生やして描画しています。次の段階でこの生成責務を Service Worker + WASM host へ寄せます。",
+            ),
+            cwd: run_plan.cwd.clone(),
+            command: run_plan.command_line.clone(),
+            highlights: vec![
+                format!("session={session_id}"),
+                format!("revision={}", session.revision),
+                format!("files={}", session.archive.file_count),
+                format!(
+                    "run-kind={}",
+                    match run_plan.command_kind {
+                        crate::protocol::RunCommandKind::NpmScript => "npm-script",
+                        crate::protocol::RunCommandKind::NodeEntrypoint => "node-entrypoint",
+                    }
+                ),
+                run_plan
+                    .resolved_script
+                    .as_ref()
+                    .map(|script| format!("resolved-script={script}"))
+                    .unwrap_or_else(|| String::from("resolved-script=<direct>")),
+                format!("react-detected={}", session.capabilities.detected_react),
+            ],
+        }
+    }
+
+    fn preview_ready_report(preview: &HostRuntimePreviewStateReport) -> HostRuntimePreviewReadyReport {
+        HostRuntimePreviewReadyReport {
+            port: preview.port.clone(),
+            url: preview.url.clone(),
+            model: preview.model.clone(),
+            root_hydrated_files: preview.root_hydrated_files.clone(),
+            host: preview.host.clone(),
+            run: preview.run.clone(),
+            host_files: preview.host_files.clone(),
+        }
+    }
+
     fn session_state_report(&self, session_id: &str) -> RuntimeHostResult<HostSessionStateReport> {
         let record = self
             .sessions
             .get(session_id)
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
+        let package_json = Self::session_package_json_summary(record);
 
         Ok(HostSessionStateReport {
             session_id: record.snapshot.session_id.clone(),
@@ -1279,7 +2034,11 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             workspace_root: record.snapshot.workspace_root.clone(),
             archive: record.snapshot.archive.clone(),
             archive_entries: Self::session_archive_entries(record),
-            package_json: Self::session_package_json_summary(record),
+            suggested_run_request: suggested_run_request(
+                package_json.as_ref(),
+                &record.snapshot.workspace_root,
+            ),
+            package_json,
             capabilities: record.snapshot.capabilities.clone(),
             host_files: self.workspace_file_index_summary(session_id)?,
         })
@@ -1301,14 +2060,21 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             method: String::from("GET"),
             relative_path: String::from("/"),
             search: String::new(),
+            client_modules: Vec::new(),
         };
         let report = self.resolve_runtime_preview_request(context_id, request.clone())?;
 
+        let session_state = self.session_state_report(&context.session_id)?;
+
+        let port = report.port.clone();
         Ok(Some(HostRuntimePreviewStateReport {
-            port: report.port,
+            port,
+            url: format!("/preview/{}/{}/", context.session_id, report.port.port),
+            model: Self::preview_model(&context.session_id, &context.run_plan, &session_state),
             root_request: request,
             root_request_hint: report.request_hint,
             root_response_descriptor: report.response_descriptor,
+            root_hydrated_files: report.hydrated_files,
             host: self.boot_summary(),
             run: context.run_plan.clone(),
             host_files: self.workspace_file_index_summary(&context.session_id)?,
@@ -1925,8 +2691,9 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     }
                 };
 
-                Ok(response)
-            }
+        Ok(response)
+    }
+
             HostRuntimeCommand::ProcessChdir { path } => {
                 let (session_id, cwd) = {
                     let context = self.runtime_contexts.get(context_id).ok_or_else(|| {
@@ -2153,9 +2920,23 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             .get(session_id)
             .ok_or_else(|| RuntimeHostError::SessionNotFound(session_id.into()))?;
 
+        let source_entry_candidate = PREVIEW_APP_ENTRY_CANDIDATES
+            .iter()
+            .find(|candidate| record.vfs.read(candidate).is_some())
+            .copied();
+
         for candidate in PREVIEW_DOCUMENT_CANDIDATES {
             if let Some(file) = record.vfs.read(candidate) {
                 if file.is_text && file.path.ends_with(".html") {
+                    if candidate == "/workspace/public/index.html" {
+                        if let Some(source_entry) = source_entry_candidate {
+                            return Ok(PreviewRootHint {
+                                kind: PreviewRootKind::SourceEntry,
+                                path: Some(source_entry.to_string()),
+                                root: None,
+                            });
+                        }
+                    }
                     return Ok(PreviewRootHint {
                         kind: PreviewRootKind::WorkspaceDocument,
                         path: Some(file.path.clone()),
@@ -2165,14 +2946,12 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
             }
         }
 
-        for candidate in PREVIEW_APP_ENTRY_CANDIDATES {
-            if record.vfs.read(candidate).is_some() {
-                return Ok(PreviewRootHint {
-                    kind: PreviewRootKind::SourceEntry,
-                    path: Some(candidate.to_string()),
-                    root: None,
-                });
-            }
+        if let Some(source_entry) = source_entry_candidate {
+            return Ok(PreviewRootHint {
+                kind: PreviewRootKind::SourceEntry,
+                path: Some(source_entry.to_string()),
+                root: None,
+            });
         }
 
         Ok(PreviewRootHint {
@@ -2282,32 +3061,8 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
                     ),
                 }),
             },
-            "/__runtime.json" => Ok(PreviewRequestHint {
-                kind: PreviewRequestKind::RuntimeState,
-                workspace_path: None,
-                document_root: None,
-                hydrate_paths: Vec::new(),
-            }),
-            "/__workspace.json" => Ok(PreviewRequestHint {
-                kind: PreviewRequestKind::WorkspaceState,
-                workspace_path: None,
-                document_root: None,
-                hydrate_paths: Vec::new(),
-            }),
-            "/__files.json" => Ok(PreviewRequestHint {
-                kind: PreviewRequestKind::FileIndex,
-                workspace_path: None,
-                document_root: None,
-                hydrate_paths: Vec::new(),
-            }),
-            "/__diagnostics.json" => Ok(PreviewRequestHint {
-                kind: PreviewRequestKind::DiagnosticsState,
-                workspace_path: None,
-                document_root: None,
-                hydrate_paths: Vec::new(),
-            }),
-            "/assets/runtime.css" => Ok(PreviewRequestHint {
-                kind: PreviewRequestKind::RuntimeStylesheet,
+            path if find_preview_auxiliary_route(path).is_some() => Ok(PreviewRequestHint {
+                kind: find_preview_auxiliary_route(path).expect("route checked above"),
                 workspace_path: None,
                 document_root: None,
                 hydrate_paths: Vec::new(),
@@ -2393,6 +3148,74 @@ impl<E: EngineAdapter> RuntimeHostCore<E> {
     }
 }
 
+fn build_runtime_preview_module_plan<E: EngineAdapter>(
+    host: &RuntimeHostCore<E>,
+    context_id: &str,
+    port: u16,
+    request_hint: &PreviewRequestHint,
+    response_descriptor: &PreviewResponseDescriptor,
+) -> RuntimeHostResult<Option<HostRuntimePreviewModulePlan>> {
+    let Some(workspace_path) =
+        resolve_preview_module_plan_workspace_path(request_hint, response_descriptor)
+    else {
+        return Ok(None);
+    };
+    if !is_preview_module_workspace_path(workspace_path) {
+        return Ok(None);
+    }
+    let loaded_module = match host.load_runtime_module(context_id, workspace_path) {
+        Ok(module) => module,
+        Err(_) => return Ok(None),
+    };
+    let session_id = host
+        .runtime_contexts
+        .get(context_id)
+        .ok_or_else(|| RuntimeHostError::RuntimeContextNotFound(context_id.into()))?
+        .session_id
+        .clone();
+    let document_root = response_descriptor
+        .document_root
+        .as_deref()
+        .or(request_hint.document_root.as_deref())
+        .unwrap_or("/workspace");
+    let mut import_plans = Vec::new();
+
+    for specifier in collect_module_dependency_specifiers(&loaded_module.source, &loaded_module.format) {
+        if let Ok(plan) = host.prepare_runtime_module_import(context_id, &specifier, Some(workspace_path)) {
+            let preview_specifier = render_preview_module_specifier(
+                &session_id,
+                port,
+                &plan.resolved_module.resolved_specifier,
+                document_root,
+            );
+            import_plans.push(HostRuntimePreviewImportPlan {
+                request_specifier: specifier,
+                preview_specifier,
+                format: plan.loaded_module.format,
+            });
+        }
+    }
+
+    Ok(Some(HostRuntimePreviewModulePlan {
+        importer_path: workspace_path.to_string(),
+        format: loaded_module.format,
+        import_plans,
+    }))
+}
+
+fn is_preview_module_workspace_path(path: &str) -> bool {
+    let normalized = path.to_ascii_lowercase();
+    normalized.ends_with(".js")
+        || normalized.ends_with(".mjs")
+        || normalized.ends_with(".cjs")
+        || normalized.ends_with(".ts")
+        || normalized.ends_with(".tsx")
+        || normalized.ends_with(".jsx")
+        || normalized.ends_with(".mts")
+        || normalized.ends_with(".cts")
+        || normalized.ends_with(".json")
+}
+
 fn build_runtime_startup_logs(
     run_plan: &RunPlan,
     context_id: &str,
@@ -2421,13 +3244,14 @@ fn build_runtime_startup_logs(
         context.process.argv.join(" ")
     ));
     logs.push(format!(
-        "[engine-context] state={} pending-jobs={} entry={}",
+        "[engine-context] state={} pending-jobs={} bridge-ready={} entry={}",
         match engine_context.state {
             crate::engine::EngineContextState::Booted => "booted",
             crate::engine::EngineContextState::Ready => "ready",
             crate::engine::EngineContextState::Disposed => "disposed",
         },
         engine_context.pending_jobs,
+        engine_context.bridge_ready,
         engine_context.entrypoint,
     ));
     logs.push(format!(
@@ -2450,13 +3274,1069 @@ fn build_runtime_startup_logs(
             .collect::<Vec<_>>()
             .join(","),
     ));
+    if let Some(shim) = find_browser_cli_shim_by_specifier(&run_plan.entrypoint).or_else(|| {
+        run_plan
+            .resolved_script
+            .as_deref()
+            .and_then(find_browser_cli_shim_for_resolved_script)
+    }) {
+        logs.push(format!(
+            "[browser-cli] runtime={} preview={} mode={}",
+            shim.runtime_kind, shim.preview_role, shim.mode
+        ));
+    }
     logs.push(format!("[context] id={}", context_id));
-    logs.push(format!(
-        "[detect] react={} vite={}",
-        capabilities.detected_react, capabilities.detected_vite
-    ));
+    logs.push(format!("[detect] react={}", capabilities.detected_react));
 
     logs
+}
+
+fn build_runtime_startup_stdout(
+    session: &HostSessionStateReport,
+    run_plan: &RunPlan,
+    startup_logs: &[String],
+    exit_code: Option<i32>,
+    exited: bool,
+    preview_ready: Option<&HostRuntimePreviewReadyReport>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "[mount] {} files available at {}",
+        session.archive.file_count, session.workspace_root
+    )];
+
+    lines.push(format!("[exec] {}", run_plan.command_line));
+
+    if let Some(script) = &run_plan.resolved_script {
+        lines.push(format!("[script] {script}"));
+    }
+
+    lines.push(format!(
+        "[host-vfs] files={} sample={} size={}",
+        session.host_files.count,
+        session.host_files.sample_path.as_deref().unwrap_or("<none>"),
+        session.host_files.sample_size.unwrap_or(0),
+    ));
+    lines.extend(startup_logs.iter().cloned());
+
+    if exited {
+        lines.push(format!(
+            "[process] exited before preview code={}",
+            exit_code.unwrap_or(0)
+        ));
+    } else if let Some(preview_ready) = preview_ready {
+        lines.push(format!("[preview] server-ready {}", preview_ready.url));
+    }
+
+    lines
+}
+
+fn preview_request_url(session_id: &str, port: u16) -> String {
+    format!("/preview/{session_id}/{port}/")
+}
+
+fn build_preview_url_for_workspace_file(
+    session_id: &str,
+    port: u16,
+    workspace_path: &str,
+    document_root: &str,
+) -> String {
+    let effective_root = if workspace_path.starts_with(&format!("{document_root}/")) {
+        document_root
+    } else {
+        "/workspace"
+    };
+    let relative = workspace_path
+        .strip_prefix(effective_root)
+        .unwrap_or(workspace_path)
+        .trim_start_matches('/');
+    let preview_url = preview_request_url(session_id, port);
+    if relative.is_empty() {
+        preview_url
+    } else {
+        format!("{preview_url}{relative}")
+    }
+}
+
+fn render_preview_module_specifier(
+    session_id: &str,
+    port: u16,
+    resolved_specifier: &str,
+    document_root: &str,
+) -> String {
+    if resolved_specifier.starts_with("/workspace") {
+        build_preview_url_for_workspace_file(session_id, port, resolved_specifier, document_root)
+    } else {
+        resolved_specifier.to_string()
+    }
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn rewrite_html_document(source: &str, preview_url: &str) -> String {
+    rewrite_prefixed_attributes(source, preview_url, &["src", "href", "action", "poster"])
+}
+
+fn rewrite_stylesheet_document(
+    record: &SessionRecord,
+    source: &str,
+    workspace_path: &str,
+    session_id: &str,
+    port: u16,
+    preview_url: &str,
+) -> String {
+    let with_imports =
+        rewrite_stylesheet_imports(record, source, workspace_path, session_id, port);
+    let mut rewritten = String::with_capacity(with_imports.len());
+    let mut index = 0usize;
+
+    while index < with_imports.len() {
+        if with_imports[index..].starts_with("url(") {
+            rewritten.push_str("url(");
+            index += 4;
+            let Some(next_char) = with_imports[index..].chars().next() else {
+                break;
+            };
+            if next_char == '"' || next_char == '\'' {
+                let quote = next_char;
+                rewritten.push(quote);
+                index += quote.len_utf8();
+                if with_imports[index..].starts_with('/') && !with_imports[index..].starts_with("//")
+                {
+                    rewritten.push_str(preview_url);
+                    index += 1;
+                    continue;
+                }
+                continue;
+            }
+            if with_imports[index..].starts_with('/') && !with_imports[index..].starts_with("//") {
+                rewritten.push_str(preview_url);
+                index += 1;
+                continue;
+            }
+            continue;
+        }
+        let ch = with_imports[index..].chars().next().unwrap_or_default();
+        rewritten.push(ch);
+        index += ch.len_utf8();
+    }
+
+    rewritten
+}
+
+fn rewrite_stylesheet_imports(
+    record: &SessionRecord,
+    source: &str,
+    workspace_path: &str,
+    session_id: &str,
+    port: u16,
+) -> String {
+    let mut rewritten = String::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(specifier) = parse_stylesheet_import_specifier(trimmed) {
+            if let Some(resolved) =
+                resolve_stylesheet_specifier(record, workspace_path, specifier.as_str())
+            {
+                let preview_specifier =
+                    build_preview_url_for_workspace_file(session_id, port, &resolved, "/workspace");
+                rewritten.push_str(&line.replacen(
+                    specifier.as_str(),
+                    preview_specifier.as_str(),
+                    1,
+                ));
+                rewritten.push('\n');
+                continue;
+            }
+        }
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+    if source.ends_with('\n') {
+        rewritten
+    } else {
+        rewritten.trim_end_matches('\n').to_string()
+    }
+}
+
+fn parse_stylesheet_import_specifier(line: &str) -> Option<String> {
+    if !line.starts_with("@import") {
+        return None;
+    }
+
+    let quoted = if let Some(start) = line.find('"') {
+        let rest = &line[start + 1..];
+        rest.find('"').map(|end| rest[..end].to_string())
+    } else if let Some(start) = line.find('\'') {
+        let rest = &line[start + 1..];
+        rest.find('\'').map(|end| rest[..end].to_string())
+    } else {
+        None
+    };
+    quoted
+}
+
+fn resolve_stylesheet_specifier(
+    record: &SessionRecord,
+    importer_path: &str,
+    specifier: &str,
+) -> Option<String> {
+    if specifier.starts_with("http://")
+        || specifier.starts_with("https://")
+        || specifier.starts_with("//")
+        || specifier.starts_with("data:")
+    {
+        return None;
+    }
+
+    if specifier.starts_with('/') {
+        return resolve_workspace_stylesheet_path(record, &format!("/workspace{specifier}"));
+    }
+
+    if specifier.starts_with('.') {
+        return resolve_workspace_stylesheet_path(
+            record,
+            &normalize_posix_path(&format!("{}/{specifier}", dirname(importer_path))),
+        );
+    }
+
+    resolve_package_stylesheet_specifier(record, dirname(importer_path), specifier)
+}
+
+fn resolve_workspace_stylesheet_path(record: &SessionRecord, base_path: &str) -> Option<String> {
+    for candidate in [
+        normalize_posix_path(base_path),
+        normalize_posix_path(&format!("{base_path}.css")),
+        normalize_posix_path(&format!("{base_path}/index.css")),
+    ] {
+        if record.vfs.read(&candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_package_stylesheet_specifier(
+    record: &SessionRecord,
+    importer_dir: &str,
+    specifier: &str,
+) -> Option<String> {
+    let (package_name, remainder) = split_package_specifier(specifier);
+    if package_name.is_empty() {
+        return None;
+    }
+
+    for package_root in node_module_search_roots(importer_dir, &package_name) {
+        let manifest = read_package_manifest_at(record, &package_root);
+        let subpath = remainder
+            .as_deref()
+            .map(|value| format!("./{value}"))
+            .unwrap_or_else(|| ".".into());
+
+        if let Some(exports_field) = manifest.as_ref().and_then(|value| value.exports.as_ref()) {
+            if let Some(target) = resolve_stylesheet_export_target(exports_field, &subpath) {
+                if let Some(resolved) = resolve_workspace_stylesheet_path(
+                    record,
+                    &normalize_posix_path(&format!("{package_root}/{target}")),
+                ) {
+                    return Some(resolved);
+                }
+            }
+        }
+
+        if remainder.is_none() {
+            if let Some(style_entry) = manifest.as_ref().and_then(|value| value.style.as_deref()) {
+                if let Some(resolved) = resolve_workspace_stylesheet_path(
+                    record,
+                    &normalize_posix_path(&format!("{package_root}/{style_entry}")),
+                ) {
+                    return Some(resolved);
+                }
+            }
+            if let Some(resolved) =
+                resolve_workspace_stylesheet_path(record, &format!("{package_root}/index.css"))
+            {
+                return Some(resolved);
+            }
+        } else if let Some(remainder) = remainder.as_deref() {
+            if let Some(resolved) =
+                resolve_workspace_stylesheet_path(record, &format!("{package_root}/{remainder}"))
+            {
+                return Some(resolved);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_stylesheet_export_target(exports_field: &JsonValue, subpath: &str) -> Option<String> {
+    match exports_field {
+        JsonValue::String(target) => {
+            if subpath == "." && target.ends_with(".css") {
+                Some(target.clone())
+            } else {
+                None
+            }
+        }
+        JsonValue::Object(map) => {
+            if has_conditional_export_keys(map) {
+                if subpath == "." {
+                    resolve_stylesheet_export_value(exports_field)
+                } else {
+                    None
+                }
+            } else if let Some(value) = map.get(subpath) {
+                resolve_stylesheet_export_value(value)
+            } else if subpath == "." {
+                map.get(".").and_then(resolve_stylesheet_export_value)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn resolve_stylesheet_export_value(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(target) => target.ends_with(".css").then(|| target.clone()),
+        JsonValue::Object(map) => {
+            for condition in ["style", "browser", "default", "import", "module", "require"] {
+                if let Some(nested) = map.get(condition) {
+                    if let Some(resolved) = resolve_stylesheet_export_value(nested) {
+                        return Some(resolved);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_svg_document(source: &str, preview_url: &str) -> String {
+    rewrite_prefixed_attributes(source, preview_url, &["href", "xlink:href"])
+}
+
+fn rewrite_prefixed_attributes(source: &str, preview_url: &str, attributes: &[&str]) -> String {
+    let mut rewritten = source.to_string();
+    for attribute in attributes {
+        for quote in ['"', '\''] {
+            let needle = format!("{attribute}={quote}/");
+            let replacement = format!("{attribute}={quote}{preview_url}");
+            rewritten = rewritten.replace(&needle, &replacement);
+        }
+    }
+    rewritten
+}
+
+fn render_preview_app_shell_html(title: &str, entry_url: &str) -> String {
+    let entry_url_json = serde_json::to_string(entry_url).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "<!doctype html><html lang=\"ja\"><head><meta charset=\"UTF-8\" /><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" /><title>{}</title><style>:root{{color-scheme:dark;background:radial-gradient(circle at top, rgba(16, 185, 129, 0.12), transparent 35%),linear-gradient(180deg, #071018 0%, #0b1522 100%);}}*{{box-sizing:border-box;}}html,body{{min-height:100%;}}body{{margin:0;}}#root,#app{{min-height:100vh;}}</style></head><body><div id=\"root\"></div><div id=\"app\"></div><script type=\"module\">globalThis.globalThis ??= globalThis; globalThis.global ??= globalThis; globalThis.process ??= {{ env: {{ NODE_ENV: \"development\" }}, browser: true }}; await import({});</script></body></html>",
+        escape_html(title),
+        entry_url_json,
+    )
+}
+
+fn is_preview_guest_component_path(workspace_path: &str) -> bool {
+    PREVIEW_GUEST_COMPONENT_CANDIDATES.contains(&workspace_path)
+}
+
+fn resolve_preview_guest_stylesheet_urls(
+    record: &SessionRecord,
+    session_id: &str,
+    port: u16,
+) -> Vec<String> {
+    PREVIEW_GUEST_STYLESHEET_CANDIDATES
+        .iter()
+        .filter(|candidate| record.vfs.read(candidate).is_some())
+        .map(|candidate| build_preview_url_for_workspace_file(session_id, port, candidate, "/workspace"))
+        .collect()
+}
+
+fn resolve_preview_guest_app_shell_for_path<E: EngineAdapter>(
+    host: &RuntimeHostCore<E>,
+    context_id: &str,
+    record: &SessionRecord,
+    session_id: &str,
+    port: u16,
+    workspace_path: &str,
+    client_modules: &[HostRuntimePreviewClientModule],
+) -> Option<PreviewGuestAppShell> {
+    if record.vfs.read(workspace_path).is_none() {
+        return None;
+    }
+    let react_url = if let Some(url) = find_preview_client_module_url(client_modules, "react") {
+        url.to_string()
+    } else {
+        let react_import = host
+            .prepare_runtime_module_import(context_id, "react", Some(workspace_path))
+            .ok()?;
+        render_preview_module_specifier(
+            session_id,
+            port,
+            &react_import.resolved_module.resolved_specifier,
+            "/workspace",
+        )
+    };
+    let react_dom_client_url =
+        if let Some(url) = find_preview_client_module_url(client_modules, "react-dom/client") {
+        url.to_string()
+    } else {
+        let react_dom_client_import = host
+            .prepare_runtime_module_import(context_id, "react-dom/client", Some(workspace_path))
+            .ok()?;
+        render_preview_module_specifier(
+            session_id,
+            port,
+            &react_dom_client_import.resolved_module.resolved_specifier,
+            "/workspace",
+        )
+        };
+    Some(PreviewGuestAppShell {
+        entry_url: build_preview_url_for_workspace_file(session_id, port, workspace_path, "/workspace"),
+        stylesheet_urls: resolve_preview_guest_stylesheet_urls(record, session_id, port),
+        react_url,
+        react_dom_client_url,
+    })
+}
+
+fn render_preview_error_html(message: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"ja\"><head><meta charset=\"UTF-8\" /><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" /><title>Preview Error</title></head><body><pre>{}</pre></body></html>",
+        escape_html(message),
+    )
+}
+
+fn render_preview_root_html(
+    session_id: &str,
+    port: u16,
+    model: &HostRuntimePreviewModel,
+    client_modules: &[HostRuntimePreviewClientModule],
+) -> HostRuntimeDirectHttpResponse {
+    let client_script_url =
+        find_preview_client_module_url(client_modules, "runtime:preview-client");
+    let Some(client_script_url) = client_script_url else {
+        return HostRuntimeDirectHttpResponse {
+            status: 503,
+            headers: BTreeMap::new(),
+            text_body: Some(render_preview_error_html(
+                "Preview client script is not configured.",
+            )),
+            bytes_body: None,
+        };
+    };
+    let preview_url = preview_request_url(session_id, port);
+    let html = format!(
+        "<!doctype html><html lang=\"ja\"><head><meta charset=\"UTF-8\" /><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" /><title>{}</title><link rel=\"stylesheet\" href=\"{}assets/runtime.css\" /><style>:root{{color-scheme:dark;font-family:\"Iowan Old Style\",\"Palatino Linotype\",serif;background:radial-gradient(circle at top, rgba(245, 158, 11, 0.18), transparent 35%),linear-gradient(160deg, #08111f 0%, #101b2f 50%, #1c2940 100%);color:#f5f7fb;}}*{{box-sizing:border-box;}}html,body,#guest-root{{min-height:100%;}}body{{margin:0;}}</style></head><body><div id=\"guest-root\"></div><script>window.__NODE_IN_NODE_PREVIEW__={{sessionId:{},port:{},bootstrapUrl:{}}};</script><script type=\"module\" src=\"{}\"></script></body></html>",
+        escape_html(&model.title),
+        preview_url,
+        serde_json::to_string(session_id).unwrap_or_else(|_| "\"\"".into()),
+        port,
+        serde_json::to_string(&format!("{preview_url}__bootstrap.json")).unwrap_or_else(|_| "\"\"".into()),
+        client_script_url,
+    );
+    HostRuntimeDirectHttpResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        text_body: Some(html),
+        bytes_body: None,
+    }
+}
+
+fn render_preview_guest_app_shell_html(
+    title: &str,
+    guest_app_shell: &PreviewGuestAppShell,
+) -> String {
+    let stylesheet_links = guest_app_shell
+        .stylesheet_urls
+        .iter()
+        .map(|href| format!("<link rel=\"stylesheet\" href=\"{}\" />", escape_html(href)))
+        .collect::<Vec<_>>()
+        .join("");
+    let react_url = serde_json::to_string(&guest_app_shell.react_url)
+        .unwrap_or_else(|_| "\"\"".into());
+    let react_dom_client_url = serde_json::to_string(&guest_app_shell.react_dom_client_url)
+        .unwrap_or_else(|_| "\"\"".into());
+    let entry_url = serde_json::to_string(&guest_app_shell.entry_url)
+        .unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "<!doctype html><html lang=\"ja\"><head><meta charset=\"UTF-8\" /><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" /><title>{}</title>{}</head><body><div id=\"guest-root\"></div><script type=\"module\">globalThis.globalThis ??= globalThis; globalThis.global ??= globalThis; globalThis.process ??= {{ env: {{ NODE_ENV: \"development\" }}, browser: true }}; const React = await import({}); const ReactDOMClient = await import({}); const guestModule = await import({}); const GuestComponent = guestModule.default; const root = document.getElementById(\"guest-root\"); if (root && typeof GuestComponent === \"function\") {{ ReactDOMClient.createRoot(root).render(React.createElement(GuestComponent)); }}</script></body></html>",
+        escape_html(title),
+        stylesheet_links,
+        react_url,
+        react_dom_client_url,
+        entry_url,
+    )
+}
+
+fn render_preview_json_response(value: JsonValue) -> HostRuntimeDirectHttpResponse {
+    HostRuntimeDirectHttpResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        text_body: Some(value.to_string()),
+        bytes_body: None,
+    }
+}
+
+fn render_preview_ready_event_json(preview: &HostRuntimePreviewStateReport) -> JsonValue {
+    serde_json::json!({
+        "type": "preview.ready",
+        "sessionId": extract_session_id_from_preview_url(&preview.url).unwrap_or_default(),
+        "pid": 0,
+        "port": preview.port.port,
+        "url": preview.url,
+        "model": render_preview_model_json(&preview.model),
+        "host": render_host_summary_json(&preview.host),
+        "run": render_run_plan_json_value(&preview.run),
+        "hostFiles": render_host_file_summary_json(&preview.host_files),
+    })
+}
+
+fn render_preview_bootstrap_json(
+    record: &SessionRecord,
+    session: &HostSessionStateReport,
+    preview: &HostRuntimePreviewStateReport,
+    request_hint: &PreviewRequestHint,
+    hydrated_files: &[WorkspaceFilePayload],
+) -> JsonValue {
+    serde_json::json!({
+        "preview": render_preview_ready_event_json(preview),
+        "workspace": render_session_snapshot_json(session),
+        "files": render_preview_file_index_json(&session.session_id, preview, &session.host_files.index),
+        "selectedFile": render_preview_selected_file_json(record, &session.session_id, preview),
+        "diagnostics": render_preview_diagnostics_json(session, preview, request_hint, hydrated_files),
+    })
+}
+
+fn render_preview_selected_file_json(
+    record: &SessionRecord,
+    session_id: &str,
+    preview: &HostRuntimePreviewStateReport,
+) -> JsonValue {
+    let document_root = resolve_preview_document_root(preview);
+    let mut text_files = record
+        .vfs
+        .files()
+        .filter(|file| file.is_text)
+        .collect::<Vec<_>>();
+    text_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let preferred = text_files
+        .iter()
+        .copied()
+        .find(|file| file.path.ends_with("/package.json"))
+        .or_else(|| text_files.iter().copied().find(|file| file.path.contains("/src/")))
+        .or_else(|| text_files.iter().copied().find(|file| file.path.contains("/app/")))
+        .or_else(|| text_files.first().copied());
+
+    match preferred {
+        Some(file) => serde_json::json!({
+            "path": file.path,
+            "size": file.bytes.len(),
+            "contentType": guess_preview_file_content_type(&file.path),
+            "isText": file.is_text,
+            "url": format!("{}files{}", preview.url, file.path.replace("/workspace", "")),
+            "previewUrl": build_preview_url_for_workspace_file(
+                session_id,
+                preview.port.port,
+                &file.path,
+                &document_root,
+            ),
+            "content": String::from_utf8_lossy(&file.bytes),
+        }),
+        None => JsonValue::Null,
+    }
+}
+
+fn render_session_snapshot_json(session: &HostSessionStateReport) -> JsonValue {
+    serde_json::json!({
+        "sessionId": session.session_id,
+        "state": render_session_state_label(&session.state),
+        "revision": session.revision,
+        "workspaceRoot": session.workspace_root,
+        "archive": {
+            "fileName": session.archive.file_name,
+            "fileCount": session.archive.file_count,
+            "directoryCount": session.archive.directory_count,
+            "rootPrefix": session.archive.root_prefix,
+            "entries": session.archive_entries.iter().map(|entry| serde_json::json!({
+                "path": entry.path,
+                "size": entry.size,
+                "kind": match entry.kind {
+                    ArchiveEntryKind::File => "file",
+                    ArchiveEntryKind::Directory => "dir",
+                },
+            })).collect::<Vec<_>>(),
+        },
+        "packageJson": session.package_json.as_ref().map(|package_json| serde_json::json!({
+            "name": package_json.name,
+            "scripts": package_json.scripts,
+            "dependencies": package_json.dependencies,
+            "devDependencies": package_json.dev_dependencies,
+        })),
+        "suggestedRunRequest": session.suggested_run_request.as_ref().map(|request| serde_json::json!({
+            "cwd": request.cwd,
+            "command": request.command,
+            "args": request.args,
+            "env": request.env,
+        })),
+        "capabilities": {
+            "detectedReact": session.capabilities.detected_react,
+        },
+    })
+}
+
+fn suggested_run_request(
+    package_json: Option<&PackageJsonSummary>,
+    workspace_root: &str,
+) -> Option<RunRequest> {
+    let scripts = &package_json?.scripts;
+    const SUGGESTED_RUN_SCRIPT_NAMES: &[&str] = &["dev", "start"];
+
+    SUGGESTED_RUN_SCRIPT_NAMES
+        .iter()
+        .find(|script_name| {
+            scripts
+                .get(**script_name)
+                .is_some_and(|script| !script.trim().is_empty())
+        })
+        .map(|script_name| {
+            RunRequest::new(
+                workspace_root.to_string(),
+                String::from("npm"),
+                vec![String::from("run"), String::from(*script_name)],
+            )
+        })
+}
+
+fn render_preview_file_index_json(
+    session_id: &str,
+    preview: &HostRuntimePreviewStateReport,
+    files: &[WorkspaceFileSummary],
+) -> JsonValue {
+    let document_root = resolve_preview_document_root(preview);
+    JsonValue::Array(
+        files.iter()
+            .filter(|file| file.is_text)
+            .map(|file| {
+                let content_type = guess_preview_file_content_type(&file.path);
+                serde_json::json!({
+                    "path": file.path,
+                    "size": file.size,
+                    "contentType": content_type,
+                    "isText": file.is_text,
+                    "url": format!("{}files{}", preview.url, file.path.replace("/workspace", "")),
+                    "previewUrl": build_preview_url_for_workspace_file(
+                        session_id,
+                        preview.port.port,
+                        &file.path,
+                        &document_root,
+                    ),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn render_preview_diagnostics_json(
+    session: &HostSessionStateReport,
+    preview: &HostRuntimePreviewStateReport,
+    request_hint: &PreviewRequestHint,
+    hydrated_files: &[WorkspaceFilePayload],
+) -> JsonValue {
+    let mut hydrated_paths = preview
+        .root_response_descriptor
+        .hydrate_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    hydrated_paths.extend(hydrated_files.iter().map(|file| file.path.clone()));
+
+    serde_json::json!({
+        "sessionId": session.session_id,
+        "pid": 0,
+        "port": preview.port.port,
+        "url": preview.url,
+        "model": render_preview_model_json(&preview.model),
+        "session": render_session_snapshot_json(session),
+        "rootRequestHint": render_preview_request_hint_json(&preview.root_request_hint),
+        "requestHint": render_preview_request_hint_json(request_hint),
+        "fileCount": session.host_files.count,
+        "hydratedFileCount": hydrated_paths.len(),
+        "hydratedPaths": hydrated_paths.into_iter().collect::<Vec<_>>(),
+        "host": render_host_summary_json(&preview.host),
+        "run": render_run_plan_json_value(&preview.run),
+        "hostFiles": render_host_file_summary_json(&preview.host_files),
+    })
+}
+
+fn render_preview_model_json(model: &HostRuntimePreviewModel) -> JsonValue {
+    serde_json::json!({
+        "title": model.title,
+        "summary": model.summary,
+        "cwd": model.cwd,
+        "command": model.command,
+        "highlights": model.highlights,
+    })
+}
+
+fn render_host_summary_json(summary: &HostBootstrapSummary) -> JsonValue {
+    serde_json::json!({
+        "engineName": summary.engine_name,
+        "supportsInterrupts": summary.supports_interrupts,
+        "supportsModuleLoader": summary.supports_module_loader,
+        "workspaceRoot": summary.workspace_root,
+    })
+}
+
+fn render_run_plan_json_value(plan: &RunPlan) -> JsonValue {
+    serde_json::json!({
+        "cwd": plan.cwd,
+        "entrypoint": plan.entrypoint,
+        "commandLine": plan.command_line,
+        "envCount": plan.env_count,
+        "commandKind": match plan.command_kind {
+            crate::protocol::RunCommandKind::NpmScript => "npm-script",
+            crate::protocol::RunCommandKind::NodeEntrypoint => "node-entrypoint",
+        },
+        "resolvedScript": plan.resolved_script,
+    })
+}
+
+fn render_host_file_summary_json(summary: &HostWorkspaceFileIndexSummary) -> JsonValue {
+    serde_json::json!({
+        "count": summary.count,
+        "samplePath": summary.sample_path,
+        "sampleSize": summary.sample_size,
+    })
+}
+
+fn render_preview_request_hint_json(hint: &PreviewRequestHint) -> JsonValue {
+    serde_json::json!({
+        "kind": match hint.kind {
+            PreviewRequestKind::RootDocument => "root-document",
+            PreviewRequestKind::RootEntry => "root-entry",
+            PreviewRequestKind::FallbackRoot => "fallback-root",
+            PreviewRequestKind::BootstrapState => "bootstrap-state",
+            PreviewRequestKind::RuntimeState => "runtime-state",
+            PreviewRequestKind::WorkspaceState => "workspace-state",
+            PreviewRequestKind::FileIndex => "file-index",
+            PreviewRequestKind::DiagnosticsState => "diagnostics-state",
+            PreviewRequestKind::RuntimeStylesheet => "runtime-stylesheet",
+            PreviewRequestKind::WorkspaceFile => "workspace-file",
+            PreviewRequestKind::WorkspaceAsset => "workspace-asset",
+            PreviewRequestKind::NotFound => "not-found",
+        },
+        "workspacePath": hint.workspace_path,
+        "documentRoot": hint.document_root,
+        "hydratePaths": hint.hydrate_paths,
+    })
+}
+
+fn render_session_state_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Booting => "booting",
+        SessionState::Mounted => "mounted",
+        SessionState::Running => "running",
+        SessionState::Stopped => "stopped",
+        SessionState::Errored => "errored",
+    }
+}
+
+fn resolve_preview_document_root(preview: &HostRuntimePreviewStateReport) -> String {
+    if matches!(preview.root_request_hint.kind, PreviewRequestKind::RootDocument) {
+        preview
+            .root_request_hint
+            .document_root
+            .clone()
+            .unwrap_or_else(|| String::from("/workspace"))
+    } else {
+        String::from("/workspace")
+    }
+}
+
+fn guess_preview_file_content_type(path: &str) -> String {
+    if path.ends_with(".html") {
+        return String::from("text/html; charset=utf-8");
+    }
+    if path.ends_with(".css") {
+        return String::from("text/css; charset=utf-8");
+    }
+    if path.ends_with(".json") {
+        return String::from("application/json; charset=utf-8");
+    }
+    if path.ends_with(".js")
+        || path.ends_with(".mjs")
+        || path.ends_with(".cjs")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
+    {
+        return String::from("text/javascript; charset=utf-8");
+    }
+    if path.ends_with(".ts") || path.ends_with(".tsx") || path.ends_with(".jsx") {
+        return String::from("text/plain; charset=utf-8");
+    }
+    if path.ends_with(".md") {
+        return String::from("text/markdown; charset=utf-8");
+    }
+    if path.ends_with(".svg") {
+        return String::from("image/svg+xml; charset=utf-8");
+    }
+    if path.ends_with(".png") {
+        return String::from("image/png");
+    }
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        return String::from("image/jpeg");
+    }
+    if path.ends_with(".gif") {
+        return String::from("image/gif");
+    }
+    if path.ends_with(".webp") {
+        return String::from("image/webp");
+    }
+    if path.ends_with(".ico") {
+        return String::from("image/x-icon");
+    }
+    if path.ends_with(".woff") {
+        return String::from("font/woff");
+    }
+    if path.ends_with(".woff2") {
+        return String::from("font/woff2");
+    }
+    String::from("application/octet-stream")
+}
+
+fn render_runtime_stylesheet() -> String {
+    String::from(
+        r#"
+    .guest-shell {
+      position: relative;
+    }
+
+    .guest-shell::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 -40px auto;
+      width: 220px;
+      height: 220px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(249, 115, 22, 0.28), transparent 70%);
+      filter: blur(10px);
+      pointer-events: none;
+    }
+
+    .guest-columns {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 18px;
+    }
+
+    .guest-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin: 20px 0;
+    }
+
+    .guest-card,
+    .guest-metric,
+    .guest-console {
+      border-radius: 18px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(8, 15, 28, 0.72);
+      box-shadow: 0 22px 60px rgba(15, 23, 42, 0.25);
+      backdrop-filter: blur(14px);
+    }
+
+    .guest-card {
+      padding: 18px 20px;
+    }
+
+    .guest-card h4 {
+      margin: 0 0 12px;
+      font-size: 0.95rem;
+    }
+
+    .guest-metric {
+      padding: 14px 16px;
+    }
+
+    .guest-metric span {
+      display: block;
+      font-size: 0.72rem;
+      opacity: 0.7;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .guest-metric strong {
+      font-size: 0.95rem;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .guest-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .guest-console {
+      margin: 18px 0;
+      padding: 14px 16px;
+      font-family: "SFMono-Regular", "Menlo", monospace;
+      font-size: 0.85rem;
+    }
+
+    .guest-console div {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .guest-console span {
+      color: #f59e0b;
+    }
+
+    .guest-list {
+      display: grid;
+      gap: 10px;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+
+    .guest-list li {
+      display: grid;
+      gap: 4px;
+    }
+
+    .guest-list code {
+      font-size: 0.74rem;
+      color: #f8c56d;
+      word-break: break-all;
+    }
+
+    .guest-list span {
+      color: rgba(226, 232, 240, 0.85);
+      word-break: break-word;
+    }
+
+    .guest-source {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      font-size: 0.8rem;
+      line-height: 1.55;
+    }
+
+    @media (max-width: 760px) {
+      .guest-columns {
+        grid-template-columns: 1fr;
+      }
+    }
+  "#,
+    )
+}
+
+fn extract_session_id_from_preview_url(url: &str) -> Option<String> {
+    let trimmed = url.trim_matches('/');
+    let mut segments = trimmed.split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("preview"), Some(session_id), Some(_port)) => Some(session_id.to_string()),
+        _ => None,
+    }
+}
+
+fn build_preview_direct_workspace_file_response(
+    record: &SessionRecord,
+    session_id: &str,
+    port: u16,
+    file: &VirtualFile,
+    descriptor: &PreviewResponseDescriptor,
+    transform_kind: Option<&HostRuntimePreviewTransformKind>,
+    preview_url: Option<&str>,
+) -> HostRuntimeDirectHttpResponse {
+    let text_body = if file.is_text {
+        let text = String::from_utf8_lossy(&file.bytes).into_owned();
+        Some(match transform_kind {
+            Some(HostRuntimePreviewTransformKind::HtmlDocument) => {
+                rewrite_html_document(&text, preview_url.unwrap_or("/"))
+            }
+            Some(HostRuntimePreviewTransformKind::Stylesheet) => {
+                rewrite_stylesheet_document(
+                    record,
+                    &text,
+                    &file.path,
+                    session_id,
+                    port,
+                    preview_url.unwrap_or("/"),
+                )
+            }
+            Some(HostRuntimePreviewTransformKind::SvgDocument) => {
+                rewrite_svg_document(&text, preview_url.unwrap_or("/"))
+            }
+            _ => text,
+        })
+    } else {
+        None
+    };
+    let bytes_body = if file.is_text {
+        None
+    } else {
+        Some(file.bytes.clone())
+    };
+    HostRuntimeDirectHttpResponse {
+        status: descriptor.status_code,
+        headers: BTreeMap::new(),
+        text_body,
+        bytes_body,
+    }
+}
+
+fn apply_direct_preview_response_metadata(
+    mut response: HostRuntimeDirectHttpResponse,
+    descriptor: &PreviewResponseDescriptor,
+) -> HostRuntimeDirectHttpResponse {
+    if let Some(content_type) = &descriptor.content_type {
+        response
+            .headers
+            .insert(String::from("content-type"), content_type.clone());
+    }
+    response
+        .headers
+        .insert(String::from("cache-control"), String::from("no-store"));
+    if !descriptor.allow_methods.is_empty() {
+        response.headers.insert(
+            String::from("allow"),
+            descriptor.allow_methods.join(", "),
+        );
+    }
+    if descriptor.omit_body {
+        response.text_body = Some(String::new());
+        response.bytes_body = None;
+    }
+    response
 }
 
 fn runtime_timer_view(timer: &RuntimeTimerRecord) -> HostRuntimeTimer {
@@ -2529,6 +4409,24 @@ fn build_runtime_bindings(
                 modules: vec!["console".into(), "node:console".into()],
                 command_prefixes: vec!["console".into()],
             },
+            HostRuntimeBuiltinSpec {
+                name: "perf_hooks".into(),
+                globals: vec!["performance".into()],
+                modules: vec!["node:perf_hooks".into()],
+                command_prefixes: Vec::new(),
+            },
+            HostRuntimeBuiltinSpec {
+                name: "module".into(),
+                globals: Vec::new(),
+                modules: vec!["node:module".into()],
+                command_prefixes: Vec::new(),
+            },
+            HostRuntimeBuiltinSpec {
+                name: "inspector".into(),
+                globals: Vec::new(),
+                modules: vec!["node:inspector".into()],
+                command_prefixes: Vec::new(),
+            },
         ],
     }
 }
@@ -2549,203 +4447,59 @@ fn build_runtime_bootstrap_plan(bindings: &HostRuntimeBindings) -> HostRuntimeBo
     let bootstrap_specifier = "runtime:bootstrap".to_string();
     let entrypoint_literal = serde_json::to_string(&bindings.entrypoint)
         .expect("entrypoint should serialize as json string");
+    let mut modules = BUILTIN_BOOTSTRAP_MODULE_SPECS
+        .iter()
+        .map(|module| HostRuntimeBootstrapModule {
+            specifier: module.specifier.into(),
+            source: module.source.into(),
+        })
+        .collect::<Vec<_>>();
+
+    modules.extend(
+        BROWSER_CLI_SHIMS
+            .iter()
+            .filter(|shim| shim.specifier == bindings.entrypoint)
+            .map(|shim| HostRuntimeBootstrapModule {
+                specifier: shim.specifier.into(),
+                source: render_browser_cli_shim_source(shim),
+            }),
+    );
+    modules.push(HostRuntimeBootstrapModule {
+        specifier: bootstrap_specifier.clone(),
+        source: format!(
+            r#"import process from "node:process";
+import {{ performance }} from "node:perf_hooks";
+import {{ Buffer }} from "node:buffer";
+import consoleValue from "node:console";
+import {{ setTimeout, clearTimeout, setInterval, clearInterval }} from "node:timers";
+
+globalThis.process = process;
+globalThis.performance = performance;
+globalThis.Buffer = Buffer;
+globalThis.console = consoleValue;
+globalThis.setTimeout = setTimeout;
+globalThis.clearTimeout = clearTimeout;
+globalThis.setInterval = setInterval;
+globalThis.clearInterval = clearInterval;
+
+const entryPromise = import({entrypoint_literal});
+
+export async function boot() {{
+  return entryPromise;
+}}
+
+export {{ entryPromise }};
+export default entryPromise;
+"#
+        ),
+    });
 
     HostRuntimeBootstrapPlan {
         context_id: bindings.context_id.clone(),
         engine_name: bindings.engine_name.clone(),
         entrypoint: bindings.entrypoint.clone(),
-        bootstrap_specifier: bootstrap_specifier.clone(),
-        modules: vec![
-            HostRuntimeBootstrapModule {
-                specifier: "node:process".into(),
-                source: r#"const runtime = globalThis.__runtime;
-function invoke(kind, payload = {}) {
-  if (!runtime || typeof runtime.invoke !== "function") {
-    throw new Error("runtime bridge is not attached");
-  }
-  return runtime.invoke(kind, payload);
-}
-const process = {
-  cwd() { return invoke("process.cwd"); },
-  chdir(path) { return invoke("process.chdir", { path }); },
-  exit(code = 0) { return invoke("process.exit", { code }); },
-  get argv() { return invoke("process.argv"); },
-  get env() { return invoke("process.env"); },
-  platform: "browser",
-};
-export default process;
-export const cwd = () => process.cwd();
-export const chdir = (path) => process.chdir(path);
-export const exit = (code = 0) => process.exit(code);
-"#
-                .into(),
-            },
-            HostRuntimeBootstrapModule {
-                specifier: "node:fs".into(),
-                source: r#"const runtime = globalThis.__runtime;
-function invoke(kind, payload = {}) {
-  if (!runtime || typeof runtime.invoke !== "function") {
-    throw new Error("runtime bridge is not attached");
-  }
-  return runtime.invoke(kind, payload);
-}
-export const existsSync = (path) => invoke("fs.exists", { path }).exists;
-export const statSync = (path) => invoke("fs.stat", { path }).entry;
-export const readdirSync = (path) => invoke("fs.read-dir", { path }).entries.map((entry) => entry.path);
-export const readFileSync = (path) => invoke("fs.read-file", { path });
-export const mkdirSync = (path) => invoke("fs.mkdir", { path });
-export const writeFileSync = (path, bytes, isText = false) =>
-  invoke("fs.write-file", { path, bytes, isText });
-export default {
-  existsSync,
-  statSync,
-  readdirSync,
-  readFileSync,
-  mkdirSync,
-  writeFileSync,
-};
-"#
-                .into(),
-            },
-            HostRuntimeBootstrapModule {
-                specifier: "node:path".into(),
-                source: r#"const runtime = globalThis.__runtime;
-function invoke(kind, payload = {}) {
-  if (!runtime || typeof runtime.invoke !== "function") {
-    throw new Error("runtime bridge is not attached");
-  }
-  return runtime.invoke(kind, payload).value;
-}
-export const resolve = (...segments) => invoke("path.resolve", { segments });
-export const join = (...segments) => invoke("path.join", { segments });
-export const dirname = (path) => invoke("path.dirname", { path });
-export const basename = (path) => invoke("path.basename", { path });
-export const extname = (path) => invoke("path.extname", { path });
-export const normalize = (path) => invoke("path.normalize", { path });
-export default { resolve, join, dirname, basename, extname, normalize };
-"#
-                .into(),
-            },
-            HostRuntimeBootstrapModule {
-                specifier: "node:buffer".into(),
-                source: r#"export const Buffer = Uint8Array;
-export default { Buffer };
-"#
-                .into(),
-            },
-            HostRuntimeBootstrapModule {
-                specifier: "node:timers".into(),
-                source: r#"const runtime = globalThis.__runtime;
-if (!runtime.__timerState) {
-  runtime.__timerState = {
-    nextCallbackId: 1,
-    callbackIdsByTimerId: new Map(),
-    callbacks: new Map(),
-  };
-}
-if (typeof runtime.fireTimer !== "function") {
-  runtime.fireTimer = (callbackId, repeat = false) => {
-    const callback = runtime.__timerState.callbacks.get(callbackId);
-    if (typeof callback === "function") {
-      callback();
-    }
-    if (!repeat) {
-      runtime.__timerState.callbacks.delete(callbackId);
-    }
-    return runtime.__timerState.callbacks.has(callbackId);
-  };
-}
-function invoke(kind, payload = {}) {
-  if (!runtime || typeof runtime.invoke !== "function") {
-    throw new Error("runtime bridge is not attached");
-  }
-  return runtime.invoke(kind, payload);
-}
-export const setTimeout = (callback, delay = 0) => {
-  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
-  runtime.__timerState.callbacks.set(callbackId, callback);
-  const timerId = invoke("timers.schedule", {
-    delayMs: delay,
-    repeat: false,
-    callback,
-    callbackId,
-  });
-  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
-  return timerId;
-};
-export const setInterval = (callback, delay = 0) => {
-  const callbackId = `runtime-callback-${runtime.__timerState.nextCallbackId++}`;
-  runtime.__timerState.callbacks.set(callbackId, callback);
-  const timerId = invoke("timers.schedule", {
-    delayMs: delay,
-    repeat: true,
-    callback,
-    callbackId,
-  });
-  runtime.__timerState.callbackIdsByTimerId.set(timerId, callbackId);
-  return timerId;
-};
-export const clearTimeout = (timerId) => {
-  const callbackId = runtime.__timerState.callbackIdsByTimerId.get(timerId);
-  if (callbackId) {
-    runtime.__timerState.callbackIdsByTimerId.delete(timerId);
-    runtime.__timerState.callbacks.delete(callbackId);
-  }
-  return invoke("timers.clear", { timerId });
-};
-export const clearInterval = clearTimeout;
-export default { setTimeout, clearTimeout, setInterval, clearInterval };
-"#
-                .into(),
-            },
-            HostRuntimeBootstrapModule {
-                specifier: "node:console".into(),
-                source: r#"const runtime = globalThis.__runtime;
-function emit(level, values) {
-  if (!runtime || typeof runtime.invoke !== "function") {
-    throw new Error("runtime bridge is not attached");
-  }
-  return runtime.invoke("console.emit", { level, values });
-}
-const consoleValue = {
-  log: (...values) => emit("log", values),
-  info: (...values) => emit("info", values),
-  warn: (...values) => emit("warn", values),
-  error: (...values) => emit("error", values),
-};
-export { consoleValue as console };
-export default consoleValue;
-"#
-                .into(),
-            },
-	            HostRuntimeBootstrapModule {
-	                specifier: bootstrap_specifier,
-	                source: format!(
-	                    r#"import process from "node:process";
-	import {{ Buffer }} from "node:buffer";
-	import consoleValue from "node:console";
-	import {{ setTimeout, clearTimeout, setInterval, clearInterval }} from "node:timers";
-
-globalThis.process = process;
-	globalThis.Buffer = Buffer;
-	globalThis.console = consoleValue;
-	globalThis.setTimeout = setTimeout;
-	globalThis.clearTimeout = clearTimeout;
-	globalThis.setInterval = setInterval;
-	globalThis.clearInterval = clearInterval;
-	
-	const entryPromise = import({entrypoint_literal});
-	
-	export async function boot() {{
-	  return entryPromise;
-	}}
-	
-	export {{ entryPromise }};
-	export default entryPromise;
-	"#
-	                ),
-	            },
-        ],
+        bootstrap_specifier,
+        modules,
     }
 }
 
@@ -2826,6 +4580,7 @@ fn runtime_http_request_view(request: &HostRuntimeHttpRequest) -> HostRuntimeHtt
         method: request.method.clone(),
         relative_path: request.relative_path.clone(),
         search: request.search.clone(),
+        client_modules: request.client_modules.clone(),
     }
 }
 
@@ -2860,6 +4615,7 @@ fn describe_preview_response(
         PreviewRequestKind::RootDocument => PreviewResponseKind::WorkspaceDocument,
         PreviewRequestKind::RootEntry => PreviewResponseKind::AppShell,
         PreviewRequestKind::FallbackRoot => PreviewResponseKind::HostManagedFallback,
+        PreviewRequestKind::BootstrapState => PreviewResponseKind::BootstrapState,
         PreviewRequestKind::RuntimeState => PreviewResponseKind::RuntimeState,
         PreviewRequestKind::WorkspaceState => PreviewResponseKind::WorkspaceState,
         PreviewRequestKind::FileIndex => PreviewResponseKind::FileIndex,
@@ -2910,10 +4666,6 @@ fn detect_react_dependency(manifest: &PackageManifest) -> bool {
     dependency_keys(manifest).any(|name| name == "react" || name == "react-dom")
 }
 
-fn detect_vite_dependency(manifest: &PackageManifest) -> bool {
-    dependency_keys(manifest).any(|name| name == "vite")
-}
-
 fn dependency_keys(manifest: &PackageManifest) -> impl Iterator<Item = &str> {
     manifest
         .dependencies
@@ -2940,8 +4692,6 @@ fn sync_session_package_manifest(record: &mut SessionRecord, path: &str) {
     record.snapshot.package_name = manifest.as_ref().and_then(|package| package.name.clone());
     record.snapshot.capabilities.detected_react =
         manifest.as_ref().is_some_and(detect_react_dependency);
-    record.snapshot.capabilities.detected_vite =
-        manifest.as_ref().is_some_and(detect_vite_dependency);
 }
 
 fn apply_engine_bridge_snapshot(
@@ -3002,6 +4752,7 @@ fn guess_preview_content_type(
             Some(String::from("text/html; charset=utf-8"))
         }
         PreviewResponseKind::RuntimeState
+        | PreviewResponseKind::BootstrapState
         | PreviewResponseKind::WorkspaceState
         | PreviewResponseKind::FileIndex
         | PreviewResponseKind::DiagnosticsState
@@ -3748,6 +5499,93 @@ fn detect_module_format(path: &str) -> crate::protocol::HostRuntimeModuleFormat 
         crate::protocol::HostRuntimeModuleFormat::Json
     } else {
         crate::protocol::HostRuntimeModuleFormat::Module
+    }
+}
+
+fn resolve_preview_module_plan_workspace_path<'a>(
+    request_hint: &'a PreviewRequestHint,
+    response_descriptor: &'a PreviewResponseDescriptor,
+) -> Option<&'a str> {
+    response_descriptor
+        .workspace_path
+        .as_deref()
+        .or(request_hint.workspace_path.as_deref())
+}
+
+fn determine_runtime_preview_transform_kind(
+    request_hint: &PreviewRequestHint,
+    response_descriptor: &PreviewResponseDescriptor,
+    module_plan: Option<&HostRuntimePreviewModulePlan>,
+) -> Option<crate::protocol::HostRuntimePreviewTransformKind> {
+    if module_plan.is_some() && matches!(response_descriptor.kind, PreviewResponseKind::WorkspaceAsset)
+    {
+        return Some(crate::protocol::HostRuntimePreviewTransformKind::Module);
+    }
+
+    let workspace_path = response_descriptor
+        .workspace_path
+        .as_deref()
+        .or(request_hint.workspace_path.as_deref())?;
+
+    let normalized = workspace_path.to_ascii_lowercase();
+    if normalized.ends_with(".html") {
+        return Some(crate::protocol::HostRuntimePreviewTransformKind::HtmlDocument);
+    }
+    if normalized.ends_with(".css") {
+        return Some(crate::protocol::HostRuntimePreviewTransformKind::Stylesheet);
+    }
+    if normalized.ends_with(".svg") {
+        return Some(crate::protocol::HostRuntimePreviewTransformKind::SvgDocument);
+    }
+    if normalized.ends_with(".png")
+        || normalized.ends_with(".jpg")
+        || normalized.ends_with(".jpeg")
+        || normalized.ends_with(".gif")
+        || normalized.ends_with(".webp")
+        || normalized.ends_with(".ico")
+        || normalized.ends_with(".woff")
+        || normalized.ends_with(".woff2")
+    {
+        return Some(crate::protocol::HostRuntimePreviewTransformKind::Binary);
+    }
+
+    Some(crate::protocol::HostRuntimePreviewTransformKind::PlainText)
+}
+
+fn build_runtime_preview_render_plan(
+    request_hint: &PreviewRequestHint,
+    response_descriptor: &PreviewResponseDescriptor,
+) -> Option<crate::protocol::HostRuntimePreviewRenderPlan> {
+    match response_descriptor.kind {
+        PreviewResponseKind::WorkspaceDocument
+        | PreviewResponseKind::WorkspaceFile
+        | PreviewResponseKind::WorkspaceAsset => Some(crate::protocol::HostRuntimePreviewRenderPlan {
+            kind: crate::protocol::HostRuntimePreviewRenderKind::WorkspaceFile,
+            workspace_path: response_descriptor
+                .workspace_path
+                .clone()
+                .or_else(|| request_hint.workspace_path.clone()),
+            document_root: response_descriptor
+                .document_root
+                .clone()
+                .or_else(|| request_hint.document_root.clone()),
+        }),
+        PreviewResponseKind::AppShell => Some(crate::protocol::HostRuntimePreviewRenderPlan {
+            kind: crate::protocol::HostRuntimePreviewRenderKind::AppShell,
+            workspace_path: response_descriptor
+                .workspace_path
+                .clone()
+                .or_else(|| request_hint.workspace_path.clone()),
+            document_root: Some(String::from("/workspace")),
+        }),
+        PreviewResponseKind::HostManagedFallback => {
+            Some(crate::protocol::HostRuntimePreviewRenderPlan {
+                kind: crate::protocol::HostRuntimePreviewRenderKind::HostManagedFallback,
+                workspace_path: None,
+                document_root: None,
+            })
+        }
+        _ => None,
     }
 }
 

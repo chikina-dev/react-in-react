@@ -1,10 +1,11 @@
 import previewClientUrl from "../preview-client.tsx?url";
+import { APP_BASE_PATH, withAppBasePath } from "./app-base";
 import type { PreviewReadyEvent, VirtualHttpRequest, VirtualHttpResponse } from "./protocol";
 import { PREVIEW_CLIENT_HEADER } from "./preview-constants";
 
 type PreviewWorkerStatus = "unsupported" | "registering" | "ready" | "error";
 
-type PreviewWorkerState = {
+export type PreviewWorkerState = {
   status: PreviewWorkerStatus;
   detail?: string;
 };
@@ -28,6 +29,10 @@ type PreviewWorkerMessage =
       sessionId: string;
     };
 
+type PreviewBridgeConnectMessage = {
+  type: "preview.bridge.connect";
+};
+
 export type PreviewBridgeRequestMessage = {
   type: "preview.http.request";
   requestId: string;
@@ -44,7 +49,7 @@ export type PreviewBridgeResponseMessage = {
 let registrationPromise: Promise<ServiceWorkerRegistration | null> | null = null;
 let currentState: PreviewWorkerState = { status: "registering" };
 const listeners = new Set<(state: PreviewWorkerState) => void>();
-const queue: PreviewWorkerMessage[] = [];
+const queue: Array<PreviewWorkerMessage | PreviewBridgeConnectMessage> = [];
 
 export function subscribePreviewWorkerState(
   listener: (state: PreviewWorkerState) => void,
@@ -98,18 +103,38 @@ export async function unregisterSessionPreviews(sessionId: string): Promise<void
   });
 }
 
+export async function connectPreviewBridge(port: MessagePort): Promise<void> {
+  const registration = await ensurePreviewServiceWorker();
+
+  if (!registration) {
+    return;
+  }
+
+  const target =
+    navigator.serviceWorker.controller ??
+    registration.active ??
+    registration.waiting ??
+    registration.installing;
+
+  if (!target) {
+    throw new Error("No Service Worker target available for preview bridge.");
+  }
+
+  postMessageToTarget(target, { type: "preview.bridge.connect" }, [port]);
+}
+
 async function registerPreviewServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   try {
-    const registration = await navigator.serviceWorker.register("/preview-sw.js", {
-      scope: "/",
+    const registration = await navigator.serviceWorker.register(withAppBasePath("/preview-sw.js"), {
+      scope: APP_BASE_PATH,
     });
 
     await navigator.serviceWorker.ready;
     postMessageToTarget(
-      registration.active ??
+      navigator.serviceWorker.controller ??
+        registration.active ??
         registration.waiting ??
-        registration.installing ??
-        navigator.serviceWorker.controller,
+        registration.installing,
       {
         type: "preview.configure",
         clientScriptUrl: previewClientUrl,
@@ -129,7 +154,9 @@ async function registerPreviewServiceWorker(): Promise<ServiceWorkerRegistration
   }
 }
 
-async function postToServiceWorker(message: PreviewWorkerMessage): Promise<void> {
+async function postToServiceWorker(
+  message: PreviewWorkerMessage | PreviewBridgeConnectMessage,
+): Promise<void> {
   const registration = await ensurePreviewServiceWorker();
 
   if (!registration) {
@@ -137,16 +164,20 @@ async function postToServiceWorker(message: PreviewWorkerMessage): Promise<void>
   }
 
   const target =
+    navigator.serviceWorker.controller ??
     registration.active ??
     registration.waiting ??
-    registration.installing ??
-    navigator.serviceWorker.controller;
+    registration.installing;
 
   if (!target) {
     queue.push(message);
     return;
   }
 
+  postMessageToTarget(target, {
+    type: "preview.configure",
+    clientScriptUrl: previewClientUrl,
+  });
   postMessageToTarget(target, message);
 }
 
@@ -169,14 +200,15 @@ function updateState(nextState: PreviewWorkerState): void {
 
 function postMessageToTarget(
   target: ServiceWorker | null | undefined,
-  message: PreviewWorkerMessage,
+  message: PreviewWorkerMessage | PreviewBridgeConnectMessage,
+  transfer: Transferable[] = [],
 ): void {
   if (!target) {
     queue.push(message);
     return;
   }
 
-  target.postMessage(message);
+  target.postMessage(message, transfer);
 }
 
 export function withPreviewClientHeader(headers: Record<string, string>): Record<string, string> {
